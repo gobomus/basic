@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cross-Asset Geometric Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:14px; font:12px/1.4 ui-monospace,Menlo,Consolas,monospace; background:#0a0c0f; color:#e7ecf2; }
+  h1 { font-size:13px; margin:0 0 8px; letter-spacing:.5px; color:#9fb3c8; text-transform:uppercase; }
+  .hero { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:10px; }
+  .card { background:#11151b; border:1px solid #1c232c; border-radius:8px; padding:10px 12px; }
+  .card h2 { font-size:12px; margin:0 0 6px; color:#9fb3c8; letter-spacing:.3px; }
+  .row { display:flex; justify-content:space-between; padding:3px 0; font-size:11px; }
+  .k { color:#7e8ea0; } .v { color:#e7ecf2; font-weight:600; }
+  .pos { color:#79e27a; } .neg { color:#f27070; } .amber { color:#f0c560; } .dim { color:#5a6876; }
+  .fuchsia { color:#e17adf; }
+  .barRow { display:flex; align-items:center; gap:6px; margin:2px 0; }
+  .bar { flex:1; height:6px; background:#1a2027; border-radius:3px; overflow:hidden; position:relative; }
+  .bar .fill { position:absolute; top:0; bottom:0; background:linear-gradient(90deg,#79e27a,#f0c560); }
+  .bar .fill.neg { left:auto; right:50%; background:linear-gradient(270deg,#f27070,#f0c560); }
+  .bar .fill.pos { left:50%; background:linear-gradient(90deg,#f0c560,#79e27a); }
+  .bar .mid { position:absolute; left:50%; top:0; bottom:0; width:1px; background:#2a333e; }
+  .lbl { width:62px; color:#7e8ea0; font-size:10px; }
+  .val { width:48px; text-align:right; font-variant-numeric:tabular-nums; font-size:10px; }
+  .basket { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .chain { background:#0e1116; border:1px solid #1c232c; border-radius:8px; padding:10px 12px; margin-top:10px; }
+  .stage { display:flex; align-items:center; gap:8px; padding:4px 0; font-size:11px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#2a333e; border:1px solid #3a4452; flex-shrink:0; }
+  .dot.on { background:#79e27a; border-color:#79e27a; box-shadow:0 0 6px #79e27a; }
+  .dot.armed { background:#f0c560; border-color:#f0c560; }
+  .matrix { border-collapse:collapse; margin-top:6px; }
+  .matrix td, .matrix th { padding:3px 8px; border:1px solid #1c232c; font-size:10px; text-align:center; font-variant-numeric:tabular-nums; }
+  .matrix th { color:#7e8ea0; background:#0e1116; }
+  .footer { margin-top:8px; color:#5a6876; font-size:10px; }
+  .regime { font-size:13px; font-weight:700; padding:6px 10px; border-radius:6px; display:inline-block; }
+  .regime.sys { background:#3d1a1a; color:#f27070; }
+  .regime.rot { background:#3d2f0f; color:#f0c560; }
+  .regime.dec { background:#1a2427; color:#9fb3c8; }
+</style>
+</head>
+<body>
+<h1>🧭 Cross-asset geometric dashboard</h1>
+<div id="root">loading…</div>
+<div class="footer" id="foot"></div>
+<script>
+const NET = "solana"
+const BASE = (pair) => "https://" + "api.geckoterminal.com/api/v2/networks/" + NET + "/pools/" + pair
+const ASSETS = [
+  { sym: "USELESS",  pair: "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp", cycleH: 42, walker: 0.04752 },
+  { sym: "Fartcoin", pair: "Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw", cycleH: 60, walker: 0.2145  },
+  { sym: "WIF",      pair: "EP2ib6dYdEeqD8MfE2ezHCxX3kP3K2eLKkirfPm5eyMx", cycleH: 48, walker: 0.2145  }
+]
+
+async function ohlcv(pair, tf, agg, limit){
+  const url = BASE(pair) + "/ohlcv/" + tf + "?aggregate=" + agg + "&limit=" + limit
+  const r = await fetch(url); const j = await r.json()
+  const arr = j?.data?.attributes?.ohlcv_list || []
+  return arr.slice().reverse().map(x => ({t:x[0], o:+x[1], h:+x[2], l:+x[3], c:+x[4], v:+x[5]}))
+}
+
+function ema(a,n){ const k=2/(n+1); let e=a[0]; const o=[e]; for(let i=1;i<a.length;i++){ e=a[i]*k+e*(1-k); o.push(e) } return o }
+function sma(a,n,i){ if(i<n-1) return NaN; let s=0; for(let k=i-n+1;k<=i;k++) s+=a[k]; return s/n }
+function rsi(a,n){ let g=0,l=0; const o=Array(a.length).fill(NaN); for(let i=1;i<a.length;i++){ const d=a[i]-a[i-1]; const u=Math.max(d,0), dn=Math.max(-d,0); if(i<=n){ g+=u; l+=dn; if(i===n){ g/=n; l/=n; o[i]=l===0?100:100-100/(1+g/l)}} else { g=(g*(n-1)+u)/n; l=(l*(n-1)+dn)/n; o[i]=l===0?100:100-100/(1+g/l) } } return o }
+function vwma(closes, vols, n, i){ let sp=0,sv=0; for(let k=i-n+1;k<=i;k++){ sp+=closes[k]*vols[k]; sv+=vols[k] } return sp/sv }
+
+// V_bar 8-panel per Layer 7 spec
+function vBar(bars){
+  if(bars.length < 210) return null
+  const i = bars.length - 1
+  const c = bars.map(b=>b.c), v = bars.map(b=>b.v)
+  // Proxy CVD = signed volume cumulative
+  const cvd = []; let s = 0
+  for(let k=0;k<bars.length;k++){ const sig = bars[k].c >= (k>0?bars[k-1].c:bars[k].o) ? 1 : -1; s += sig*bars[k].v; cvd.push(s) }
+  const cvdEma = ema(cvd, 20)[i]
+  const e200 = ema(c, 200)[i]
+  const e9   = ema(c, 9)[i]
+  const e21  = ema(c, 21)[i]
+  const e20  = ema(c, 20)[i]
+  const mom  = c[i] - c[i-10]
+  const vw50 = vwma(c, v, 50, i)
+  const r = rsi(c, 14)[i]
+  const m20 = sma(c, 20, i)
+  const sd = Math.sqrt(c.slice(-20).reduce((a,x)=>a+(x-m20)**2,0)/20)
+  const up = m20 + 2*sd, dn = m20 - 2*sd
+  const pctB = (c[i] - dn) / (up - dn)
+  const rising3 = ema(c, 20)[i] > ema(c, 20)[i-3]
+  // 8 factors
+  const factors = [
+    cvd[i] > cvdEma,          // s1 CVD above its EMA
+    c[i] > e200,              // s2 above 200EMA
+    mom > 0,                  // s3 momentum positive
+    rising3,                  // s4 EMA20 rising 3 bars
+    e9 > e21,                 // s5 9>21 EMA
+    c[i] > vw50,              // s6 above VWMA50
+    r > 50,                   // s7 RSI>50
+    pctB > 0.5                // s8 above BB mid
+  ]
+  const p = factors.filter(Boolean).length
+  const V_mag = Math.abs(p - 4) / 4
+  const V_sign = p === 4 ? 0 : (p > 4 ? 1 : -1)
+  const V_signed = V_sign * V_mag
+  // SPT depth
+  const ent = (x) => x === 0 ? 0 : -x * Math.log2(x)
+  const H = ent(p/8) + ent((8-p)/8)
+  const V_depth = 1 - H
+  return { V_mag, V_sign, V_signed, V_depth, p, factors }
+}
+
+// Saturation dwell — bars back with V_mag >= 0.875
+function tSat(bars){
+  let n = 0
+  for(let k = bars.length - 1; k >= 30; k--){
+    const slice = bars.slice(0, k+1)
+    const v = vBar(slice)
+    if(!v || v.V_mag < 0.875) break
+    n++
+    if(n > 20) break
+  }
+  return n
+}
+
+// Crown overhead ratio
+function crownOver(bars, tau=720){
+  const i = bars.length - 1; const px = bars[i].c
+  let over = 0, total = 0
+  const start = Math.max(0, i - tau)
+  for(let k = start; k <= i; k++){
+    const w = Math.exp(-(i-k)/tau)
+    total += bars[k].v * w
+    if(bars[k].h >= px) over += bars[k].v * w
+  }
+  return total > 0 ? over/total : 0
+}
+
+// 30d drawdown from running peak
+function ddFromPeak(bars, lookback=720){
+  const slice = bars.slice(-lookback)
+  const peak = Math.max(...slice.map(b=>b.h))
+  const last = slice[slice.length-1].c
+  return (last - peak) / peak
+}
+
+// Macro phase (same method as page 16, per-asset cycle)
+function macroPhase(bars, cycleH){
+  const win12 = 12, win84 = Math.max(84, cycleH*2)
+  const vols = bars.map(b=>b.v)
+  const rolling = []
+  for(let i=0;i<vols.length;i++){ let s=0; for(let k=Math.max(0,i-win12+1);k<=i;k++) s+=vols[k]; rolling.push(s) }
+  const last = rolling.length-1
+  const lo = Math.max(0, last-win84+1)
+  let mi=lo, mv=rolling[lo]
+  for(let i=lo;i<=last;i++) if(rolling[i]<mv){mv=rolling[i]; mi=i}
+  return Math.min(360, ((last-mi) / cycleH) * 360)
+}
+
+// Cross-correlation lag — returns {tauStar, rhoStar}
+function lagCorr(Va, Vb, maxLag=12){
+  let best = {tau: 0, rho: -1}
+  const n = Math.min(Va.length, Vb.length)
+  const mean = (a,s,e) => { let m=0; for(let k=s;k<e;k++) m+=a[k]; return m/(e-s) }
+  for(let tau = -maxLag; tau <= maxLag; tau++){
+    let s=0, sa=0, sb=0, na=0
+    const aStart = Math.max(0, -tau)
+    const aEnd = Math.min(n, n-tau)
+    if(aEnd - aStart < 20) continue
+    const mA = mean(Va, aStart, aEnd)
+    const mB = mean(Vb, aStart+tau, aEnd+tau)
+    for(let k = aStart; k < aEnd; k++){
+      const da = Va[k]-mA, db = Vb[k+tau]-mB
+      s += da*db; sa += da*da; sb += db*db; na++
+    }
+    const rho = s / Math.sqrt(sa*sb || 1e-12)
+    if(Math.abs(rho) > Math.abs(best.rho)) best = { tau, rho }
+  }
+  return best
+}
+
+// Rolling V_signed series for lag analysis
+function vSeries(bars, stride=1){
+  const out = []
+  for(let i = 210; i < bars.length; i += stride){
+    const s = bars.slice(0, i+1)
+    const v = vBar(s)
+    out.push(v ? v.V_signed : 0)
+  }
+  return out
+}
+
+function fmt(x, d){ return (!isFinite(x) || x == null) ? "—" : x.toFixed(d) }
+function signClass(v){ return v > 0.01 ? "pos" : v < -0.01 ? "neg" : "dim" }
+
+function renderBar(v, scale=1){
+  const pct = Math.max(-1, Math.min(1, v/scale)) * 50
+  if(Math.abs(v) < 0.01) return `<div class="bar"><div class="mid"></div></div>`
+  if(v > 0) return `<div class="bar"><div class="mid"></div><div class="fill pos" style="left:50%;width:${pct}%"></div></div>`
+  return `<div class="bar"><div class="mid"></div><div class="fill neg" style="right:50%;width:${-pct}%"></div></div>`
+}
+
+function assetCard(a, data){
+  const { h4, h1, m15, tSatN, crown, dd, phase } = data
+  const dvHL = (h4.V_signed - m15.V_signed)
+  const sptCls = h1.V_depth > 0.9 ? "pos" : h1.V_depth > 0.5 ? "amber" : "dim"
+  return `
+  <div class="card">
+    <h2>${a.sym} <span class="dim">· ${fmt(data.price, a.sym=="USELESS" ? 5 : 4)}</span></h2>
+    <div class="barRow"><span class="lbl">V 4h</span>${renderBar(h4.V_signed)}<span class="val ${signClass(h4.V_signed)}">${fmt(h4.V_signed,2)}</span></div>
+    <div class="barRow"><span class="lbl">V 1h</span>${renderBar(h1.V_signed)}<span class="val ${signClass(h1.V_signed)}">${fmt(h1.V_signed,2)}</span></div>
+    <div class="barRow"><span class="lbl">V 15m</span>${renderBar(m15.V_signed)}<span class="val ${signClass(m15.V_signed)}">${fmt(m15.V_signed,2)}</span></div>
+    <div class="barRow"><span class="lbl">ΔV_HL</span>${renderBar(dvHL, 2)}<span class="val ${Math.abs(dvHL) >= 0.75 ? "fuchsia" : signClass(dvHL)}">${fmt(dvHL,2)}</span></div>
+    <div class="row"><span class="k">SPT depth 1h</span><span class="v ${sptCls}">${fmt(h1.V_depth, 2)}</span></div>
+    <div class="row"><span class="k">T_sat 1h bars</span><span class="v ${tSatN >= 4 ? "amber" : "dim"}">${tSatN}</span></div>
+    <div class="row"><span class="k">Crown S_over</span><span class="v ${crown > 0.4 ? "neg" : crown > 0.15 ? "amber" : "pos"}">${fmt(crown*100, 0)}%</span></div>
+    <div class="row"><span class="k">DD 30d</span><span class="v">${fmt(dd*100, 1)}%</span></div>
+    <div class="row"><span class="k">Macro phase</span><span class="v">${fmt(phase, 0)}°</span></div>
+  </div>`
+}
+
+function regimeBadge(Bmag){
+  if(Bmag > 0.7) return '<span class="regime sys">SYSTEMIC PULSE</span>'
+  if(Bmag > 0.3) return '<span class="regime rot">ROTATIONAL</span>'
+  return '<span class="regime dec">DECOUPLED</span>'
+}
+
+function renderAll(data){
+  const cards = ASSETS.map((a, idx) => assetCard(a, data[idx])).join("")
+  const B1h = data.reduce((s, d) => s + d.h1.V_signed, 0) / 3
+  const B4h = data.reduce((s, d) => s + d.h4.V_signed, 0) / 3
+  const phases = data.map(d => d.phase)
+  const meanPhase = phases.reduce((s,p) => s+p, 0) / phases.length
+  const cpd = Math.sqrt(phases.reduce((s,p) => s + (p-meanPhase)**2, 0) / phases.length)
+  // Pairwise lag
+  const pairs = [[0,1],[0,2],[1,2]]
+  const lagRows = pairs.map(([i,j]) => {
+    const L = lagCorr(data[i].vSer, data[j].vSer, 8)
+    return `<tr><td>${ASSETS[i].sym} → ${ASSETS[j].sym}</td><td>${L.tau >= 0 ? "+" : ""}${L.tau}h</td><td class="${L.rho > 0.5 ? "pos" : L.rho < -0.5 ? "neg" : "dim"}">${fmt(L.rho, 2)}</td></tr>`
+  }).join("")
+  // Chain state
+  const uselessTag = Math.abs(data[0].price - ASSETS[0].walker) / data[0].price < 0.005 && data[0].h1.V_sign > 0
+  const fartFlipped = data[1].h1.V_sign > 0
+  const wifFlipped = data[2].m15.V_sign > 0
+  const stage1 = uselessTag ? "on" : ""
+  const stage2 = stage1 && fartFlipped ? "on" : (data[1].m15.V_sign > 0 ? "armed" : "")
+  const stage3 = stage1 && stage2 && wifFlipped ? "on" : ""
+  // Regime
+  const Bmag = Math.abs(B1h)
+  const regime = regimeBadge(Bmag)
+  document.getElementById("root").innerHTML = `
+    <div class="hero">${cards}</div>
+    <div class="basket">
+      <div class="card">
+        <h2>Basket vector $\\vec B$</h2>
+        <div class="row"><span class="k">Regime</span><span>${regime}</span></div>
+        <div class="barRow"><span class="lbl">B 4h</span>${renderBar(B4h)}<span class="val ${signClass(B4h)}">${fmt(B4h,2)}</span></div>
+        <div class="barRow"><span class="lbl">B 1h</span>${renderBar(B1h)}<span class="val ${signClass(B1h)}">${fmt(B1h,2)}</span></div>
+        <div class="row"><span class="k">CPD (Kuramoto σφ)</span><span class="v ${cpd < 30 ? "neg" : cpd > 90 ? "amber" : "pos"}">${fmt(cpd, 0)}°</span></div>
+      </div>
+      <div class="card">
+        <h2>Lag-chain coherence $L(A\\to B)$</h2>
+        <table class="matrix">
+          <tr><th>pair</th><th>τ*</th><th>ρ*</th></tr>
+          ${lagRows}
+        </table>
+      </div>
+    </div>
+    <div class="chain">
+      <h2 style="font-size:12px; margin:0 0 6px; color:#9fb3c8; letter-spacing:.3px;">Sympathetic chain · USELESS → Fartcoin → WIF</h2>
+      <div class="stage"><div class="dot ${stage1}"></div><span><strong>Stage 1</strong> · USELESS tags Walker $${ASSETS[0].walker} + V_sign 1h = +</span></div>
+      <div class="stage"><div class="dot ${stage2}"></div><span><strong>Stage 2</strong> · Fartcoin V_sign 1h flips + within 8h</span></div>
+      <div class="stage"><div class="dot ${stage3}"></div><span><strong>Stage 3</strong> · WIF V_sign 15m flips + → <strong class="pos">primary long trigger on WIF</strong></span></div>
+    </div>`
+  document.getElementById("foot").textContent = "last refresh " + new Date().toISOString().slice(11,16) + "Z · auto 90s"
+}
+
+async function tick(){
+  try {
+    const all = await Promise.all(ASSETS.map(async a => {
+      const [h4, h1, m15] = await Promise.all([
+        ohlcv(a.pair, "hour", 4, 250),
+        ohlcv(a.pair, "hour", 1, 250),
+        ohlcv(a.pair, "minute", 15, 250)
+      ])
+      return {
+        price: h1[h1.length-1].c,
+        h4: vBar(h4), h1: vBar(h1), m15: vBar(m15),
+        tSatN: tSat(h1),
+        crown: crownOver(h1),
+        dd: ddFromPeak(h1),
+        phase: macroPhase(h1, a.cycleH),
+        vSer: vSeries(h1, 2)
+      }
+    }))
+    if(all.some(d => !d.h4 || !d.h1 || !d.m15)) throw new Error("V_bar insufficient bars")
+    renderAll(all)
+  } catch(e){
+    document.getElementById("root").innerHTML = `<div class="card neg">error: ${e.message || e}</div>`
+  }
+}
+tick(); setInterval(tick, 90_000)
+</script>
+</body>
+</html>
