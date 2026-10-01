@@ -66,15 +66,15 @@ An honest status of every feature category those platforms offer, as of this com
 |---|---|---|
 | Live price, liquidity, buys/sells, volume, curve progress | 📦 | every Pump/PumpSwap trade recorded (`mkt.swaps`) |
 | Lifecycle: creation, graduation | 📦 | `CreateEvent` / `CompleteEvent` decoded |
-| Holders, top-10 %, dev %, snipers, bundlers, insiders, fresh wallets | ⬜ | feature service planned ([03](03-data-model.md)) |
-| Dev history (prior launches / rugs) | 📦 | creator of every coin recorded; aggregation planned |
-| Socials (X, Telegram, website), KOL mentions | ⬜ | needs metadata fetch + X API |
-| Smart money / KOL tags | ⬜ | `leader-report` covers single wallets; bulk tagging planned |
+| Holders, top-10 %, dev %, snipers, bundlers, insiders, fresh wallets | 🔶 | GMGN OpenAPI (`token/info` + `token/security`) logged with every copy decision; optional entry gate; `copybot token-intel` |
+| Dev history (prior launches / rugs) | 🔶 | GMGN `creator_open_count`, creator ATH, CTO flag, `created_tokens` |
+| Socials (X, Telegram, website), DexScreener ad/boost, X renames | 🔶 | GMGN `token/info` link + dev fields |
+| Smart money / KOL tags and live trades | 🔶 | `copybot discover` (GMGN `smartmoney` / `kol` feeds + wallet stats) |
 
 ## Wallet analytics (GMGN wallet pages)
 | Feature | Status | Where |
 |---|---|---|
-| PnL, win rate, median hold, bot detection per wallet | 🔶 | `copybot leader-report` (reads on-chain history) |
+| PnL, win rate, median hold, bot detection per wallet | 🔶 | `copybot leader-report`: on-chain history + GMGN track-record / copy-tradeability score (ported from GMGN's own scoring) |
 | Copier-return simulation (the imitation penalty) | ✅ logic / 📦 data | `wallet_score` + shadow mode measures it live |
 
 ## Operations
@@ -87,6 +87,12 @@ An honest status of every feature category those platforms offer, as of this com
 | Journal (JSONL always; Postgres and ClickHouse optional) | ✅ JSONL / 🔶 DBs | `journal.rs`, `schema/` |
 | systemd service, setup script, CI | ✅ | `deploy/`, `.github/workflows/ci.yml` |
 | Web dashboard / UI | ⬜ | `copybot ctl` + Grafana on the databases for now |
+
+## Sources of truth
+- **GMGN:** official `gmgn-cli` (npm 1.6.6) and the `GMGNAI/gmgn-skills` repo define the OpenAPI routes, auth and fields the client uses.
+- **BasedBot:** no public repo or SDK exists.
+- **Proxima:** closed beta; GitHub org `proximacorp` with nothing public to build on.
+- **Pump.fun / PumpSwap:** official IDLs + `@pump-fun/pump-sdk` / `pump-swap-sdk` source.
 
 ## Why some items are 🔶
 The build sandbox's network policy blocks Solana RPC, gRPC and sender hosts. Everything was therefore verified offline:

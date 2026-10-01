@@ -682,3 +682,369 @@ pub fn bench(iterations: u32) {
     );
     println!("  = {:.3} ms median of in-process work; the rest of the reaction time is network (feed + send).", p(0.5) as f64 / 1000.0);
 }
+
+// ------------------------------------------------------------------ discover (GMGN)
+
+/// Scores ported from GMGN's official `gmgn-wallet-score` skill (stats-only
+/// factors; entry-mcap / fast-flip factors need activity sampling and are
+/// covered by `leader-report` on-chain + shadow mode).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalletCard {
+    pub address: String,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub seen_buys: u32,
+    pub seen_sells: u32,
+    pub trades_7d: u64,
+    pub tokens_7d: u64,
+    pub realized_profit_usd: f64,
+    pub roi: f64,
+    pub winrate: f64,
+    pub avg_hold_s: f64,
+    pub created_tokens: u64,
+    pub track_score: u32,
+    pub copy_score_partial: u32,
+    pub flags: Vec<String>,
+}
+
+fn clamp01(x: f64) -> f64 {
+    x.clamp(0.0, 1.0)
+}
+
+pub fn score_stats(address: &str, s: &serde_json::Value) -> WalletCard {
+    use serde_json::Value;
+    let f = |v: &Value| match v {
+        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::String(x) => x.parse().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let pnl = &s["pnl_stat"];
+    let common = &s["common"];
+    let buy = f(if s["buy"].is_null() {
+        &s["buy_count"]
+    } else {
+        &s["buy"]
+    }) as u64;
+    let sell = f(if s["sell"].is_null() {
+        &s["sell_count"]
+    } else {
+        &s["sell"]
+    }) as u64;
+    let trades = buy + sell;
+    let token_num = f(&pnl["token_num"]) as u64;
+    let (gt5, x2_5, x0_2, lt_n50) = (
+        f(&pnl["pnl_gt_5x_num"]),
+        f(&pnl["pnl_2x_5x_num"]),
+        f(&pnl["pnl_0x_2x_num"]),
+        f(&pnl["pnl_lt_nd5_num"]),
+    );
+    let realized = f(&s["realized_profit"]);
+    let roi = if s["realized_profit_pnl"].is_null() {
+        f(&s["pnl"])
+    } else {
+        f(&s["realized_profit_pnl"])
+    };
+    let winrate = if pnl["winrate"].is_null() {
+        f(&s["winrate"])
+    } else {
+        f(&pnl["winrate"])
+    };
+    let avg_hold_s = f(&pnl["avg_holding_period"]);
+    let created = f(&common["created_token_count"]) as u64;
+    let tn = token_num.max(1) as f64;
+
+    // track-record score (GMGN weights)
+    let tail = 1.0 - lt_n50 / tn;
+    let upside = (gt5 + x2_5 + x0_2) / tn;
+    let roi_f = clamp01((roi + 0.05) / 0.35);
+    let win_f = clamp01(winrate / 0.5);
+    let size_f = clamp01((tn - 20.0) / 300.0);
+    let track =
+        0.34 * clamp01(tail) + 0.28 * clamp01(upside) + 0.16 * roi_f + 0.10 * win_f + 0.12 * size_f;
+    // copy-tradeability, stats-only factors (GMGN weights renormalised over profit/hold/feasible)
+    let avg_trade_usd = if sell > 0 {
+        realized / sell as f64
+    } else {
+        0.0
+    };
+    let profit_f = clamp01(avg_trade_usd / 80.0);
+    let hold_f = clamp01(avg_hold_s / 172_800.0 + 0.15);
+    let feasible_f = clamp01(1.0 - trades as f64 / 2500.0);
+    let copy = (0.22 * profit_f + 0.20 * hold_f + 0.18 * feasible_f) / 0.60;
+    let is_dev = created > 0 && created as f64 > 0.5 * tn;
+    let discount = if is_dev { 0.45 } else { 1.0 };
+
+    let mut flags = vec![];
+    if trades >= 2000 {
+        flags.push(format!("bot-tier frequency ({trades} trades/7d)"));
+    }
+    if avg_hold_s > 0.0 && avg_hold_s < 60.0 {
+        flags.push(format!(
+            "avg hold {avg_hold_s:.0}s: you'd be exit liquidity"
+        ));
+    }
+    if is_dev {
+        flags.push(format!(
+            "mostly a token launcher ({created} created): self-dealing"
+        ));
+    }
+    if realized <= 0.0 {
+        flags.push("not profitable over 7d".into());
+    }
+    if token_num < 10 {
+        flags.push("small sample".into());
+    }
+    WalletCard {
+        address: address.to_string(),
+        name: common["twitter_name"]
+            .as_str()
+            .or(common["name"].as_str())
+            .unwrap_or("")
+            .to_string(),
+        tags: common["tags"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        seen_buys: 0,
+        seen_sells: 0,
+        trades_7d: trades,
+        tokens_7d: token_num,
+        realized_profit_usd: realized,
+        roi,
+        winrate,
+        avg_hold_s,
+        created_tokens: created,
+        track_score: (100.0 * track * discount).round() as u32,
+        copy_score_partial: (100.0 * copy * discount).round() as u32,
+        flags,
+    }
+}
+
+pub async fn discover(cfg: &BotConfig, limit: u32, top: usize) -> anyhow::Result<()> {
+    let gc = cfg.infra.gmgn.clone().unwrap_or(crate::gmgn::GmgnConfig {
+        api_key_env: "GMGN_API_KEY".into(),
+        requests_per_sec: 4.0,
+        enrich: true,
+        gate: None,
+    });
+    let gm = crate::gmgn::Gmgn::from_config(&gc)
+        .ok_or_else(|| anyhow::anyhow!("set {} (GMGN OpenAPI key)", gc.api_key_env))?;
+    let mut seen: HashMap<String, (u32, u32, Vec<String>)> = HashMap::new();
+    for (src, res) in [
+        ("smartmoney", gm.smartmoney_trades(limit).await),
+        ("kol", gm.kol_trades(limit).await),
+    ] {
+        let v = res.map_err(|e| anyhow::anyhow!("{src}: {e}"))?;
+        for t in v["list"].as_array().into_iter().flatten() {
+            let Some(maker) = t["maker"].as_str() else {
+                continue;
+            };
+            let e = seen.entry(maker.to_string()).or_default();
+            if t["side"] == "buy" {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+            for tag in t["maker_info"]["tags"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str())
+            {
+                if !e.2.iter().any(|x| x == tag) {
+                    e.2.push(tag.to_string());
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{} active smart-money / KOL wallets in the latest feed; scoring…",
+        seen.len()
+    );
+    let wallets: Vec<String> = seen.keys().cloned().collect();
+    let mut cards = vec![];
+    for chunk in wallets.chunks(20) {
+        let v = gm.wallet_stats(chunk, "7d").await?;
+        let rows: Vec<serde_json::Value> = match &v {
+            serde_json::Value::Array(a) => a.clone(),
+            o => vec![o.clone()],
+        };
+        for (i, row) in rows.iter().enumerate() {
+            let addr = row["wallet_address"]
+                .as_str()
+                .or(row["address"].as_str())
+                .map(String::from)
+                .or_else(|| chunk.get(i).cloned())
+                .unwrap_or_default();
+            let mut c = score_stats(&addr, row);
+            if let Some((b, s, tags)) = seen.get(&addr) {
+                c.seen_buys = *b;
+                c.seen_sells = *s;
+                for t in tags {
+                    if !c.tags.contains(t) {
+                        c.tags.push(t.clone());
+                    }
+                }
+            }
+            cards.push(c);
+        }
+    }
+    cards.sort_by_key(|c| {
+        std::cmp::Reverse(
+            c.flags.is_empty() as u32 * 1000 + c.copy_score_partial * 2 + c.track_score,
+        )
+    });
+    println!(
+        "{:<44} {:>5} {:>5} {:>7} {:>10} {:>6} {:>8}  name / tags / flags",
+        "wallet", "track", "copy", "trades", "pnl_usd", "win", "hold"
+    );
+    for c in cards.iter().take(top) {
+        println!(
+            "{:<44} {:>5} {:>5} {:>7} {:>10.0} {:>5.0}% {:>7.0}m  {} [{}] {}",
+            c.address,
+            c.track_score,
+            c.copy_score_partial,
+            c.trades_7d,
+            c.realized_profit_usd,
+            c.winrate * 100.0,
+            c.avg_hold_s / 60.0,
+            c.name,
+            c.tags.join(","),
+            if c.flags.is_empty() {
+                String::new()
+            } else {
+                format!("⚠ {}", c.flags.join("; "))
+            }
+        );
+    }
+    println!("\n# Paste candidates into config as probation leaders, verify with `copybot leader-report <addr>`, then shadow mode:");
+    for c in cards
+        .iter()
+        .filter(|c| c.flags.is_empty())
+        .take(top.min(10))
+    {
+        println!("[[leaders]]\naddress = \"{}\"\nlabel = \"{}\"\nenabled = false   # track {} / copy {} (GMGN 7d)\n", c.address, if c.name.is_empty() { "gmgn" } else { &c.name }, c.track_score, c.copy_score_partial);
+    }
+    Ok(())
+}
+
+/// GMGN token panel for one mint: intel + tagged top holders.
+pub async fn token_intel(cfg: &BotConfig, mint: &str) -> anyhow::Result<()> {
+    let gc = cfg
+        .infra
+        .gmgn
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("configure [infra.gmgn]"))?;
+    let gm = crate::gmgn::Gmgn::from_config(&gc)
+        .ok_or_else(|| anyhow::anyhow!("set {}", gc.api_key_env))?;
+    let (intel, _) = gm.token_intel(mint).await?;
+    println!("{}", serde_json::to_string_pretty(&intel)?);
+    if let Some(g) = &gc.gate {
+        println!(
+            "gate: {}",
+            match g.check(&intel) {
+                Ok(()) => "PASS".to_string(),
+                Err(e) => format!("BLOCK ({e})"),
+            }
+        );
+    }
+    for tag in [
+        "sniper",
+        "bundler",
+        "rat_trader",
+        "smart_degen",
+        "renowned",
+        "dev",
+    ] {
+        let v = gm.top_holders(mint, Some(tag), 20).await?;
+        let list = v["list"]
+            .as_array()
+            .or(v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let pct: f64 = list
+            .iter()
+            .filter_map(|h| {
+                h["amount_percentage"]
+                    .as_f64()
+                    .or_else(|| h["amount_percentage"].as_str()?.parse().ok())
+            })
+            .sum();
+        println!(
+            "{tag:<12} {:>3} wallets holding {:.2}% of supply",
+            list.len(),
+            pct * 100.0
+        );
+    }
+    Ok(())
+}
+
+/// GMGN view of a wallet: 7d/30d stats score + launched tokens.
+pub async fn gmgn_wallet(cfg: &BotConfig, wallet: &str) -> anyhow::Result<()> {
+    let Some(gc) = cfg.infra.gmgn.clone() else {
+        return Ok(());
+    };
+    let Some(gm) = crate::gmgn::Gmgn::from_config(&gc) else {
+        return Ok(());
+    };
+    println!("\nGMGN view");
+    for period in ["7d", "30d"] {
+        match gm.wallet_stats(&[wallet.to_string()], period).await {
+            Ok(v) => {
+                let row = v.as_array().and_then(|a| a.first().cloned()).unwrap_or(v);
+                let c = score_stats(wallet, &row);
+                println!(
+                    "  {period}: track {} · copy {} (stats-only) · trades {} · pnl ${:.0} · win {:.0}% · avg hold {:.0} m {}",
+                    c.track_score, c.copy_score_partial, c.trades_7d, c.realized_profit_usd, c.winrate * 100.0, c.avg_hold_s / 60.0,
+                    if c.flags.is_empty() { String::new() } else { format!("⚠ {}", c.flags.join("; ")) }
+                );
+            }
+            Err(e) => println!("  {period}: {e}"),
+        }
+    }
+    if let Ok(ct) = gm.created_tokens(wallet).await {
+        let n = ct["tokens"].as_array().map(|a| a.len()).unwrap_or(0);
+        if n > 0 {
+            println!(
+                "  launched {n} tokens (open {} / still on curve {})",
+                ct["open_count"], ct["inner_count"]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod discover_tests {
+    use super::*;
+
+    #[test]
+    fn gmgn_scoring_port() {
+        let good = serde_json::json!({
+            "buy": 40, "sell": 35, "realized_profit": "12000", "pnl": 0.4,
+            "pnl_stat": {"token_num": 60, "winrate": 0.55, "avg_holding_period": 5400, "pnl_gt_5x_num": 3, "pnl_2x_5x_num": 8, "pnl_0x_2x_num": 22, "pnl_lt_nd5_num": 2},
+            "common": {"name": "alpha", "tags": ["smart_degen"], "created_token_count": 0}
+        });
+        let c = score_stats("A", &good);
+        assert!(c.flags.is_empty(), "{:?}", c.flags);
+        assert!(c.track_score > 60, "{}", c.track_score);
+        let bot = serde_json::json!({
+            "buy": 3000, "sell": 2900, "realized_profit": 900, "pnl": 0.02,
+            "pnl_stat": {"token_num": 800, "winrate": 0.6, "avg_holding_period": 8, "pnl_lt_nd5_num": 50},
+            "common": {}
+        });
+        let b = score_stats("B", &bot);
+        assert!(b.flags.iter().any(|f| f.contains("bot-tier")));
+        assert!(b.flags.iter().any(|f| f.contains("exit liquidity")));
+        assert!(b.copy_score_partial < c.copy_score_partial);
+        let dev = serde_json::json!({"buy": 30, "sell": 30, "realized_profit": 5000, "pnl_stat": {"token_num": 20}, "common": {"created_token_count": 15}});
+        assert!(score_stats("D", &dev)
+            .flags
+            .iter()
+            .any(|f| f.contains("launcher")));
+    }
+}

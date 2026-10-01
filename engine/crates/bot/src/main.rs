@@ -4,6 +4,7 @@
 //!   copybot run              start the engine (mode from config: shadow | paper | live)
 //!   copybot simulate         dry-run our real buy against mainnet (no keys, no funds)
 //!   copybot leader-report    score a wallet from its on-chain history
+//!   copybot discover         leader candidates from GMGN smart-money / KOL feeds
 //!   copybot wallet …         create / import / balance / sweep / close-empty
 //!   copybot ctl <cmd>        talk to the running engine: status | positions | leaders | pause | resume | kill | flatten
 
@@ -11,6 +12,7 @@ mod cfg;
 mod control;
 mod engine;
 mod exec;
+mod gmgn;
 mod journal;
 mod keystore;
 mod tools;
@@ -69,6 +71,15 @@ enum Cmd {
     },
     /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten
     Ctl { command: String },
+    /// Find leader candidates from GMGN's live smart-money / KOL feeds (needs GMGN_API_KEY)
+    Discover {
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+    /// GMGN token panel: holders, dev, snipers, bundlers, insiders, smart money, socials, gate verdict
+    TokenIntel { mint: String },
     /// Measure in-process reaction time (decode → size → build → sign)
     Bench {
         #[arg(long, default_value_t = 10000)]
@@ -175,7 +186,8 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(if ok { 0 } else { 1 });
                 }
                 Cmd::LeaderReport { address, limit } => {
-                    tools::leader_report(&cfg, address.parse()?, limit).await
+                    tools::leader_report(&cfg, address.parse()?, limit).await?;
+                    tools::gmgn_wallet(&cfg, &address).await
                 }
                 Cmd::Wallet {
                     cmd: WalletCmd::Balance,
@@ -202,6 +214,8 @@ async fn main() -> anyhow::Result<()> {
                     tools::close_empty(&cfg, &kp).await
                 }
                 Cmd::Run => run(cfg).await,
+                Cmd::Discover { limit, top } => tools::discover(&cfg, limit, top).await,
+                Cmd::TokenIntel { mint } => tools::token_intel(&cfg, &mint).await,
                 Cmd::Ctl { command } => {
                     print!(
                         "{}",
@@ -280,10 +294,29 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
         cfg.infra.control_socket
     );
 
+    let gmgn_client = cfg.infra.gmgn.as_ref().and_then(|g| {
+        let c = gmgn::Gmgn::from_config(g);
+        if c.is_none() {
+            tracing::warn!(
+                "[infra.gmgn] configured but {} is not set: token intelligence disabled",
+                g.api_key_env
+            );
+        }
+        c.map(Arc::new)
+    });
+
     let (feed_tx, feed_rx) = mpsc::channel(200_000);
     let (filters_tx, filters_rx) = watch::channel(chain::geyser::Filters::default());
     let (res_tx, res_rx) = mpsc::channel(10_000);
-    let mut engine = engine::Engine::new(cfg.clone(), me, exec, journal, filters_tx, res_tx);
+    let mut engine = engine::Engine::new(
+        cfg.clone(),
+        me,
+        exec,
+        gmgn_client,
+        journal,
+        filters_tx,
+        res_tx,
+    );
     if live {
         // Recover: anything already held is put back under exit management.
         for prog in [

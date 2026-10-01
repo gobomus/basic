@@ -144,5 +144,23 @@ journal_dir = "data/journal"         # always on: JSONL of every signal, order, 
 postgres_url_env = "DATABASE_URL"    # optional: schema/postgres/001_state.sql
 clickhouse_url = ""                  # optional: http://host:8123 for schema/clickhouse
 
+[infra.gmgn]                         # GMGN OpenAPI (key from gmgn.ai → API); token + wallet intelligence
+api_key_env = "GMGN_API_KEY"
+requests_per_sec = 4
+enrich = true                        # log GMGN's token panel (holders, dev, snipers, bundlers, insiders,
+                                     # smart money/KOL, socials) next to every copy decision
+# Optional entry gate. Each entry waits up to timeout_ms for GMGN data, so this
+# trades latency for safety: enable it once shadow data shows which rules pay.
+# [infra.gmgn.gate]
+# timeout_ms = 350
+# allow_on_timeout = true
+# max_top10_rate = 0.45
+# max_bundler_rate = 0.30
+# max_rat_trader_rate = 0.20
+# max_insider_hold_rate = 0.20
+# max_rug_ratio = 0.5
+# skip_wash_trading = true
+# skip_if_dev_sold = false
+
 [infra.jupiter]                      # fallback route for venues without a direct builder
 base_url = "https://lite-api.jup.ag/swap/v1"

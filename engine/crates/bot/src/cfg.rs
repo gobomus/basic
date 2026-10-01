@@ -98,6 +98,9 @@ pub struct InfraConfig {
     pub control_socket: String,
     #[serde(default)]
     pub storage: StorageConfig,
+    /// GMGN OpenAPI: token intelligence + wallet analytics (optional).
+    #[serde(default)]
+    pub gmgn: Option<crate::gmgn::GmgnConfig>,
     /// Fallback router for venues without a direct builder.
     #[serde(default)]
     pub jupiter: Option<JupiterConfig>,

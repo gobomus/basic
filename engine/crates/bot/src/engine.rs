@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, watch};
 use crate::cfg::BotConfig;
 use crate::control::{Command, Request};
 use crate::exec::{Confirmation, Exec, SendOutcome, SOL_MINT};
+use crate::gmgn::{Gmgn, TokenIntel};
 use crate::journal::{now_ms, Journal};
 
 const PATH_CAP: usize = 200_000;
@@ -113,10 +114,24 @@ pub enum OrderResult {
         template: Box<anyhow::Result<Template>>,
     },
     Balance(u64),
+    Intel {
+        mint: Pubkey,
+        intel: Option<Box<(TokenIntel, serde_json::Value)>>,
+        error: Option<String>,
+    },
     TokenBalance {
         mint: Pubkey,
         amount: u64,
     },
+}
+
+/// A copy entry waiting for GMGN token intelligence (intel gate).
+struct PendingEntry {
+    observed_ns: u64,
+    swap: DetectedSwap,
+    leader: LeaderConfig,
+    lamports: u64,
+    signal: serde_json::Value,
 }
 
 #[derive(Default)]
@@ -153,6 +168,8 @@ pub struct Engine {
     mode: RunMode,
     me: Pubkey,
     exec: Option<Arc<Exec>>,
+    gmgn: Option<Arc<Gmgn>>,
+    pending: HashMap<Pubkey, PendingEntry>,
     journal: Journal,
     leaders: HashMap<Pubkey, LeaderConfig>,
     tokens: HashMap<Pubkey, TokenInfo>,
@@ -179,6 +196,7 @@ impl Engine {
         cfg: BotConfig,
         me: Pubkey,
         exec: Option<Arc<Exec>>,
+        gmgn: Option<Arc<Gmgn>>,
         journal: Journal,
         filters: watch::Sender<Filters>,
         results_tx: mpsc::Sender<OrderResult>,
@@ -204,6 +222,8 @@ impl Engine {
             cfg,
             me,
             exec,
+            gmgn,
+            pending: HashMap::new(),
             journal,
             leaders,
             tokens: HashMap::new(),
@@ -525,17 +545,15 @@ impl Engine {
             ),
             SizeDecision::Skip { reason } => ("skip", Some(format!("{reason:?}")), None, None),
         };
-        self.journal.record(
-            "signal",
-            json!({
-                "leader": s.wallet.to_string(), "label": lcfg.label, "signature": tx.signature, "slot": tx.slot,
-                "tx_index": tx.tx_index, "mint": s.mint.to_string(), "venue": s.venue, "side": "buy",
-                "leader_sol": s.sol_amount, "leader_price": s.price_sol, "source": format!("{:?}", tx.source).to_lowercase(),
-                "slot_lag": lag, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
-                "pool_sol": s.pool_sol, "exact": s.exact, "token_age_secs": entry.token_age_secs,
-            }),
-        );
+        let signal = json!({
+            "leader": s.wallet.to_string(), "label": lcfg.label, "signature": tx.signature, "slot": tx.slot,
+            "tx_index": tx.tx_index, "mint": s.mint.to_string(), "venue": s.venue, "side": "buy",
+            "leader_sol": s.sol_amount, "leader_price": s.price_sol, "source": format!("{:?}", tx.source).to_lowercase(),
+            "slot_lag": lag, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
+            "pool_sol": s.pool_sol, "exact": s.exact, "token_age_secs": entry.token_age_secs,
+        });
         let Some(lamports) = size else {
+            self.journal.record("signal", signal);
             self.stats.skips += 1;
             *self
                 .stats
@@ -544,11 +562,145 @@ impl Engine {
                 .or_default() += 1;
             return;
         };
+        let gate = self.cfg.infra.gmgn.as_ref().and_then(|g| g.gate.clone());
+        if let (Some(gate), Some(gm)) = (gate, self.gmgn.clone()) {
+            if self.pending.contains_key(&s.mint) {
+                return; // already waiting on intel for this mint
+            }
+            self.pending.insert(
+                s.mint,
+                PendingEntry {
+                    observed_ns: tx.observed_at_ns,
+                    swap: s.clone(),
+                    leader: lcfg.clone(),
+                    lamports,
+                    signal,
+                },
+            );
+            self.spawn_intel(gm, s.mint, Some(Duration::from_millis(gate.timeout_ms)));
+            return;
+        }
+        self.journal.record("signal", signal);
         self.stats.copies += 1;
-        self.enter(tx, s, &lcfg, lamports);
+        self.enter(tx.observed_at_ns, s, &lcfg, lamports);
+        if let (Some(gm), true) = (
+            self.gmgn.clone(),
+            self.cfg.infra.gmgn.as_ref().is_some_and(|g| g.enrich),
+        ) {
+            self.spawn_intel(gm, s.mint, None);
+        }
     }
 
-    fn enter(&mut self, tx: &ChainTx, s: &DetectedSwap, lcfg: &LeaderConfig, lamports: u64) {
+    fn spawn_intel(&self, gm: Arc<Gmgn>, mint: Pubkey, timeout: Option<Duration>) {
+        let results = self.results_tx.clone();
+        tokio::spawn(async move {
+            let mint_s = mint.to_string();
+            let fut = gm.token_intel(&mint_s);
+            let res = match timeout {
+                Some(t) => tokio::time::timeout(t, fut)
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timeout"))),
+                None => fut.await,
+            };
+            let (intel, error) = match res {
+                Ok(v) => (Some(Box::new(v)), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            let _ = results
+                .send(OrderResult::Intel { mint, intel, error })
+                .await;
+        });
+    }
+
+    fn on_intel(
+        &mut self,
+        mint: Pubkey,
+        intel: Option<Box<(TokenIntel, serde_json::Value)>>,
+        error: Option<String>,
+    ) {
+        if let Some(b) = &intel {
+            self.journal.record(
+                "token_intel",
+                json!({"mint": mint.to_string(), "intel": b.0, "raw": b.1}),
+            );
+        }
+        let Some(p) = self.pending.remove(&mint) else {
+            return;
+        };
+        let gate = self
+            .cfg
+            .infra
+            .gmgn
+            .as_ref()
+            .and_then(|g| g.gate.clone())
+            .expect("pending implies gate");
+        let verdict = match (&intel, &error) {
+            (Some(b), _) => gate.check(&b.0),
+            (None, e) if gate.allow_on_timeout => {
+                tracing::warn!(
+                    "intel unavailable for {mint} ({e:?}); entering per allow_on_timeout"
+                );
+                Ok(())
+            }
+            (None, e) => Err(format!(
+                "intel unavailable: {}",
+                e.clone().unwrap_or_default()
+            )),
+        };
+        // The world moved while we waited: re-check safety and price drift.
+        let price_now = self
+            .tokens
+            .get(&mint)
+            .map(|t| t.price)
+            .unwrap_or(p.swap.price_sol);
+        let drift = if p.swap.price_sol > 0.0 {
+            price_now / p.swap.price_sol - 1.0
+        } else {
+            0.0
+        };
+        let verdict = verdict.and_then(|_| {
+            if self.killed || self.paused || self.feed_stale {
+                Err("KillSwitch".to_string())
+            } else if drift > self.cfg.engine.filters.max_price_drift_pct {
+                Err(format!(
+                    "PriceAlreadyMoved {:.1}% while waiting for intel",
+                    drift * 100.0
+                ))
+            } else if self
+                .positions
+                .get(&mint)
+                .is_some_and(|q| q.leader != p.swap.wallet)
+            {
+                Err("PositionCapReached".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        let mut signal = p.signal;
+        signal["intel_gate"] = json!(verdict.as_ref().err());
+        signal["intel_wait_ms"] =
+            json!(ChainTx::now_ns().saturating_sub(p.observed_ns) / 1_000_000);
+        match verdict {
+            Ok(()) => {
+                self.journal.record("signal", signal);
+                self.stats.copies += 1;
+                self.enter(p.observed_ns, &p.swap, &p.leader, p.lamports);
+            }
+            Err(reason) => {
+                signal["decision"] = json!("skip");
+                signal["skip_reason"] = json!(format!("IntelGate: {reason}"));
+                self.journal.record("signal", signal);
+                self.stats.skips += 1;
+                *self
+                    .stats
+                    .skip_reasons
+                    .entry("IntelGate".into())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    fn enter(&mut self, observed_ns: u64, s: &DetectedSwap, lcfg: &LeaderConfig, lamports: u64) {
         let template = self
             .tokens
             .get(&s.mint)
@@ -608,7 +760,7 @@ impl Engine {
             let tip = self.cfg.infra.fees.tip_lamports_buy;
             let cu = self.cfg.infra.fees.cu_limit_buy;
             let results = self.results_tx.clone();
-            let observed = tx.observed_at_ns;
+            let observed = observed_ns;
             tokio::spawn(async move {
                 let outcome = match plan {
                     Some((ixs, _, _)) => exec.send_ixs(ixs, cu, tip, salt).await,
@@ -1211,6 +1363,7 @@ impl Engine {
                 Err(e) => tracing::warn!("migrated template for {mint}: {e}"),
             },
             OrderResult::Balance(b) => self.balance = b,
+            OrderResult::Intel { mint, intel, error } => self.on_intel(mint, intel, error),
             OrderResult::TokenBalance { mint, amount } => {
                 if let Some(p) = self.positions.get_mut(&mint) {
                     if p.status == PosStatus::Opening && amount > 0 {
@@ -1592,7 +1745,7 @@ mod tests {
         let (ftx, _frx) = watch::channel(Filters::default());
         let (rtx, rrx) = mpsc::channel(100);
         (
-            Engine::new(cfg, Pubkey::new_unique(), None, journal, ftx, rtx),
+            Engine::new(cfg, Pubkey::new_unique(), None, None, journal, ftx, rtx),
             rrx,
         )
     }
@@ -1921,7 +2074,7 @@ mod adopt_tests {
             .unwrap();
         let (ftx, _f) = watch::channel(Filters::default());
         let (rtx, _r) = mpsc::channel(10);
-        let mut e = Engine::new(cfg, Pubkey::new_unique(), None, journal, ftx, rtx);
+        let mut e = Engine::new(cfg, Pubkey::new_unique(), None, None, journal, ftx, rtx);
         let mint = Pubkey::new_unique();
         e.adopt(mint, 1_000_000, chain::consts::TOKEN_PROGRAM, 6);
         e.apply_event(
@@ -1940,5 +2093,177 @@ mod adopt_tests {
             },
         ); // -40% → stop loss (35%)
         assert!(!e.positions.contains_key(&mint));
+    }
+}
+
+#[cfg(test)]
+mod intel_gate_tests {
+    use super::*;
+    use crate::gmgn::{GmgnConfig, IntelGate};
+    use chain::detect::Template;
+    use chain::pump::{CurveCoin, CurveState};
+
+    fn swap(leader: Pubkey, mint: Pubkey) -> DetectedSwap {
+        DetectedSwap {
+            wallet: leader,
+            mint,
+            side: Side::Buy,
+            venue: Venue::PumpFunCurve,
+            sol_amount: 1_000_000_000,
+            token_amount: 1,
+            token_decimals: 6,
+            token_program: chain::consts::TOKEN_PROGRAM,
+            price_sol: 3e-8,
+            pool_sol: Some(30_000_000_000),
+            fraction_sold: None,
+            exact: true,
+            template: Template::Curve {
+                coin: CurveCoin::sol_paired(
+                    mint,
+                    Pubkey::new_unique(),
+                    chain::consts::TOKEN_PROGRAM,
+                    false,
+                ),
+                state: CurveState {
+                    virtual_token_reserves: 1_000_000_000_000_000,
+                    virtual_quote_reserves: 30_000_000_000,
+                    real_token_reserves: 800_000_000_000_000,
+                    real_quote_reserves: 30_000_000_000,
+                },
+                fee_bps: 125,
+            },
+            creator: None,
+            migrated: false,
+        }
+    }
+
+    async fn engine(allow_on_timeout: bool) -> (Engine, Pubkey) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg =
+            BotConfig::from_toml(include_str!("../../../../config/copybot.example.toml")).unwrap();
+        cfg.engine.mode = RunMode::Paper;
+        let leader = Pubkey::new_unique();
+        cfg.engine.leaders = vec![LeaderConfig {
+            address: leader.to_string(),
+            label: "L".into(),
+            enabled: true,
+            copy_pct: None,
+            max_buy_sol: None,
+            exit: None,
+        }];
+        cfg.infra.gmgn = Some(GmgnConfig {
+            api_key_env: "X".into(),
+            requests_per_sec: 100.0,
+            enrich: true,
+            gate: Some(IntelGate {
+                timeout_ms: 50,
+                allow_on_timeout,
+                max_top10_rate: Some(0.5),
+                max_dev_team_hold_rate: None,
+                max_creator_hold_rate: None,
+                max_insider_hold_rate: None,
+                max_bundler_rate: Some(0.3),
+                max_rat_trader_rate: None,
+                max_rug_ratio: None,
+                max_sniper_count: None,
+                max_fresh_wallet_rate: None,
+                min_holders: None,
+                skip_wash_trading: true,
+                require_mint_renounced: false,
+                require_freeze_renounced: false,
+                skip_if_dev_sold: false,
+            }),
+        });
+        let journal = Journal::start(dir.path().to_str().unwrap(), None, None)
+            .await
+            .unwrap();
+        std::mem::forget(dir);
+        let (ftx, _f) = watch::channel(Filters::default());
+        let (rtx, _r) = mpsc::channel(10);
+        (
+            Engine::new(cfg, Pubkey::new_unique(), None, None, journal, ftx, rtx),
+            leader,
+        )
+    }
+
+    fn pend(e: &mut Engine, leader: Pubkey, mint: Pubkey) {
+        let lc = e.leaders[&leader].clone();
+        e.tokens.insert(
+            mint,
+            TokenInfo {
+                template: swap(leader, mint).template,
+                price: 3e-8,
+                pool_sol: None,
+                creator: None,
+                token_program: chain::consts::TOKEN_PROGRAM,
+                decimals: 6,
+                created_ms: None,
+                migrated: false,
+            },
+        );
+        e.pending.insert(
+            mint,
+            PendingEntry {
+                observed_ns: ChainTx::now_ns(),
+                swap: swap(leader, mint),
+                leader: lc,
+                lamports: 100_000_000,
+                signal: json!({}),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_concentrated_token_and_passes_clean_one() {
+        let (mut e, leader) = engine(false).await;
+        let (bad, good) = (Pubkey::new_unique(), Pubkey::new_unique());
+        pend(&mut e, leader, bad);
+        e.on_intel(
+            bad,
+            Some(Box::new((
+                TokenIntel {
+                    top10_rate: Some(0.8),
+                    ..Default::default()
+                },
+                json!({}),
+            ))),
+            None,
+        );
+        assert!(!e.positions.contains_key(&bad));
+        assert_eq!(e.stats.skip_reasons.get("IntelGate"), Some(&1));
+        pend(&mut e, leader, good);
+        e.on_intel(
+            good,
+            Some(Box::new((
+                TokenIntel {
+                    top10_rate: Some(0.2),
+                    bundler_rate: Some(0.1),
+                    ..Default::default()
+                },
+                json!({}),
+            ))),
+            None,
+        );
+        assert!(e.positions.contains_key(&good));
+    }
+
+    #[tokio::test]
+    async fn timeout_policy() {
+        let (mut e, leader) = engine(false).await;
+        let m = Pubkey::new_unique();
+        pend(&mut e, leader, m);
+        e.on_intel(m, None, Some("timeout".into()));
+        assert!(
+            !e.positions.contains_key(&m),
+            "skip when data is missing and allow_on_timeout = false"
+        );
+
+        let (mut e, leader) = engine(true).await;
+        pend(&mut e, leader, m);
+        e.on_intel(m, None, Some("timeout".into()));
+        assert!(
+            e.positions.contains_key(&m),
+            "enter when allow_on_timeout = true"
+        );
     }
 }
