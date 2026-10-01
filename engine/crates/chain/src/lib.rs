@@ -10,6 +10,7 @@ pub mod model;
 pub mod pda;
 pub mod pump;
 pub mod pump_amm;
+pub mod raydium_launchlab;
 pub mod rpc;
 pub mod sender;
 pub mod tx;

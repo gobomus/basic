@@ -385,6 +385,12 @@ impl<'a> Enc<'a> {
         if let Some(d) = ty.get("defined") {
             let name = d["name"].as_str().unwrap();
             let t = &find(self.types, name)["type"];
+            if t["kind"] == "enum" {
+                let n = t["variants"].as_array().unwrap().len() as u64;
+                let v = (self.next() % n) as u8;
+                self.out.push(v);
+                return Value::from(v);
+            }
             let mut obj = serde_json::Map::new();
             for f in t["fields"].as_array().unwrap() {
                 if f.is_object() {
@@ -761,4 +767,113 @@ fn dbc_price_math() {
     let out = dbc::estimate_buy(p, 1_000_000_000, 100);
     assert!((out as f64 - 0.99e9 / p).abs() / (out as f64) < 1e-9);
     assert!(dbc::estimate_sell(p, out, 100) < 1_000_000_000);
+}
+
+// ---------------------------------------------------------------- Raydium LaunchLab
+
+fn launch_coin() -> chain::raydium_launchlab::LaunchCoin {
+    use chain::raydium_launchlab as ll;
+    let platform = Pubkey::new_unique();
+    let creator = Pubkey::new_unique();
+    ll::LaunchCoin {
+        pool: Pubkey::new_unique(),
+        global_config: Pubkey::new_unique(),
+        platform_config: platform,
+        base_mint: Pubkey::new_unique(),
+        quote_mint: WSOL_MINT,
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_token_program: TOKEN_PROGRAM,
+        quote_token_program: TOKEN_PROGRAM,
+        platform_fee_vault: ll::platform_fee_vault(&platform, &WSOL_MINT),
+        creator_fee_vault: ll::creator_fee_vault(&creator, &WSOL_MINT),
+    }
+}
+
+#[test]
+fn raydium_launchlab_matches_idl_and_sdk() {
+    use chain::raydium_launchlab as ll;
+    let d = idl("raydium_launchpad.json");
+    assert_eq!(d["address"], ll::LAUNCHLAB_PROGRAM.to_string());
+    // discriminators: IDL + the SDK's hard-coded anchorDataBuf values
+    assert_eq!(
+        ll::ix_disc("buy_exact_in").to_vec(),
+        disc_of(find(&d["instructions"], "buy_exact_in"))
+    );
+    assert_eq!(
+        ll::ix_disc("sell_exact_in").to_vec(),
+        disc_of(find(&d["instructions"], "sell_exact_in"))
+    );
+    assert_eq!(
+        ll::ix_disc("buy_exact_in"),
+        [250, 234, 13, 123, 213, 156, 19, 236]
+    );
+    assert_eq!(
+        ll::ix_disc("sell_exact_in"),
+        [149, 39, 222, 155, 211, 124, 152, 26]
+    );
+    assert_eq!(
+        ll::event_disc("TradeEvent").to_vec(),
+        disc_of(find(&d["events"], "TradeEvent"))
+    );
+
+    let user = Pubkey::new_unique();
+    let coin = launch_coin();
+    for (ixs, name) in [
+        (
+            ll::buy_instructions(&coin, &user, 1_000_000_000, 7),
+            "buy_exact_in",
+        ),
+        (ll::sell_instructions(&coin, &user, 5, 1), "sell_exact_in"),
+    ] {
+        let ix = ixs
+            .iter()
+            .find(|i| i.program_id == ll::LAUNCHLAB_PROGRAM)
+            .unwrap();
+        check_ix_against_idl(ix, &d, name, &ll::LAUNCHLAB_PROGRAM, &HashMap::new());
+        // SDK (instrument.ts) appends: system program, platform fee vault (w), creator fee vault (w)
+        let tail: Vec<(Pubkey, bool)> = ix.accounts[15..]
+            .iter()
+            .map(|m| (m.pubkey, m.is_writable))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                (SYSTEM_PROGRAM, false),
+                (coin.platform_fee_vault, true),
+                (coin.creator_fee_vault, true)
+            ]
+        );
+        assert_eq!(ix.data.len(), 8 + 24);
+        let rebuilt = ll::LaunchCoin::from_trade_ix(
+            &ix.accounts.iter().map(|m| m.pubkey).collect::<Vec<_>>(),
+            &ix.data,
+        )
+        .unwrap();
+        assert_eq!(rebuilt, coin);
+    }
+    // SDK PDA seeds
+    assert_eq!(
+        ll::authority(),
+        Pubkey::find_program_address(&[b"vault_auth_seed"], &ll::LAUNCHLAB_PROGRAM).0
+    );
+}
+
+#[test]
+fn raydium_launchlab_trade_event_decodes() {
+    use chain::raydium_launchlab as ll;
+    let d = idl("raydium_launchpad.json");
+    for seed in 1..100u64 {
+        let (bytes, f) = Enc::encode_struct(&d["types"], "TradeEvent", seed * 3571);
+        let mut data = EVENT_IX_TAG.to_vec();
+        data.extend(ll::event_disc("TradeEvent"));
+        data.extend(&bytes);
+        let e = ll::decode_event_ix(&data).expect("decode");
+        assert_eq!(e.pool, pk(&f["pool_state"]));
+        assert_eq!(e.virtual_base, f["virtual_base"].as_u64().unwrap());
+        assert_eq!(e.real_quote_after, f["real_quote_after"].as_u64().unwrap());
+        assert_eq!(e.amount_out, f["amount_out"].as_u64().unwrap());
+        assert_eq!(e.is_buy, f["trade_direction"].as_u64().unwrap() == 0);
+        assert_eq!(e.pool_status as u64, f["pool_status"].as_u64().unwrap());
+    }
 }

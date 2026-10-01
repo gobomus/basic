@@ -361,3 +361,118 @@ fn meteora_dbc_buy_detected_with_template() {
         t => panic!("{t:?}"),
     }
 }
+
+#[test]
+fn log_events_are_attributed_to_the_emitting_program() {
+    use base64::Engine;
+    let other = Pubkey::new_unique();
+    let mut tx = base_tx(Pubkey::new_unique());
+    let payload = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+    tx.logs = vec![
+        format!("Program {} invoke [1]", other),
+        format!("Program data: {payload}"),
+        format!("Program {PUMP_PROGRAM} invoke [2]"),
+        "Program data: BAUG".into(),
+        format!("Program {PUMP_PROGRAM} success"),
+        format!("Program data: {payload}"),
+        format!("Program {} success", other),
+    ];
+    assert_eq!(
+        detect::program_data_logs(&tx, &PUMP_PROGRAM),
+        vec![vec![4u8, 5, 6]]
+    );
+    assert_eq!(detect::program_data_logs(&tx, &other).len(), 2);
+}
+
+#[test]
+fn raydium_launchlab_buy_detected_with_template() {
+    use chain::raydium_launchlab as ll;
+    let leader = Pubkey::new_unique();
+    let platform = Pubkey::new_unique();
+    let coin = ll::LaunchCoin {
+        pool: Pubkey::new_unique(),
+        global_config: Pubkey::new_unique(),
+        platform_config: platform,
+        base_mint: Pubkey::new_unique(),
+        quote_mint: WSOL_MINT,
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_token_program: TOKEN_PROGRAM,
+        quote_token_program: TOKEN_PROGRAM,
+        platform_fee_vault: ll::platform_fee_vault(&platform, &WSOL_MINT),
+        creator_fee_vault: ll::creator_fee_vault(&Pubkey::new_unique(), &WSOL_MINT),
+    };
+    let mut tx = base_tx(leader);
+    for i in ll::buy_instructions(&coin, &leader, 1_000_000_000, 1) {
+        tx.top.push(to_ix(&i));
+    }
+    let idx = tx
+        .top
+        .iter()
+        .position(|i| i.program == ll::LAUNCHLAB_PROGRAM)
+        .unwrap();
+    let mut ev = EVENT_IX_TAG.to_vec();
+    ev.extend(ll::event_disc("TradeEvent"));
+    ev.extend(coin.pool.to_bytes());
+    // total_base_sell, virtual_base, virtual_quote, real_base_before, real_quote_before, real_base_after, real_quote_after
+    for v in [
+        793_100_000_000_000u64,
+        1_073_025_605_596_382,
+        30_000_852_951,
+        0,
+        0,
+        33_000_000_000_000,
+        990_000_000,
+    ] {
+        ev.extend(v.to_le_bytes());
+    }
+    for v in [
+        1_000_000_000u64,
+        33_000_000_000_000,
+        2_500_000,
+        5_000_000,
+        0,
+        0,
+    ] {
+        ev.extend(v.to_le_bytes());
+    }
+    ev.extend([0u8, 0u8, 1u8]); // Buy, Fund, exact_in
+    tx.inner.push((
+        idx,
+        vec![Ix {
+            program: ll::LAUNCHLAB_PROGRAM,
+            accounts: vec![],
+            data: ev,
+        }],
+    ));
+    tx.post_balances = vec![10_000_000_000 - 1_000_000_000 - 5000];
+    tx.post_tokens.push(TokenBal {
+        account: Pubkey::new_unique(),
+        mint: coin.base_mint,
+        owner: leader,
+        program: TOKEN_PROGRAM,
+        amount: 33_000_000_000_000,
+        decimals: 6,
+    });
+
+    let s = &detect::swaps_by(&tx, &leader)[0];
+    assert_eq!(
+        (s.venue, s.side, s.mint),
+        (Venue::RaydiumLaunchLab, Side::Buy, coin.base_mint)
+    );
+    assert_eq!(s.pool_sol, Some(990_000_000));
+    let expect_raw =
+        (30_000_852_951f64 + 990_000_000.0) / (1_073_025_605_596_382f64 - 33_000_000_000_000.0);
+    match &s.template {
+        Template::LaunchLab {
+            coin: c,
+            price_raw,
+            fee_bps,
+        } => {
+            assert_eq!(c, &coin);
+            assert!((price_raw - expect_raw).abs() / expect_raw < 1e-12);
+            assert_eq!(*fee_bps, 75); // 7.5M fees on 1 SOL in
+        }
+        t => panic!("{t:?}"),
+    }
+}

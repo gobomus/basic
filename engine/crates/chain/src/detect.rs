@@ -19,12 +19,13 @@ use crate::model::ChainTx;
 use crate::pda;
 use crate::pump::{self, CurveCoin, CurveState, PumpEvent, TradeEvent};
 use crate::pump_amm::{self, AmmCoin, SwapEventData};
+use crate::raydium_launchlab::{self as launchlab, LaunchCoin};
 
 // Venue labelling only (never used to move funds).
 const RAYDIUM_AMM_V4: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 const RAYDIUM_CPMM: Pubkey = pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
 const RAYDIUM_CLMM: Pubkey = pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
-const RAYDIUM_LAUNCHLAB: Pubkey = pubkey!("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj");
+const RAYDIUM_LAUNCHLAB: Pubkey = launchlab::LAUNCHLAB_PROGRAM;
 const METEORA_DBC: Pubkey = dbc::DBC_PROGRAM;
 const METEORA_DAMM_V2: Pubkey = pubkey!("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
 const METEORA_DLMM: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
@@ -85,6 +86,12 @@ pub enum Template {
     /// Meteora DBC: raw spot price (quote units per base unit) after the observed swap.
     Dbc {
         coin: DbcCoin,
+        price_raw: f64,
+        fee_bps: u64,
+    },
+    /// Raydium LaunchLab: raw spot price after the observed trade.
+    LaunchLab {
+        coin: LaunchCoin,
         price_raw: f64,
         fee_bps: u64,
     },
@@ -151,7 +158,8 @@ pub fn pump_events(tx: &ChainTx) -> Vec<PumpEvent> {
         .filter_map(|ix| pump::decode_event_ix(&ix.data))
         .collect();
     if out.is_empty() {
-        out = program_data_logs(tx)
+        out = program_data_logs(tx, &PUMP_PROGRAM)
+            .into_iter()
             .filter_map(|b| pump::decode_event(&b))
             .collect();
     }
@@ -165,19 +173,47 @@ pub fn amm_events(tx: &ChainTx) -> Vec<SwapEventData> {
         .filter_map(|ix| pump_amm::decode_event_ix(&ix.data))
         .collect();
     if out.is_empty() {
-        out = program_data_logs(tx)
+        out = program_data_logs(tx, &PUMP_AMM_PROGRAM)
+            .into_iter()
             .filter_map(|b| pump_amm::decode_event(&b))
             .collect();
     }
     out
 }
 
-fn program_data_logs(tx: &ChainTx) -> impl Iterator<Item = Vec<u8>> + '_ {
+/// `Program data:` payloads emitted *by `program`* (attributed via the
+/// invoke/success stack in the logs). Programs share event names — Pump and
+/// Raydium LaunchLab both emit a `TradeEvent` with the same discriminator —
+/// so unattributed log data must never be decoded.
+pub fn program_data_logs(tx: &ChainTx, program: &Pubkey) -> Vec<Vec<u8>> {
     use base64::Engine;
-    tx.logs
-        .iter()
-        .filter_map(|l| l.strip_prefix("Program data: "))
-        .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+    let target = program.to_string();
+    let mut stack: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for l in &tx.logs {
+        if let Some(rest) = l.strip_prefix("Program ") {
+            if let Some(data) = rest.strip_prefix("data: ") {
+                if stack.last() == Some(&target.as_str()) {
+                    if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        out.push(b);
+                    }
+                }
+                continue;
+            }
+            let mut parts = rest.split_whitespace();
+            let (Some(id), Some(word)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            match word {
+                "invoke" => stack.push(id),
+                "success" | "failed:" if stack.last() == Some(&id) => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> DetectedSwap {
@@ -418,6 +454,70 @@ fn enrich_dbc(tx: &ChainTx, swaps: &mut [DetectedSwap]) {
     }
 }
 
+fn launchlab_events(tx: &ChainTx) -> Vec<launchlab::TradeEvt> {
+    let mut ev: Vec<launchlab::TradeEvt> = tx
+        .all_ixs()
+        .filter(|ix| {
+            ix.program == launchlab::LAUNCHLAB_PROGRAM && ix.data.starts_with(&EVENT_IX_TAG)
+        })
+        .filter_map(|ix| launchlab::decode_event_ix(&ix.data))
+        .collect();
+    if ev.is_empty() {
+        ev = program_data_logs(tx, &launchlab::LAUNCHLAB_PROGRAM)
+            .iter()
+            .filter_map(|b| launchlab::decode_event(b))
+            .collect();
+    }
+    ev
+}
+
+/// Upgrade balance-delta swaps that went through Raydium LaunchLab.
+fn enrich_launchlab(tx: &ChainTx, swaps: &mut [DetectedSwap]) {
+    let trades: Vec<(Pubkey, LaunchCoin)> = tx
+        .all_ixs()
+        .filter(|ix| ix.program == launchlab::LAUNCHLAB_PROGRAM)
+        .filter_map(|ix| {
+            Some((
+                LaunchCoin::payer_of(&ix.accounts)?,
+                LaunchCoin::from_trade_ix(&ix.accounts, &ix.data)?,
+            ))
+        })
+        .collect();
+    if trades.is_empty() {
+        return;
+    }
+    let events = launchlab_events(tx);
+    for s in swaps
+        .iter_mut()
+        .filter(|s| matches!(s.template, Template::Generic))
+    {
+        let Some((_, coin)) = trades
+            .iter()
+            .find(|(payer, c)| *payer == s.wallet && c.base_mint == s.mint)
+        else {
+            continue;
+        };
+        if coin.quote_mint != WSOL_MINT {
+            continue;
+        }
+        s.venue = Venue::RaydiumLaunchLab;
+        let (price_raw, fee_bps) = match events.iter().find(|e| e.pool == coin.pool) {
+            Some(e) if e.price_raw() > 0.0 => {
+                s.price_sol = e.price_raw() * 10f64.powi(s.token_decimals as i32) / 1e9;
+                s.pool_sol = Some(e.real_quote_after);
+                s.migrated = e.pool_status != 0;
+                (e.price_raw(), e.fee_bps_estimate())
+            }
+            _ => (s.price_sol * 1e9 / 10f64.powi(s.token_decimals as i32), 200),
+        };
+        s.template = Template::LaunchLab {
+            coin: coin.clone(),
+            price_raw,
+            fee_bps,
+        };
+    }
+}
+
 /// Swaps executed by `wallet` in this transaction.
 pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     if tx.failed {
@@ -439,6 +539,7 @@ pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     if out.is_empty() && tx.has_meta {
         out = balance_swaps(tx, wallet);
         enrich_dbc(tx, &mut out);
+        enrich_launchlab(tx, &mut out);
     }
     out
 }
@@ -461,6 +562,7 @@ pub fn all_swaps(tx: &ChainTx) -> Vec<DetectedSwap> {
             out.extend(balance_swaps(tx, &s));
         }
         enrich_dbc(tx, &mut out);
+        enrich_launchlab(tx, &mut out);
     }
     out
 }

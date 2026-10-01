@@ -31,7 +31,8 @@ pub struct GeyserConfig {
     /// x-token / API key. Prefer the env var named in `x_token_env`.
     #[serde(default)]
     pub x_token_env: Option<String>,
-    /// Subscribe to every Pump + PumpSwap transaction (market firehose).
+    /// Subscribe to every Pump, PumpSwap, Meteora DBC and Raydium LaunchLab
+    /// transaction (market firehose).
     #[serde(default = "yes")]
     pub firehose: bool,
     /// Also open the pre-execution deshred stream (if the provider supports it).
@@ -113,7 +114,12 @@ fn request(cfg: &GeyserConfig, f: &Filters) -> SubscribeRequest {
         txs.insert(
             "firehose".into(),
             SubscribeRequestFilterTransactions {
-                account_include: vec![PUMP_PROGRAM.to_string(), PUMP_AMM_PROGRAM.to_string()],
+                account_include: vec![
+                    PUMP_PROGRAM.to_string(),
+                    PUMP_AMM_PROGRAM.to_string(),
+                    crate::meteora_dbc::DBC_PROGRAM.to_string(),
+                    crate::raydium_launchlab::LAUNCHLAB_PROGRAM.to_string(),
+                ],
                 ..base
             },
         );

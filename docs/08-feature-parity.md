@@ -44,7 +44,9 @@ An honest status of every feature category those platforms offer, as of this com
 |---|---|---|
 | Pump.fun curve buy/sell (`buy_exact_quote_in_v2`, `sell_v2`) | 🔶 | `chain::pump`, verified against the official IDL |
 | PumpSwap buy/sell (incl. cashback, pool-v2, buyback accounts) | 🔶 | `chain::pump_amm`, matches the official SDK |
-| Raydium, Meteora, Orca and other venues | 🔶 | detected for any venue; executed through the Jupiter fallback |
+| Meteora DBC (Bags, Jupiter Studio, Believe…) direct | 🔶 | `chain::meteora_dbc`, verified against the IDL in Meteora's SDK (Sep 2026) |
+| Raydium LaunchLab (LetsBONK) direct | 🔶 | `chain::raydium_launchlab`, IDL + Raydium SDK v2 (Sep 2026) account layout |
+| Other venues (Raydium AMM/CPMM/CLMM, Meteora DAMM/DLMM, Orca) | 🔶 | detected for any venue; executed through the Jupiter fallback |
 | Multi-sender fan-out (Jito, Helius Sender, Nozomi, 0slot, Astralane, RPC) | 🔶 | `chain::sender`, one signature so it can't double-fill |
 | Priority fee + Jito tip, urgent-exit tip boost, retry escalation | ✅ | `[infra.fees]`, `sell()` |
 | In-process reaction time | ✅ measured | `copybot bench`: **~0.2 ms** median (decode → size → build → sign) |
@@ -93,6 +95,8 @@ An honest status of every feature category those platforms offer, as of this com
 - **BasedBot:** no public repo or SDK exists.
 - **Proxima:** closed beta; GitHub org `proximacorp` with nothing public to build on.
 - **Pump.fun / PumpSwap:** official IDLs + `@pump-fun/pump-sdk` / `pump-swap-sdk` source.
+- **Meteora DBC:** IDL embedded in `@meteora-ag/dynamic-bonding-curve-sdk` 1.5.13 + its `swap()` builder.
+- **Raydium LaunchLab:** `raydium-io/raydium-idl` + `@raydium-io/raydium-sdk-v2` 0.2.73 (`launchpad/instrument.ts`, `pda.ts`, curve math).
 
 ## Why some items are 🔶
 The build sandbox's network policy blocks Solana RPC, gRPC and sender hosts. Everything was therefore verified offline:

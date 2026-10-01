@@ -107,7 +107,7 @@ control_socket = "data/copybot.sock"   # `copybot ctl status | pause | flatten .
 [infra.geyser]                       # any Yellowstone-gRPC endpoint (Triton, LaserStream, Shyft, ...)
 endpoint = "https://YOUR-GRPC-ENDPOINT:443"
 x_token_env = "GEYSER_X_TOKEN"
-firehose = true                      # stream every Pump / PumpSwap trade (prices, features, data)
+firehose = true                      # stream every Pump / PumpSwap / Meteora DBC / LaunchLab trade
 deshred = false                      # pre-execution stream, only if your provider supports it
 
 # Every order is ONE signed transaction pushed to all senders in parallel.
