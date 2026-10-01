@@ -35,7 +35,20 @@ sudo -u copybot bash -c 'set -a; . /etc/copybot.env; cd /opt/copybot && ./copybo
 ```
 It prints the wallet address. The private key is stored **encrypted** and is never shown. Back up `keys/hot-1.json` **and** your passphrase. Without both, the funds are gone.
 
+## 3b. (Recommended) Durable nonces for multi-sender sending
+Jito, Helius Sender, Nozomi and others each require tips to **their own** accounts. To use several at once, the bot signs one copy of each order per service on a shared *durable nonce*, so only one copy can ever execute:
+```bash
+./copybot wallet nonce-create --count 4      # ~0.0015 SOL rent each, refundable with `wallet nonce-close`
+```
+Paste the printed `nonce_accounts = [...]` line into `[infra]`. Without nonces, the bot uses only the first sender group (e.g. Jito) plus any plain RPC endpoints.
+
 ## 4. Pick leaders
+Find candidates from GMGN's live smart-money and KOL feeds (needs `GMGN_API_KEY` in `/etc/copybot.env`):
+```bash
+./copybot discover
+```
+It scores each active wallet with GMGN's own track-record and copy-tradeability method and prints ready-to-paste `[[leaders]]` entries.
+
 For each wallet you're considering:
 ```bash
 ./copybot leader-report <WALLET_ADDRESS>
@@ -46,7 +59,12 @@ It reads the wallet's history and reports:
 - median hold time;
 - active hours per day.
 
-It also flags wallets that are bots, or that flip too fast to copy (you'd be their exit liquidity). Add good candidates to `[[leaders]]` in the config.
+It also flags wallets that are bots, or that flip too fast to copy (you'd be their exit liquidity). With a GMGN key it adds GMGN's 7-day and 30-day scores. Add good candidates to `[[leaders]]` in the config.
+
+To check a specific token (holders, dev, snipers, bundlers, insiders, smart money, socials):
+```bash
+./copybot token-intel --mint <TOKEN_MINT>
+```
 
 ## 5. Preflight check
 ```bash

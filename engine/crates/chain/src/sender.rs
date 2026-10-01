@@ -24,6 +24,13 @@ pub struct SenderConfig {
     /// True if this endpoint accepts a tip paid to a Jito tip account.
     #[serde(default)]
     pub accepts_jito_tip: bool,
+    /// This service's own tip accounts (e.g. Helius Sender, Nozomi, Astralane).
+    /// Copy them from the provider's docs/SDK. Overrides `accepts_jito_tip`.
+    #[serde(default)]
+    pub tip_accounts: Vec<String>,
+    /// Provider minimum tip (lamports), e.g. 1_000_000 for Helius Sender Max.
+    #[serde(default)]
+    pub min_tip_lamports: u64,
     #[serde(default = "yes")]
     pub enabled: bool,
 }
@@ -38,6 +45,15 @@ pub struct SendReport {
     pub ok: bool,
     pub ms: u64,
     pub detail: String,
+}
+
+/// Senders that accept the same tip accounts (one signed variant per group).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TipGroup {
+    pub senders: Vec<usize>,
+    pub tip_accounts: Vec<Pubkey>,
+    pub min_tip_lamports: u64,
+    pub label: String,
 }
 
 #[derive(Clone)]
@@ -58,8 +74,71 @@ impl Fanout {
         self.senders.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// Group senders by tip family. Plain endpoints (no tip rule) ride along
+    /// with the first tipped group.
+    pub fn groups(&self, jito_tips: &[Pubkey]) -> Vec<TipGroup> {
+        let mut out: Vec<TipGroup> = Vec::new();
+        let mut plain = Vec::new();
+        for (i, s) in self.senders.iter().enumerate() {
+            let tips: Vec<Pubkey> = if !s.tip_accounts.is_empty() {
+                s.tip_accounts
+                    .iter()
+                    .filter_map(|t| t.parse().ok())
+                    .collect()
+            } else if s.accepts_jito_tip {
+                jito_tips.to_vec()
+            } else {
+                plain.push(i);
+                continue;
+            };
+            if tips.is_empty() {
+                plain.push(i);
+                continue;
+            }
+            match out.iter_mut().find(|g| g.tip_accounts == tips) {
+                Some(g) => {
+                    g.senders.push(i);
+                    g.min_tip_lamports = g.min_tip_lamports.max(s.min_tip_lamports);
+                    g.label = format!("{}+{}", g.label, s.name);
+                }
+                None => out.push(TipGroup {
+                    senders: vec![i],
+                    tip_accounts: tips,
+                    min_tip_lamports: s.min_tip_lamports,
+                    label: s.name.clone(),
+                }),
+            }
+        }
+        match out.first_mut() {
+            Some(g) => g.senders.extend(plain),
+            None => out.push(TipGroup {
+                senders: plain,
+                tip_accounts: vec![],
+                min_tip_lamports: 0,
+                label: "plain".into(),
+            }),
+        }
+        out
+    }
+
+    /// Send one wire transaction to the given sender indices.
+    pub async fn send_to(&self, idx: &[usize], wire_b64: &str) -> Vec<SendReport> {
+        let picked: Vec<SenderConfig> = idx
+            .iter()
+            .filter_map(|i| self.senders.get(*i).cloned())
+            .collect();
+        Fanout {
+            senders: Arc::new(picked),
+            http: self.http.clone(),
+        }
+        .send(wire_b64)
+        .await
+    }
+
     pub fn any_accepts_jito_tip(&self) -> bool {
-        self.senders.iter().any(|s| s.accepts_jito_tip)
+        self.senders
+            .iter()
+            .any(|s| s.accepts_jito_tip || !s.tip_accounts.is_empty())
     }
 
     /// Send to all endpoints concurrently; returns as soon as all have answered.
@@ -127,4 +206,50 @@ pub async fn fetch_jito_tip_accounts(block_engine_url: &str) -> anyhow::Result<V
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no tip accounts")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sc(name: &str, jito: bool, tips: &[&str]) -> SenderConfig {
+        SenderConfig {
+            name: name.into(),
+            url: "http://x".into(),
+            headers: Default::default(),
+            accepts_jito_tip: jito,
+            tip_accounts: tips.iter().map(|s| s.to_string()).collect(),
+            min_tip_lamports: 0,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn groups_by_tip_family() {
+        let h = Pubkey::new_unique().to_string();
+        let j = vec![Pubkey::new_unique()];
+        let f = Fanout::new(vec![
+            sc("jito-fra", true, &[]),
+            sc("helius", false, &[&h]),
+            sc("rpc", false, &[]),
+            sc("jito-ams", true, &[]),
+        ]);
+        let g = f.groups(&j);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].senders, vec![0, 3, 2], "jito group + plain rpc");
+        assert_eq!(g[0].tip_accounts, j);
+        assert_eq!(g[1].senders, vec![1]);
+        assert_eq!(g[1].tip_accounts, vec![h.parse::<Pubkey>().unwrap()]);
+        // no tips anywhere → one plain group
+        let f = Fanout::new(vec![sc("rpc", false, &[])]);
+        assert_eq!(
+            f.groups(&[]),
+            vec![TipGroup {
+                senders: vec![0],
+                tip_accounts: vec![],
+                min_tip_lamports: 0,
+                label: "plain".into()
+            }]
+        );
+    }
 }

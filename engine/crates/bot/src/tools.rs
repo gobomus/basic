@@ -89,6 +89,7 @@ pub async fn check(cfg: &BotConfig) -> anyhow::Result<bool> {
     match keystore::read(&cfg.infra.wallet.keystore) {
         Ok(f) => {
             let pk: Pubkey = f.pubkey.parse()?;
+            all_ok &= check_nonces(cfg, &rpc, &pk).await;
             match rpc.balance(&pk).await {
                 Ok(b) => {
                     let need = sol_to_lamports(
@@ -1016,6 +1017,117 @@ pub async fn gmgn_wallet(cfg: &BotConfig, wallet: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+// ------------------------------------------------------------------ durable nonces
+
+pub async fn nonce_create(cfg: &BotConfig, kp: &Keypair, count: u32) -> anyhow::Result<()> {
+    let rpc = Rpc::new(cfg.rpc_url()?);
+    let rent: u64 = rpc
+        .call(
+            "getMinimumBalanceForRentExemption",
+            serde_json::json!([chain::nonce::NONCE_ACCOUNT_SIZE]),
+        )
+        .await?
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("bad rent response"))?;
+    let mut created = vec![];
+    for _ in 0..count {
+        let nonce_kp = Keypair::new();
+        let ixs = chain::nonce::create_nonce_account(
+            &kp.pubkey(),
+            &nonce_kp.pubkey(),
+            &kp.pubkey(),
+            rent,
+        );
+        let (bh, _) = rpc.latest_blockhash("confirmed").await?;
+        let signed = tx::build_multi(
+            &[kp, &nonce_kp],
+            ixs,
+            50_000,
+            cfg.infra.fees.cu_price_micro_lamports,
+            bh,
+        )?;
+        let sig = rpc.send(&signed.wire_b64).await?;
+        let mut ok = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(st) = rpc.signature_statuses(std::slice::from_ref(&sig)).await {
+                if let Some(Some((_, err))) = st.first() {
+                    anyhow::ensure!(err.is_none(), "nonce creation failed: {err:?}");
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        anyhow::ensure!(ok, "nonce creation not confirmed: {sig}");
+        println!("created nonce account {}", nonce_kp.pubkey());
+        created.push(nonce_kp.pubkey().to_string());
+    }
+    let mut all = cfg.infra.nonce_accounts.clone();
+    all.extend(created);
+    println!(
+        "\nadd to [infra] in your config:\nnonce_accounts = {:?}",
+        all
+    );
+    Ok(())
+}
+
+pub async fn nonce_close(cfg: &BotConfig, kp: &Keypair) -> anyhow::Result<()> {
+    let rpc = Rpc::new(cfg.rpc_url()?);
+    for a in &cfg.infra.nonce_accounts {
+        let acc: Pubkey = a.parse()?;
+        let Some(info) = rpc.account(&acc).await? else {
+            println!("{acc}: not found");
+            continue;
+        };
+        let ix = chain::nonce::withdraw_nonce(&acc, &kp.pubkey(), &kp.pubkey(), info.lamports);
+        let sig = send_simple(cfg, kp, vec![ix]).await?;
+        println!("closed {acc}: {sig}");
+    }
+    println!("remove nonce_accounts from the config");
+    Ok(())
+}
+
+/// Preflight for nonce accounts: exist, initialised, owned by the hot wallet.
+async fn check_nonces(cfg: &BotConfig, rpc: &Rpc, wallet: &Pubkey) -> bool {
+    if cfg.infra.nonce_accounts.is_empty() {
+        let families = Fanout::new(cfg.infra.senders.clone())
+            .groups(&[Pubkey::new_unique()])
+            .len();
+        line(
+            families < 2,
+            "durable nonces",
+            if families < 2 {
+                "not needed (one tip family)".to_string()
+            } else {
+                format!("{families} tip families but no nonce_accounts: only the first family is used. Run `copybot wallet nonce-create`")
+            },
+        );
+        return true;
+    }
+    let mut ok = true;
+    for a in &cfg.infra.nonce_accounts {
+        let res = match a.parse::<Pubkey>() {
+            Err(e) => Err(e.to_string()),
+            Ok(pk) => match rpc.account(&pk).await {
+                Ok(Some(acc)) => match chain::nonce::parse_nonce_account(&acc.data) {
+                    Some((auth, _)) if auth == *wallet => Ok(()),
+                    Some((auth, _)) => Err(format!("authority {auth} ≠ hot wallet")),
+                    None => Err("not an initialised nonce account".into()),
+                },
+                Ok(None) => Err("not found".into()),
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        ok &= res.is_ok();
+        line(
+            res.is_ok(),
+            &format!("nonce {}", &a[..8.min(a.len())]),
+            res.err().unwrap_or_else(|| "ok".into()),
+        );
+    }
+    ok
 }
 
 #[cfg(test)]

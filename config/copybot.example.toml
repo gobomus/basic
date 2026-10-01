@@ -102,6 +102,7 @@ rpc_url_env = "RPC_URL"              # e.g. a Helius / Triton / QuickNode HTTPS 
 jito_block_engine = "https://frankfurt.mainnet.block-engine.jito.wtf"
 tip_accounts = []                    # empty = fetched from the block engine at startup
 feed_stale_secs = 5
+nonce_accounts = []                  # `copybot wallet nonce-create --count 4` prints these
 control_socket = "data/copybot.sock"   # `copybot ctl status | pause | flatten ...`
 
 [infra.geyser]                       # any Yellowstone-gRPC endpoint (Triton, LaserStream, Shyft, ...)
@@ -110,8 +111,10 @@ x_token_env = "GEYSER_X_TOKEN"
 firehose = true                      # stream every Pump / PumpSwap / Meteora DBC / LaunchLab trade
 deshred = false                      # pre-execution stream, only if your provider supports it
 
-# Every order is ONE signed transaction pushed to all senders in parallel.
-# It can execute at most once. Check each provider's docs for URL + tip rules.
+# Senders are grouped by whose tip accounts they accept. With one group, each
+# order is one signed transaction sent everywhere. With several groups (e.g.
+# Jito + Helius Sender + Nozomi), each order is signed once per group on a
+# shared durable nonce (see nonce_accounts) so only one variant can land.
 [[infra.senders]]
 name = "jito"
 url = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions"
@@ -119,8 +122,26 @@ accepts_jito_tip = true
 
 [[infra.senders]]
 name = "helius-sender"
-url = "http://fra-sender.helius-rpc.com/fast"
-accepts_jito_tip = true
+url = "http://fra-sender.helius-rpc.com/fast"   # regions: slc / ewr / lon / fra / ams / sg / tyo
+accepts_jito_tip = false
+min_tip_lamports = 1000000           # Sender Max minimum (0.001 SOL); 5000 = SWQoS-only tier
+# Helius Sender tip accounts, verbatim from helius-sdk 3.2.0 (SENDER_TIP_ACCOUNTS)
+tip_accounts = [
+  "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE", "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
+  "9bnz4RShgq1hAnLnZbP8kbgBg1kEmcJBYQq3gQbmnSta", "5VY91ws6B2hMmBFRsXkoAAdsPHBJwRfBht4DXox3xkwn",
+  "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD", "2q5pghRs6arqVjRvT5gfgWfWcHWmw1ZuCzphgd5KfWGJ",
+  "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",  "3KCKozbAaF75qEU33jtzozcJ29yJuaLJTy2jFdzUY8bT",
+  "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey", "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
+]
+
+# More landing services each have their OWN tip accounts. Paste them from the
+# provider's docs/SDK (never guess: a wrong address burns the tip).
+# [[infra.senders]]
+# name = "nozomi"
+# url = "https://fra1.secure.nozomi.temporal.xyz/?c=YOUR_KEY"
+# accepts_jito_tip = false
+# min_tip_lamports = 1000000
+# tip_accounts = ["…from use.temporal.xyz/nozomi…"]
 
 [[infra.senders]]
 name = "rpc"

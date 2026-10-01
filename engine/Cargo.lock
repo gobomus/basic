@@ -451,7 +451,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "solana-address",
+ "solana-hash",
+ "solana-instruction 3.5.1",
+ "solana-nonce",
+ "solana-pubkey",
  "solana-sdk",
+ "solana-system-interface",
  "thiserror",
  "tokio",
  "tracing",
@@ -3141,6 +3147,8 @@ version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d274410b6399c0d03442849a768e12f434dbe8909c4e19c26c9846fdf6d14eda"
 dependencies = [
+ "serde",
+ "serde_derive",
  "solana-fee-calculator",
  "solana-hash",
  "solana-pubkey",
@@ -3552,7 +3560,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e2d5311d0584af231c6c2b0503ba1c3aa50118ead4f503ab215ccbdd1ffac57"
 dependencies = [
  "num-traits",
+ "serde",
+ "serde_derive",
  "solana-address",
+ "solana-instruction 3.5.1",
  "solana-msg",
  "solana-program-error",
 ]

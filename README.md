@@ -7,7 +7,7 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 3. **Record everything** that terminals like GMGN, Axiom and Padre show (volume, transactions per second, holders, snipers, bundlers, dev history, socials, …) plus our own execution data. The resulting trade log tunes exits and sizing first, and later a **leader-free, self-adjusting engine**.
 
 > **Status: engine built; next step is the live-chain verification on your server.**
-> - Built and tested offline (42 tests):
+> - Built and tested offline (61 tests):
 >   - the live engine, real-time feed, Pump.fun and PumpSwap execution, multi-sender delivery, exits, risk controls, wallet tools, local control (`copybot ctl`) and journal;
 >   - all of it checked against Pump's official program definitions and SDK.
 > - Not yet run against mainnet: this build environment can't reach Solana.
@@ -46,9 +46,9 @@ archive/                    unrelated legacy code (RFO BASIC! Android app)
 ## Develop
 ```sh
 cd engine
-cargo test --workspace                 # 42 tests, incl. IDL conformance + end-to-end engine
+cargo test --workspace                 # 61 tests, incl. IDL conformance + end-to-end engine
 cargo build --release -p bot           # → target/release/copybot
-./target/release/copybot bench         # in-process reaction time (~0.2 ms median)
+./target/release/copybot bench         # in-process reaction time (~0.17 ms median)
 ```
 
 Real configs (`config/copybot.toml`), keys and `.env` files are git-ignored. Never commit key material.

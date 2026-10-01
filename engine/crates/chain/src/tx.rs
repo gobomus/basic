@@ -58,6 +58,67 @@ pub fn build(
     })
 }
 
+/// Same as [`build`] but on a durable nonce: `AdvanceNonceAccount` first and
+/// the nonce value as the recent blockhash. Variants sharing a nonce are
+/// mutually exclusive on-chain.
+pub fn build_with_nonce(
+    payer: &Keypair,
+    body: Vec<Instruction>,
+    fees: FeePlan,
+    tip_account: Option<&Pubkey>,
+    nonce_account: &Pubkey,
+    nonce_value: Hash,
+) -> anyhow::Result<SignedTx> {
+    let mut with_nonce = vec![crate::nonce::advance_nonce(nonce_account, &payer.pubkey())];
+    with_nonce.extend(body);
+    // `build` prepends compute-budget ixs; the nonce advance must stay first.
+    let mut ixs = Vec::with_capacity(with_nonce.len() + 3);
+    ixs.push(with_nonce.remove(0));
+    ixs.push(ixs::set_compute_unit_limit(fees.cu_limit));
+    if fees.cu_price_micro_lamports > 0 {
+        ixs.push(ixs::set_compute_unit_price(fees.cu_price_micro_lamports));
+    }
+    ixs.extend(with_nonce);
+    if fees.tip_lamports > 0 {
+        let to =
+            tip_account.ok_or_else(|| anyhow::anyhow!("tip requested but no tip account known"))?;
+        ixs.push(ixs::system_transfer(&payer.pubkey(), to, fees.tip_lamports));
+    }
+    sign(&[payer], ixs, nonce_value)
+}
+
+/// Sign with several keypairs (first = fee payer). Used for account creation.
+pub fn build_multi(
+    signers: &[&Keypair],
+    body: Vec<Instruction>,
+    cu_limit: u32,
+    cu_price: u64,
+    blockhash: Hash,
+) -> anyhow::Result<SignedTx> {
+    let mut ixs = vec![ixs::set_compute_unit_limit(cu_limit)];
+    if cu_price > 0 {
+        ixs.push(ixs::set_compute_unit_price(cu_price));
+    }
+    ixs.extend(body);
+    sign(signers, ixs, blockhash)
+}
+
+fn sign(signers: &[&Keypair], ixs: Vec<Instruction>, blockhash: Hash) -> anyhow::Result<SignedTx> {
+    let msg = v0::Message::try_compile(&signers[0].pubkey(), &ixs, &[], blockhash)?;
+    let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), signers)?;
+    let bytes = bincode::serialize(&tx)?;
+    anyhow::ensure!(
+        bytes.len() <= 1232,
+        "transaction too large: {} bytes",
+        bytes.len()
+    );
+    Ok(SignedTx {
+        signature: tx.signatures[0],
+        wire_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        tx,
+    })
+}
+
 /// Unsigned-equivalent message for `simulateTransaction` with `sigVerify=false`
 /// on behalf of any address (used by the `simulate` command — no keys needed).
 pub fn build_unsigned_b64(

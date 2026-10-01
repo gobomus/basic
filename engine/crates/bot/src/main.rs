@@ -122,6 +122,13 @@ enum WalletCmd {
     },
     /// Close empty token accounts to reclaim rent
     CloseEmpty,
+    /// Create durable nonce accounts for multi-sender fan-out (~0.0015 SOL rent each, refundable)
+    NonceCreate {
+        #[arg(long, default_value_t = 4)]
+        count: u32,
+    },
+    /// Close the configured nonce accounts and return their rent
+    NonceClose,
 }
 
 fn init_tracing() {
@@ -205,6 +212,24 @@ async fn main() -> anyhow::Result<()> {
                     tools::sweep(&cfg, &kp, &to.parse()?, keep).await
                 }
                 Cmd::Wallet {
+                    cmd: WalletCmd::NonceCreate { count },
+                } => {
+                    let kp = keystore::load(
+                        &cfg.infra.wallet.keystore,
+                        &cfg.infra.wallet.passphrase_env,
+                    )?;
+                    tools::nonce_create(&cfg, &kp, count).await
+                }
+                Cmd::Wallet {
+                    cmd: WalletCmd::NonceClose,
+                } => {
+                    let kp = keystore::load(
+                        &cfg.infra.wallet.keystore,
+                        &cfg.infra.wallet.passphrase_env,
+                    )?;
+                    tools::nonce_close(&cfg, &kp).await
+                }
+                Cmd::Wallet {
                     cmd: WalletCmd::CloseEmpty,
                 } => {
                     let kp = keystore::load(
@@ -266,6 +291,12 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
             cfg.infra.fees.clone(),
             tips,
             cfg.infra.jupiter.clone(),
+            cfg.infra
+                .nonce_accounts
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<Vec<Pubkey>, _>>()
+                .map_err(|e| anyhow::anyhow!("infra.nonce_accounts: {e}"))?,
         ));
         ex.spawn_refreshers();
         Some(ex)

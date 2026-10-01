@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use chain::detect::Template;
 use chain::meteora_dbc;
+use chain::nonce::NoncePool;
 use chain::pda;
 use chain::pump::{self};
 use chain::pump_amm::{self, AmmCoin, GlobalConfig, Pool};
@@ -30,15 +31,20 @@ use crate::cfg::{FeeConfig, JupiterConfig};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SendOutcome {
+    /// First variant's signature (the landed one is reported by `resolve`).
     pub signature: String,
+    /// All variants (one per tip group when a durable nonce is used).
+    pub signatures: Vec<String>,
     pub build_us: u64,
     pub reports: Vec<SendReport>,
     pub tip_lamports: u64,
+    /// Durable nonce account the variants share, if any.
+    pub nonce_account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Confirmation {
-    Landed { slot: u64 },
+    Landed { slot: u64, signature: String },
     Failed { slot: u64, err: String },
     Expired,
 }
@@ -52,6 +58,7 @@ pub struct Exec {
     pub blockhash: Arc<RwLock<(Hash, Instant)>>,
     pub amm_global: Arc<RwLock<Option<GlobalConfig>>>,
     pub jupiter: Option<JupiterConfig>,
+    pub nonces: Arc<NoncePool>,
     http: reqwest::Client,
 }
 
@@ -63,6 +70,7 @@ impl Exec {
         fees: FeeConfig,
         tip_accounts: Vec<Pubkey>,
         jupiter: Option<JupiterConfig>,
+        nonce_accounts: Vec<Pubkey>,
     ) -> Self {
         Self {
             rpc,
@@ -76,6 +84,7 @@ impl Exec {
             ))),
             amm_global: Arc::new(RwLock::new(None)),
             jupiter,
+            nonces: Arc::new(NoncePool::new(&nonce_accounts)),
             http: chain::rpc::http_client(Duration::from_secs(5)),
         }
     }
@@ -110,6 +119,17 @@ impl Exec {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
+        let me = self.clone();
+        tokio::spawn(async move {
+            for acc in me.nonces.accounts() {
+                me.refresh_nonce(&acc).await;
+            }
+            tracing::info!(
+                "durable nonces ready: {}/{}",
+                me.nonces.available(),
+                me.nonces.accounts().len()
+            );
+        });
     }
 
     async fn fresh_blockhash(&self) -> anyhow::Result<Hash> {
@@ -120,14 +140,6 @@ impl Exec {
         let (h, _) = self.rpc.latest_blockhash("processed").await?;
         *self.blockhash.write().await = (h, Instant::now());
         Ok(h)
-    }
-
-    fn tip_account(&self, salt: u64) -> Option<&Pubkey> {
-        if self.tip_accounts.is_empty() {
-            None
-        } else {
-            Some(&self.tip_accounts[(salt as usize) % self.tip_accounts.len()])
-        }
     }
 
     // ---------------------------------------------------------------- instruction plans
@@ -343,41 +355,187 @@ impl Exec {
         salt: u64,
     ) -> anyhow::Result<SendOutcome> {
         let t = Instant::now();
-        let bh = self.fresh_blockhash().await?;
-        let fees = FeePlan {
+        let groups = self.fanout.groups(&self.tip_accounts);
+        let fees = |min_tip: u64| FeePlan {
             cu_limit,
             cu_price_micro_lamports: self.fees.cu_price_micro_lamports,
-            tip_lamports: tip,
+            tip_lamports: if tip > 0 { tip.max(min_tip) } else { 0 },
         };
-        let signed = tx::build(&self.kp, body, fees, self.tip_account(salt), bh)?;
+        let pick = |g: &chain::sender::TipGroup| -> Option<Pubkey> {
+            (!g.tip_accounts.is_empty())
+                .then(|| g.tip_accounts[(salt as usize) % g.tip_accounts.len()])
+        };
+
+        // Several tip families + a free nonce: one variant per family, mutually
+        // exclusive on-chain because they all advance the same nonce.
+        if groups.len() > 1 {
+            if let Some((nonce_acc, nonce_val)) = self.nonces.take() {
+                let mut variants = Vec::with_capacity(groups.len());
+                for g in &groups {
+                    let tip_acc = pick(g);
+                    let mut fp = fees(g.min_tip_lamports);
+                    if tip_acc.is_none() {
+                        fp.tip_lamports = 0;
+                    }
+                    match tx::build_with_nonce(
+                        &self.kp,
+                        body.clone(),
+                        fp,
+                        tip_acc.as_ref(),
+                        &nonce_acc,
+                        nonce_val,
+                    ) {
+                        Ok(sg) => variants.push((g.senders.clone(), sg)),
+                        Err(e) => {
+                            self.nonces.set(&nonce_acc, nonce_val);
+                            return Err(e);
+                        }
+                    }
+                }
+                let build_us = t.elapsed().as_micros() as u64;
+                let sends = variants
+                    .iter()
+                    .map(|(idx, sg)| self.fanout.send_to(idx, &sg.wire_b64));
+                let reports = futures::future::join_all(sends)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let signatures: Vec<String> = variants
+                    .iter()
+                    .map(|(_, sg)| sg.signature.to_string())
+                    .collect();
+                return Ok(SendOutcome {
+                    signature: signatures[0].clone(),
+                    signatures,
+                    build_us,
+                    reports,
+                    tip_lamports: tip,
+                    nonce_account: Some(nonce_acc.to_string()),
+                });
+            }
+            tracing::debug!("no free durable nonce: single variant to the first tip group");
+        }
+
+        // Single variant on a recent blockhash → first tip group (+ plain endpoints).
+        let bh = self.fresh_blockhash().await?;
+        let g = &groups[0];
+        let signed = tx::build(
+            &self.kp,
+            body,
+            fees(g.min_tip_lamports),
+            pick(g).as_ref(),
+            bh,
+        )?;
         let build_us = t.elapsed().as_micros() as u64;
-        let reports = self.fanout.send(&signed.wire_b64).await;
+        let reports = self.fanout.send_to(&g.senders, &signed.wire_b64).await;
+        let sig = signed.signature.to_string();
         Ok(SendOutcome {
-            signature: signed.signature.to_string(),
+            signature: sig.clone(),
+            signatures: vec![sig],
             build_us,
             reports,
             tip_lamports: tip,
+            nonce_account: None,
         })
     }
 
-    pub async fn confirm(&self, sig: &str, timeout: Duration) -> Confirmation {
-        let start = Instant::now();
-        let sigs = vec![sig.to_string()];
-        while start.elapsed() < timeout {
-            if let Ok(st) = self.rpc.signature_statuses(&sigs).await {
-                if let Some(Some((slot, err))) = st.first() {
-                    return match err {
-                        None => Confirmation::Landed { slot: *slot },
-                        Some(e) => Confirmation::Failed {
-                            slot: *slot,
-                            err: e.to_string(),
-                        },
-                    };
+    /// Wait for any variant to land. With a durable nonce, an order that has
+    /// not landed by `timeout` is cancelled by advancing the nonce ourselves,
+    /// so a stale variant can never execute later. The slot is then refreshed.
+    pub async fn resolve(&self, o: &SendOutcome, timeout: Duration) -> Confirmation {
+        let mut c = self.confirm_any(&o.signatures, timeout).await;
+        if let Some(acc) = o
+            .nonce_account
+            .as_ref()
+            .and_then(|a| a.parse::<Pubkey>().ok())
+        {
+            if c == Confirmation::Expired {
+                match self.cancel_nonce(&acc).await {
+                    Ok(()) => tracing::info!(
+                        "order {} expired: nonce advanced, variants invalidated",
+                        o.signature
+                    ),
+                    Err(e) => tracing::warn!("nonce cancel for {} failed: {e}", o.signature),
                 }
+                // a variant may have landed while we were cancelling
+                c = self
+                    .confirm_any(&o.signatures, Duration::from_millis(300))
+                    .await;
+            }
+            self.refresh_nonce(&acc).await;
+        }
+        c
+    }
+
+    async fn confirm_any(&self, sigs: &[String], timeout: Duration) -> Confirmation {
+        let start = Instant::now();
+        loop {
+            if let Ok(st) = self.rpc.signature_statuses(sigs).await {
+                for (i, s) in st.iter().enumerate() {
+                    if let Some((slot, err)) = s {
+                        return match err {
+                            None => Confirmation::Landed {
+                                slot: *slot,
+                                signature: sigs[i].clone(),
+                            },
+                            Some(e) => Confirmation::Failed {
+                                slot: *slot,
+                                err: e.to_string(),
+                            },
+                        };
+                    }
+                }
+            }
+            if start.elapsed() >= timeout {
+                return Confirmation::Expired;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        Confirmation::Expired
+    }
+
+    async fn cancel_nonce(&self, acc: &Pubkey) -> anyhow::Result<()> {
+        let bh = self.fresh_blockhash().await?;
+        let fp = FeePlan {
+            cu_limit: 20_000,
+            cu_price_micro_lamports: self.fees.cu_price_micro_lamports,
+            tip_lamports: 0,
+        };
+        let signed = tx::build(
+            &self.kp,
+            vec![chain::nonce::advance_nonce(acc, &self.me())],
+            fp,
+            None,
+            bh,
+        )?;
+        self.rpc.send(&signed.wire_b64).await?;
+        match self
+            .confirm_any(&[signed.signature.to_string()], Duration::from_secs(15))
+            .await
+        {
+            Confirmation::Landed { .. } => Ok(()),
+            other => anyhow::bail!("cancel not confirmed: {other:?}"),
+        }
+    }
+
+    /// Re-read a nonce account and return it to the pool.
+    pub async fn refresh_nonce(&self, acc: &Pubkey) {
+        for _ in 0..5 {
+            if let Ok(Some(a)) = self.rpc.account(acc).await {
+                if let Some((auth, h)) = chain::nonce::parse_nonce_account(&a.data) {
+                    if auth == self.me() {
+                        self.nonces.set(acc, h);
+                    } else {
+                        tracing::error!(
+                            "nonce {acc} authority is {auth}, not the hot wallet — slot disabled"
+                        );
+                    }
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        tracing::warn!("nonce {acc} could not be refreshed; slot stays out of rotation");
     }
 
     // ---------------------------------------------------------------- Jupiter fallback
@@ -434,9 +592,11 @@ impl Exec {
         let reports = self.fanout.send(&wire).await;
         Ok(SendOutcome {
             signature: sig.to_string(),
+            signatures: vec![sig.to_string()],
             build_us,
             reports,
             tip_lamports: 0,
+            nonce_account: None,
         })
     }
 }

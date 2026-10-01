@@ -93,6 +93,11 @@ pub struct InfraConfig {
     pub senders: Vec<SenderConfig>,
     pub fees: FeeConfig,
     pub wallet: WalletConfig,
+    /// Durable nonce accounts (created with `copybot wallet nonce-create`). With
+    /// two or more tip families among the senders, each order is signed once per
+    /// family on a shared nonce, so only one variant can ever land.
+    #[serde(default)]
+    pub nonce_accounts: Vec<String>,
     /// Unix socket for `copybot ctl` (status, pause, flatten, ...).
     #[serde(default = "default_socket")]
     pub control_socket: String,
@@ -136,12 +141,24 @@ impl BotConfig {
         let engine =
             EngineConfig::from_toml(&toml::to_string(&v)?).map_err(|e| anyhow::anyhow!(e))?;
         anyhow::ensure!(!infra.senders.is_empty(), "infra.senders is empty");
+        for snd in &infra.senders {
+            for t in &snd.tip_accounts {
+                t.parse::<chain::solana_sdk::pubkey::Pubkey>()
+                    .map_err(|e| {
+                        anyhow::anyhow!("sender {}: bad tip account {t}: {e}", snd.name)
+                    })?;
+            }
+        }
+        for n in &infra.nonce_accounts {
+            n.parse::<chain::solana_sdk::pubkey::Pubkey>()
+                .map_err(|e| anyhow::anyhow!("nonce account {n}: {e}"))?;
+        }
         anyhow::ensure!(
             infra.fees.tip_lamports_buy == 0
                 || infra
                     .senders
                     .iter()
-                    .any(|s| s.accepts_jito_tip && s.enabled),
+                    .any(|s| (s.accepts_jito_tip || !s.tip_accounts.is_empty()) && s.enabled),
             "tips configured but no sender accepts Jito tips"
         );
         Ok(Self { engine, infra })

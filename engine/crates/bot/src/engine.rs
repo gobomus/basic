@@ -774,7 +774,7 @@ impl Engine {
                 };
                 let reaction_ms = ChainTx::now_ns().saturating_sub(observed) / 1_000_000;
                 let confirmation = match &outcome {
-                    Ok(o) => Some(exec.confirm(&o.signature, Duration::from_secs(30)).await),
+                    Ok(o) => Some(exec.resolve(o, Duration::from_secs(20)).await),
                     Err(_) => None,
                 };
                 let _ = results
@@ -1170,7 +1170,7 @@ impl Engine {
                 },
             };
             let confirmation = match &outcome {
-                Ok(o) => Some(exec.confirm(&o.signature, Duration::from_secs(30)).await),
+                Ok(o) => Some(exec.resolve(o, Duration::from_secs(20)).await),
                 Err(_) => None,
             };
             let _ = results
@@ -1276,7 +1276,7 @@ impl Engine {
                     None => "failed",
                 };
                 let landed_slot = match &confirmation {
-                    Some(Confirmation::Landed { slot }) => Some(*slot),
+                    Some(Confirmation::Landed { slot, .. }) => Some(*slot),
                     _ => None,
                 };
                 self.journal.record("order", json!({"side": "buy", "reason": "copy", "mint": mint.to_string(), "signature": sig, "senders": reports, "status": status, "error": err.or_else(|| match &confirmation { Some(Confirmation::Failed { err, .. }) => Some(err.clone()), _ => None }), "reaction_ms": reaction_ms, "landed_slot": landed_slot, "tip_lamports": self.cfg.infra.fees.tip_lamports_buy, "cu_limit": self.cfg.infra.fees.cu_limit_buy}));

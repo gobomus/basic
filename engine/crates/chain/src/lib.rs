@@ -7,6 +7,7 @@ pub mod geyser;
 pub mod ixs;
 pub mod meteora_dbc;
 pub mod model;
+pub mod nonce;
 pub mod pda;
 pub mod pump;
 pub mod pump_amm;

@@ -47,7 +47,7 @@ An honest status of every feature category those platforms offer, as of this com
 | Meteora DBC (Bags, Jupiter Studio, Believe…) direct | 🔶 | `chain::meteora_dbc`, verified against the IDL in Meteora's SDK (Sep 2026) |
 | Raydium LaunchLab (LetsBONK) direct | 🔶 | `chain::raydium_launchlab`, IDL + Raydium SDK v2 (Sep 2026) account layout |
 | Other venues (Raydium AMM/CPMM/CLMM, Meteora DAMM/DLMM, Orca) | 🔶 | detected for any venue; executed through the Jupiter fallback |
-| Multi-sender fan-out (Jito, Helius Sender, Nozomi, 0slot, Astralane, RPC) | 🔶 | `chain::sender`, one signature so it can't double-fill |
+| Multi-sender fan-out (Jito, Helius Sender, Nozomi, Astralane, RPC) | 🔶 | `chain::sender` groups services by tip family; one variant per family on a shared durable nonce (`chain::nonce`, byte-checked against `solana-system-interface` / `solana-nonce`), so only one can land; expired orders are cancelled by advancing the nonce. Helius tip accounts taken verbatim from `helius-sdk` 3.2.0 |
 | Priority fee + Jito tip, urgent-exit tip boost, retry escalation | ✅ | `[infra.fees]`, `sell()` |
 | In-process reaction time | ✅ measured | `copybot bench`: **~0.2 ms** median (decode → size → build → sign) |
 | MEV-protected routing | 🔶 | via Jito / Astralane-type senders |
@@ -96,6 +96,7 @@ An honest status of every feature category those platforms offer, as of this com
 - **Proxima:** closed beta; GitHub org `proximacorp` with nothing public to build on.
 - **Pump.fun / PumpSwap:** official IDLs + `@pump-fun/pump-sdk` / `pump-swap-sdk` source.
 - **Meteora DBC:** IDL embedded in `@meteora-ag/dynamic-bonding-curve-sdk` 1.5.13 + its `swap()` builder.
+- **Helius Sender:** endpoints, tip accounts and minimum tips from the official `helius-sdk` 3.2.0.
 - **Raydium LaunchLab:** `raydium-io/raydium-idl` + `@raydium-io/raydium-sdk-v2` 0.2.73 (`launchpad/instrument.ts`, `pda.ts`, curve math).
 
 ## Why some items are 🔶
