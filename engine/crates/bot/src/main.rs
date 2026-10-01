@@ -5,13 +5,14 @@
 //!   copybot simulate         dry-run our real buy against mainnet (no keys, no funds)
 //!   copybot leader-report    score a wallet from its on-chain history
 //!   copybot wallet …         create / import / balance / sweep / close-empty
+//!   copybot ctl <cmd>        talk to the running engine: status | positions | leaders | pause | resume | kill | flatten
 
 mod cfg;
+mod control;
 mod engine;
 mod exec;
 mod journal;
 mod keystore;
-mod telegram;
 mod tools;
 
 use std::sync::Arc;
@@ -66,6 +67,8 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten
+    Ctl { command: String },
     /// Measure in-process reaction time (decode → size → build → sign)
     Bench {
         #[arg(long, default_value_t = 10000)]
@@ -199,6 +202,13 @@ async fn main() -> anyhow::Result<()> {
                     tools::close_empty(&cfg, &kp).await
                 }
                 Cmd::Run => run(cfg).await,
+                Cmd::Ctl { command } => {
+                    print!(
+                        "{}",
+                        control::send(&cfg.infra.control_socket, &command).await?
+                    );
+                    Ok(())
+                }
                 Cmd::Wallet { .. } | Cmd::Bench { .. } => unreachable!(),
             }
         }
@@ -264,25 +274,16 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
     .await?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let tg = match &cfg.infra.telegram {
-        Some(t) if t.chat_id != 0 => match cfg::env(&t.bot_token_env) {
-            Ok(token) => {
-                let tg = telegram::Telegram::new(token, t.chat_id);
-                tg.spawn_commands(cmd_tx.clone());
-                Some(tg)
-            }
-            Err(e) => {
-                tracing::warn!("telegram disabled: {e}");
-                None
-            }
-        },
-        _ => None,
-    };
+    control::serve(&cfg.infra.control_socket, cmd_tx)?;
+    tracing::info!(
+        "control socket: {} (use `copybot ctl status`)",
+        cfg.infra.control_socket
+    );
 
     let (feed_tx, feed_rx) = mpsc::channel(200_000);
     let (filters_tx, filters_rx) = watch::channel(chain::geyser::Filters::default());
     let (res_tx, res_rx) = mpsc::channel(10_000);
-    let mut engine = engine::Engine::new(cfg.clone(), me, exec, journal, tg, filters_tx, res_tx);
+    let mut engine = engine::Engine::new(cfg.clone(), me, exec, journal, filters_tx, res_tx);
     if live {
         // Recover: anything already held is put back under exit management.
         for prog in [
@@ -317,7 +318,7 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
     tokio::select! {
         _ = engine.run(feed_rx, res_rx, cmd_rx) => {}
         _ = tokio::signal::ctrl_c() => {
-            tracing::warn!("ctrl-c: stopping. Open positions are NOT sold automatically — use /flatten first or manage them manually.");
+            tracing::warn!("ctrl-c: stopping. Open positions are NOT sold automatically: run `copybot ctl flatten` first, or they are re-adopted on the next start.");
         }
     }
     Ok(())

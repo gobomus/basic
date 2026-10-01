@@ -1,9 +1,9 @@
 //! The live engine: one event loop owning all trading state.
 //!
 //! Inputs : Geyser/deshred transactions, slot ticks, a 1 s clock, order
-//!          results from execution tasks, Telegram commands.
+//!          results from execution tasks, operator commands (control socket).
 //! Outputs: orders (live) or simulated fills (shadow/paper), journal records,
-//!          alerts, and feed filter updates (leaders + held mints).
+//!          log events, and feed filter updates (leaders + held mints).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -24,9 +24,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
 use crate::cfg::BotConfig;
+use crate::control::{Command, Request};
 use crate::exec::{Confirmation, Exec, SendOutcome, SOL_MINT};
 use crate::journal::{now_ms, Journal};
-use crate::telegram::{Command, Telegram, HELP};
 
 const PATH_CAP: usize = 200_000;
 const AFTERLIFE_MS: i64 = 2 * 3600 * 1000;
@@ -154,7 +154,6 @@ pub struct Engine {
     me: Pubkey,
     exec: Option<Arc<Exec>>,
     journal: Journal,
-    tg: Option<Telegram>,
     leaders: HashMap<Pubkey, LeaderConfig>,
     tokens: HashMap<Pubkey, TokenInfo>,
     positions: HashMap<Pubkey, Position>,
@@ -181,7 +180,6 @@ impl Engine {
         me: Pubkey,
         exec: Option<Arc<Exec>>,
         journal: Journal,
-        tg: Option<Telegram>,
         filters: watch::Sender<Filters>,
         results_tx: mpsc::Sender<OrderResult>,
     ) -> Self {
@@ -207,7 +205,6 @@ impl Engine {
             me,
             exec,
             journal,
-            tg,
             leaders,
             tokens: HashMap::new(),
             positions: HashMap::new(),
@@ -231,12 +228,11 @@ impl Engine {
         e
     }
 
+    /// Operator-visible event: logged and written to the journal.
     fn alert(&self, msg: impl Into<String>) {
         let m = msg.into();
         tracing::info!("{m}");
-        if let Some(t) = &self.tg {
-            t.send(m);
-        }
+        self.journal.record("event", json!({"msg": m}));
     }
 
     fn next_salt(&mut self) -> u64 {
@@ -278,7 +274,7 @@ impl Engine {
         mut self,
         mut feed: mpsc::Receiver<FeedEvent>,
         mut results: mpsc::Receiver<OrderResult>,
-        mut commands: mpsc::Receiver<Command>,
+        mut commands: mpsc::Receiver<Request>,
     ) {
         self.journal.record("wallet", json!({"pubkey": self.me.to_string(), "max_balance_sol": self.cfg.engine.risk.max_total_exposure_sol}));
         self.alert(format!(
@@ -302,7 +298,7 @@ impl Engine {
                     None => { self.alert("feed closed — engine stopping"); return; }
                 },
                 r = results.recv() => if let Some(r) = r { self.on_result(r) },
-                c = commands.recv() => if let Some(c) = c { self.on_command(c) },
+                c = commands.recv() => if let Some((c, reply)) = c { let r = self.on_command(c); let _ = reply.send(r); },
                 _ = clock.tick() => self.on_clock(),
             }
         }
@@ -1382,21 +1378,20 @@ impl Engine {
         }
     }
 
-    fn on_command(&mut self, c: Command) {
-        match c {
-            Command::Help => self.alert(HELP),
+    fn on_command(&mut self, c: Command) -> String {
+        let msg = match c {
             Command::Pause => {
                 self.paused = true;
-                self.alert("⏸ entries paused (exits keep running)");
+                "entries paused (exits keep running)".to_string()
             }
             Command::Resume => {
                 self.paused = false;
-                self.alert("▶️ entries resumed");
+                "entries resumed".to_string()
             }
             Command::Kill => {
                 self.killed = true;
                 self.journal.record("risk", json!({"risk": "manual_kill"}));
-                self.alert("🛑 kill switch ON — no new entries");
+                "kill switch ON: no new entries".to_string()
             }
             Command::Flatten => {
                 self.paused = true;
@@ -1411,10 +1406,7 @@ impl Engine {
                     }
                     self.sell(*m, *t, "Flatten", true);
                 }
-                self.alert(format!(
-                    "flattening {} positions; entries paused",
-                    mints.len()
-                ));
+                format!("flattening {} positions; entries paused", mints.len())
             }
             Command::Leaders => {
                 let s: Vec<String> = self
@@ -1432,11 +1424,11 @@ impl Engine {
                         )
                     })
                     .collect();
-                self.alert(format!("leaders:\n{}", s.join("\n")));
+                format!("leaders:\n{}", s.join("\n"))
             }
             Command::Positions => {
                 if self.positions.is_empty() {
-                    self.alert("no open positions");
+                    "no open positions".to_string()
                 } else {
                     let s: Vec<String> = self
                         .positions
@@ -1453,12 +1445,12 @@ impl Engine {
                             )
                         })
                         .collect();
-                    self.alert(s.join("\n"));
+                    s.join("\n")
                 }
             }
             Command::Status => {
                 let s = &self.stats;
-                self.alert(format!(
+                format!(
                     "mode {:?} · up {}m · {}\nsignals {} · copies {} · skips {} · sends {} · landed {} · failed {}\nreaction p50 {} ms / p90 {} ms · detect lag p50 {} / p90 {} slots\nopen {} · exposure {:.3} SOL · today {:+.4} SOL · balance {:.3} SOL\ntop skips: {}",
                     self.mode,
                     self.started.elapsed().as_secs() / 60,
@@ -1471,9 +1463,14 @@ impl Engine {
                     self.day_realized_sol,
                     lamports_to_sol(self.balance),
                     top_skips(&s.skip_reasons),
-                ));
+                )
             }
-        }
+        };
+        self.journal.record(
+            "control",
+            json!({"command": format!("{c:?}"), "reply": msg}),
+        );
+        msg
     }
 }
 
@@ -1595,7 +1592,7 @@ mod tests {
         let (ftx, _frx) = watch::channel(Filters::default());
         let (rtx, rrx) = mpsc::channel(100);
         (
-            Engine::new(cfg, Pubkey::new_unique(), None, journal, None, ftx, rtx),
+            Engine::new(cfg, Pubkey::new_unique(), None, journal, ftx, rtx),
             rrx,
         )
     }
@@ -1924,7 +1921,7 @@ mod adopt_tests {
             .unwrap();
         let (ftx, _f) = watch::channel(Filters::default());
         let (rtx, _r) = mpsc::channel(10);
-        let mut e = Engine::new(cfg, Pubkey::new_unique(), None, journal, None, ftx, rtx);
+        let mut e = Engine::new(cfg, Pubkey::new_unique(), None, journal, ftx, rtx);
         let mint = Pubkey::new_unique();
         e.adopt(mint, 1_000_000, chain::consts::TOKEN_PROGRAM, 6);
         e.apply_event(

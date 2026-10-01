@@ -41,13 +41,6 @@ fn default_pass_env() -> String {
     "KEYSTORE_PASSPHRASE".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct TelegramConfig {
-    pub bot_token_env: String,
-    pub chat_id: i64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -100,8 +93,9 @@ pub struct InfraConfig {
     pub senders: Vec<SenderConfig>,
     pub fees: FeeConfig,
     pub wallet: WalletConfig,
-    #[serde(default)]
-    pub telegram: Option<TelegramConfig>,
+    /// Unix socket for `copybot ctl` (status, pause, flatten, ...).
+    #[serde(default = "default_socket")]
+    pub control_socket: String,
     #[serde(default)]
     pub storage: StorageConfig,
     /// Fallback router for venues without a direct builder.
@@ -110,6 +104,10 @@ pub struct InfraConfig {
     /// Seconds without a slot update before entries are paused.
     #[serde(default = "five")]
     pub feed_stale_secs: u64,
+}
+
+fn default_socket() -> String {
+    "data/copybot.sock".into()
 }
 
 fn default_block_engine() -> String {

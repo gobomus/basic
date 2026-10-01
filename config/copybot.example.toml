@@ -102,6 +102,7 @@ rpc_url_env = "RPC_URL"              # e.g. a Helius / Triton / QuickNode HTTPS 
 jito_block_engine = "https://frankfurt.mainnet.block-engine.jito.wtf"
 tip_accounts = []                    # empty = fetched from the block engine at startup
 feed_stale_secs = 5
+control_socket = "data/copybot.sock"   # `copybot ctl status | pause | flatten ...`
 
 [infra.geyser]                       # any Yellowstone-gRPC endpoint (Triton, LaserStream, Shyft, ...)
 endpoint = "https://YOUR-GRPC-ENDPOINT:443"
@@ -137,10 +138,6 @@ urgent_tip_multiplier = 3            # stop-loss / dev-dump / liquidity-pull exi
 [infra.wallet]
 keystore = "keys/hot-1.json"         # created by: copybot wallet new --out keys/hot-1.json
 passphrase_env = "KEYSTORE_PASSPHRASE"
-
-[infra.telegram]
-bot_token_env = "TELEGRAM_BOT_TOKEN"
-chat_id = 0                          # your chat id; 0 = alerts disabled
 
 [infra.storage]
 journal_dir = "data/journal"         # always on: JSONL of every signal, order, fill, exit

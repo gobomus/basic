@@ -32,7 +32,7 @@ flowchart LR
   REC --> CH
   REC --> PG[(Postgres<br/>journal + state)]
   CH & PG --> RES[Research — Python<br/>wallet discovery, copy simulation,<br/>exit replay, models]
-  RES -->|new config / model version| CTRL[Control plane<br/>hot reload, kill switch,<br/>Telegram, Grafana]
+  RES -->|new config / model version| CTRL[Control plane<br/>hot reload, kill switch,<br/>control socket, Grafana]
   CTRL --> STRAT & POS
 ```
 
@@ -104,7 +104,7 @@ flowchart LR
   - sender landing-rate collapse;
   - a balance discrepancy;
   - a manual command.
-- **Telegram bot** for alerts and a few commands: pause leader, flatten all, mode switch.
+- **Local control socket** (`copybot ctl`): status, positions, pause, resume, kill, flatten. No external messaging service.
 - **Grafana** on ClickHouse/Postgres for dashboards: PnL, latency histograms, landing rates, per-leader copy returns, shadow-policy leaderboard.
 
 ### Research (offline, Python)
@@ -134,7 +134,7 @@ Host the engine in the same region as the providers' gRPC and sender endpoints. 
 | Journal / state | **Postgres** | Transactions, constraints, joins for reporting |
 | Research | **Python** | Ecosystem for modelling; reads ClickHouse directly |
 | Dashboards | **Grafana** | Native ClickHouse and Postgres sources |
-| Alerts / control | Telegram bot | What the trench already uses; fast on mobile |
+| Control | Unix socket + `copybot ctl` | No third-party dependency in the trading path |
 
 ## Repository layout
 ```

@@ -39,7 +39,7 @@ CEX account ──(withdraw)──► Treasury ──(top-up, policy-limited)─
   - Our own hot wallets become visible over time. Others may copy us, which adds competition for our fills, or target us for sandwiches.
   - Rotate hot wallets on a schedule or when we detect followers: wallets that consistently buy the same tokens right after us.
   - Retire a wallet by setting it to `draining`: no new entries, positions exit normally, then sweep, close ATAs and retire.
-- **Timeline:** one view (Grafana / Telegram `/timeline`) merging signals, orders, transfers, config changes and risk events in time order. This is the "what happened at 03:12?" tool.
+- **Timeline:** one view (Grafana over the journal) merging signals, orders, transfers, config changes and risk events in time order. This is the "what happened at 03:12?" tool.
 - **ATA hygiene:** close empty token accounts after full exits to reclaim ~0.002 SOL each. At 100 tokens a day that is ~0.2 SOL a day.
 
 ## Pre-trade token safety checks (fast, cached per mint)

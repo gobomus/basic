@@ -9,7 +9,6 @@ This is the order to follow. **Do not skip the shadow and simulation steps.** Th
 | **A server** near the Solana validators: 4+ CPU cores, 8 GB RAM, Ubuntu | Speed. The bot has to sit physically close to the network. | Any dedicated or VPS host in **Frankfurt** or **Amsterdam** (or New York) |
 | **A Solana data plan with Yellowstone gRPC, plus an RPC URL** | The live feed of every trade, and basic chain access | Helius (Business or Professional plan includes LaserStream gRPC + RPC + Sender), Triton, Shyft, QuickNode |
 | **Transaction senders** | Getting our trades into blocks fast | Jito (free, tip-based), Helius Sender (comes with Helius). Optional: Nozomi, 0slot, Astralane |
-| **A Telegram bot** | Alerts and remote control from your phone | Message **@BotFather** → `/newbot` gives you the token. Message **@userinfobot** to get your chat id. |
 | **SOL** | Trading capital + fees | Your exchange account |
 
 Postgres and ClickHouse (the analytics databases) are optional on day one. The bot always writes a complete daily log file regardless.
@@ -23,11 +22,10 @@ sudo bash deploy/setup.sh
 This builds the bot, runs the full test suite, and installs the background service.
 
 ## 2. Fill in your keys and settings
-- `/etc/copybot.env`: your RPC URL, gRPC token, a long keystore passphrase, and the Telegram token.
+- `/etc/copybot.env`: your RPC URL, gRPC token, and a long keystore passphrase.
 - `/opt/copybot/config/copybot.toml`:
   - `[infra.geyser] endpoint`: your gRPC URL.
   - `[[infra.senders]]`: your sender URLs (use the region closest to your server).
-  - `[infra.telegram] chat_id`: your chat id.
   - `[[leaders]]`: the wallets to copy (step 4).
   - Leave `mode = "shadow"` for now.
 
@@ -71,9 +69,9 @@ Pick any live Pump.fun token and any wallet address that holds some SOL (it does
 sudo systemctl enable --now copybot
 journalctl -u copybot -f          # live log
 ```
-The bot follows the leaders in real time and decides every trade, but **sends nothing**. On Telegram:
-- `/status`: signals, copies, skips, latency, simulated PnL.
-- `/positions`: open simulated positions.
+The bot follows the leaders in real time and decides every trade, but **sends nothing**. On the server:
+- `copybot ctl status`: signals, copies, skips, latency, simulated PnL.
+- `copybot ctl positions`: open simulated positions.
 
 Everything is logged to `/opt/copybot/data/journal/*.jsonl`. Review it before moving on. That includes skipped trades and their reasons, and how every alternative exit strategy would have done.
 
@@ -81,17 +79,17 @@ Everything is logged to `/opt/copybot/data/journal/*.jsonl`. Review it before mo
 1. Send a **small** amount of SOL (e.g. 1–2 SOL) to the wallet address from step 3.
 2. In the config, set `mode = "live"`. Keep `max_buy_sol` small, e.g. 0.1.
 3. Run `sudo systemctl restart copybot`.
-4. Watch the first trades on Telegram. Check them on Solscan.
+4. Watch the first trades with `journalctl -u copybot -f` and `copybot ctl positions`. Check them on Solscan.
 
 Compare live results with the shadow results. Raise sizes only when they match.
 
 ## Day-to-day
 | Need | Do |
 |---|---|
-| Health and PnL | Telegram `/status` |
-| Stop new buys (exits keep running) | `/pause`, later `/resume` |
-| Emergency: sell everything | `/flatten` |
-| Hard stop for the day | `/kill` |
+| Health and PnL | `copybot ctl status` |
+| Stop new buys (exits keep running) | `copybot ctl pause`, later `copybot ctl resume` |
+| Emergency: sell everything | `copybot ctl flatten` |
+| Hard stop for the day | `copybot ctl kill` |
 | Take profits out | `./copybot wallet sweep --to <YOUR_SAFE_WALLET> --keep 1.0` |
 | Reclaim rent from empty token accounts (~0.002 SOL each) | `./copybot wallet close-empty` |
 | Wallet contents | `./copybot wallet balance` |

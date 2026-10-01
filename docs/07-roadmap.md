@@ -40,7 +40,7 @@ Fixed cost per transaction (tip + priority fee) is assumed at ~0.001 SOL; the He
   - Yellowstone gRPC and deshred feeds, RPC client, multi-sender.
 - [x] `copybot` binary:
   - live engine in shadow, paper or live mode;
-  - Telegram control, journal, kill switches, restart recovery;
+  - local control socket (`copybot ctl`), journal, kill switches, restart recovery;
   - `check`, `simulate`, `leader-report`, `bench` and `wallet` tools.
 - [x] Deployment: `deploy/setup.sh`, systemd unit, docker-compose, CI.
 - [ ] **Live-chain verification on the production server:** `copybot check` → `copybot simulate` (curve + PumpSwap coin) → shadow mode.
@@ -57,7 +57,7 @@ Fixed cost per transaction (tip + priority fee) is assumed at ~0.001 SOL; the He
 ## Phase 1 — Shadow (weeks 2–4)
 - Engine runs live with `mode = "shadow"`: real signals, real decisions, real snapshots; no orders.
 - Shadow exits active. Feature service writing snapshots at decision points.
-- Telegram alerts; kill-switch plumbing tested.
+- Kill-switch plumbing tested via `copybot ctl`.
 
 **Gate 1:**
 - At least 300 shadow signals.

@@ -28,9 +28,10 @@ systemctl daemon-reload
 cat <<MSG
 
 Installed. Next (see RUNBOOK.md):
-  1. edit /etc/copybot.env                 (RPC_URL, GEYSER_X_TOKEN, KEYSTORE_PASSPHRASE, TELEGRAM_BOT_TOKEN)
-  2. edit /opt/copybot/config/copybot.toml (endpoints, leaders, chat_id)
+  1. edit /etc/copybot.env                 (RPC_URL, GEYSER_X_TOKEN, KEYSTORE_PASSPHRASE)
+  2. edit /opt/copybot/config/copybot.toml (endpoints, leaders)
   3. sudo -u copybot bash -c 'set -a; . /etc/copybot.env; cd /opt/copybot && ./copybot wallet new --out keys/hot-1.json'
   4. sudo -u copybot bash -c 'set -a; . /etc/copybot.env; cd /opt/copybot && ./copybot check'
   5. systemctl enable --now copybot   &&   journalctl -u copybot -f
+  6. control: sudo -u copybot /opt/copybot/copybot -c /opt/copybot/config/copybot.toml ctl status
 MSG

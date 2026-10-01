@@ -7,8 +7,8 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 3. **Record everything** that terminals like GMGN, Axiom and Padre show (volume, transactions per second, holders, snipers, bundlers, dev history, socials, …) plus our own execution data. The resulting trade log tunes exits and sizing first, and later a **leader-free, self-adjusting engine**.
 
 > **Status: engine built; next step is the live-chain verification on your server.**
-> - Built and tested offline (41 tests):
->   - the live engine, real-time feed, Pump.fun and PumpSwap execution, multi-sender delivery, exits, risk controls, wallet tools, Telegram control and journal;
+> - Built and tested offline (42 tests):
+>   - the live engine, real-time feed, Pump.fun and PumpSwap execution, multi-sender delivery, exits, risk controls, wallet tools, local control (`copybot ctl`) and journal;
 >   - all of it checked against Pump's official program definitions and SDK.
 > - Not yet run against mainnet: this build environment can't reach Solana.
 > - **Start with [RUNBOOK.md](RUNBOOK.md)** and see what is and isn't built in [docs/08-feature-parity.md](docs/08-feature-parity.md).
@@ -32,7 +32,7 @@ engine/                     Rust workspace
   crates/core/              pure strategy logic: sizing, exit policies, replay, wallet scoring
   crates/chain/             Solana I/O: Pump.fun + PumpSwap builders/decoders, swap detection,
                             Yellowstone gRPC feed, RPC, multi-sender
-  crates/bot/               `copybot` binary: engine, execution, wallet keystore, Telegram,
+  crates/bot/               `copybot` binary: engine, execution, wallet keystore, control socket,
                             journal, check / simulate / leader-report / bench / wallet tools
   idl/                      official Pump IDLs (tests verify our code against them)
 config/                     copybot.example.toml (production template) + engine.example.toml
@@ -46,7 +46,7 @@ archive/                    unrelated legacy code (RFO BASIC! Android app)
 ## Develop
 ```sh
 cd engine
-cargo test --workspace                 # 41 tests, incl. IDL conformance + end-to-end engine
+cargo test --workspace                 # 42 tests, incl. IDL conformance + end-to-end engine
 cargo build --release -p bot           # → target/release/copybot
 ./target/release/copybot bench         # in-process reaction time (~0.2 ms median)
 ```

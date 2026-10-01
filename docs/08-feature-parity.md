@@ -80,13 +80,13 @@ An honest status of every feature category those platforms offer, as of this com
 ## Operations
 | Feature | Status | Where |
 |---|---|---|
-| Telegram alerts + commands (`/status`, `/positions`, `/pause`, `/resume`, `/kill`, `/flatten`, `/leaders`) | 🔶 | `telegram.rs` |
+| Operator control: `copybot ctl status / positions / leaders / pause / resume / kill / flatten` | ✅ | `control.rs` (local Unix socket) |
 | Kill switch: daily loss, stale feed, manual | ✅ | engine |
 | Preflight check with latency | 🔶 | `copybot check` |
 | Live-chain dry run without funds | 🔶 | `copybot simulate` |
 | Journal (JSONL always; Postgres and ClickHouse optional) | ✅ JSONL / 🔶 DBs | `journal.rs`, `schema/` |
 | systemd service, setup script, CI | ✅ | `deploy/`, `.github/workflows/ci.yml` |
-| Web dashboard / UI | ⬜ | Telegram + Grafana on the databases for now |
+| Web dashboard / UI | ⬜ | `copybot ctl` + Grafana on the databases for now |
 
 ## Why some items are 🔶
 The build sandbox's network policy blocks Solana RPC, gRPC and sender hosts. Everything was therefore verified offline:
