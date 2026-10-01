@@ -1,20 +1,28 @@
-# built application files
-*.apk
-*.ap_
+# Rust
+target/
+**/*.rs.bk
 
-# files for the dex VM
-*.dex
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
 
-# Java class files
-*.class
+# Secrets / local config — never commit keys or real configs
+.env
+.env.*
+!.env.example
+*.keypair.json
+keys/
+config/*.local.toml
+config/engine.toml
 
-# generated files
-bin/
-gen/
+# Data
+data/
+*.parquet
+*.duckdb
 
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Eclipse project files
-.classpath
-.project
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
