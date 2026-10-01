@@ -1,0 +1,25 @@
+[package]
+name = "chain"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Solana I/O: Pump.fun/PumpSwap instruction builders + event decoders, universal swap detection, RPC, senders, Geyser feed."
+
+[dependencies]
+engine-core = { path = "../core" }
+solana-sdk = "5"
+yellowstone-grpc-client = "14"
+yellowstone-grpc-proto = "13"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+serde.workspace = true
+serde_json = "1"
+base64 = "0.22"
+bincode = "1.3"
+bs58 = "0.5"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1"
