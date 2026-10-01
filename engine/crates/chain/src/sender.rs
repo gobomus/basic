@@ -48,7 +48,10 @@ pub struct Fanout {
 
 impl Fanout {
     pub fn new(senders: Vec<SenderConfig>) -> Self {
-        Self { senders: Arc::new(senders.into_iter().filter(|s| s.enabled).collect()), http: http_client(Duration::from_secs(5)) }
+        Self {
+            senders: Arc::new(senders.into_iter().filter(|s| s.enabled).collect()),
+            http: http_client(Duration::from_secs(5)),
+        }
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -74,9 +77,24 @@ impl Fanout {
                 let res = async { req.send().await?.json::<Value>().await }.await;
                 let ms = t.elapsed().as_millis() as u64;
                 match res {
-                    Ok(v) if v.get("error").is_none() => SendReport { sender: name, ok: true, ms, detail: v["result"].to_string() },
-                    Ok(v) => SendReport { sender: name, ok: false, ms, detail: v["error"].to_string() },
-                    Err(e) => SendReport { sender: name, ok: false, ms, detail: e.to_string() },
+                    Ok(v) if v.get("error").is_none() => SendReport {
+                        sender: name,
+                        ok: true,
+                        ms,
+                        detail: v["result"].to_string(),
+                    },
+                    Ok(v) => SendReport {
+                        sender: name,
+                        ok: false,
+                        ms,
+                        detail: v["error"].to_string(),
+                    },
+                    Err(e) => SendReport {
+                        sender: name,
+                        ok: false,
+                        ms,
+                        detail: e.to_string(),
+                    },
                 }
             }
         });
@@ -95,7 +113,10 @@ pub async fn fetch_jito_tip_accounts(block_engine_url: &str) -> anyhow::Result<V
             Ok(r) => {
                 let v: Value = r.json().await?;
                 if let Some(arr) = v["result"].as_array() {
-                    let out: Vec<Pubkey> = arr.iter().filter_map(|x| x.as_str()?.parse().ok()).collect();
+                    let out: Vec<Pubkey> = arr
+                        .iter()
+                        .filter_map(|x| x.as_str()?.parse().ok())
+                        .collect();
                     if !out.is_empty() {
                         return Ok(out);
                     }

@@ -39,13 +39,23 @@ pub fn http_client(timeout: Duration) -> reqwest::Client {
 
 impl Rpc {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), http: http_client(Duration::from_secs(10)) }
+        Self {
+            url: url.into(),
+            http: http_client(Duration::from_secs(10)),
+        }
     }
 
     pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let t = Instant::now();
-        let resp: Value = self.http.post(&self.url).json(&body).send().await?.json().await?;
+        let resp: Value = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         tracing::trace!(method, ms = t.elapsed().as_millis() as u64, "rpc");
         if let Some(e) = resp.get("error") {
             anyhow::bail!("{method}: {e}");
@@ -54,25 +64,41 @@ impl Rpc {
     }
 
     pub async fn get_slot(&self, commitment: &str) -> anyhow::Result<u64> {
-        let v = self.call("getSlot", json!([{"commitment": commitment}])).await?;
+        let v = self
+            .call("getSlot", json!([{"commitment": commitment}]))
+            .await?;
         v.as_u64().ok_or_else(|| anyhow::anyhow!("bad getSlot"))
     }
 
     pub async fn latest_blockhash(&self, commitment: &str) -> anyhow::Result<(Hash, u64)> {
-        let v = self.call("getLatestBlockhash", json!([{"commitment": commitment}])).await?;
-        let bh = v["value"]["blockhash"].as_str().ok_or_else(|| anyhow::anyhow!("no blockhash"))?;
+        let v = self
+            .call("getLatestBlockhash", json!([{"commitment": commitment}]))
+            .await?;
+        let bh = v["value"]["blockhash"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no blockhash"))?;
         let h = v["value"]["lastValidBlockHeight"].as_u64().unwrap_or(0);
         Ok((bh.parse()?, h))
     }
 
     pub async fn balance(&self, pk: &Pubkey) -> anyhow::Result<u64> {
-        let v = self.call("getBalance", json!([pk.to_string(), {"commitment": "processed"}])).await?;
-        v["value"].as_u64().ok_or_else(|| anyhow::anyhow!("bad getBalance"))
+        let v = self
+            .call(
+                "getBalance",
+                json!([pk.to_string(), {"commitment": "processed"}]),
+            )
+            .await?;
+        v["value"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("bad getBalance"))
     }
 
     pub async fn account(&self, pk: &Pubkey) -> anyhow::Result<Option<AccountData>> {
         let v = self
-            .call("getAccountInfo", json!([pk.to_string(), {"encoding": "base64", "commitment": "processed"}]))
+            .call(
+                "getAccountInfo",
+                json!([pk.to_string(), {"encoding": "base64", "commitment": "processed"}]),
+            )
             .await?;
         parse_account(&v["value"])
     }
@@ -80,9 +106,17 @@ impl Rpc {
     pub async fn accounts(&self, pks: &[Pubkey]) -> anyhow::Result<Vec<Option<AccountData>>> {
         let keys: Vec<String> = pks.iter().map(|p| p.to_string()).collect();
         let v = self
-            .call("getMultipleAccounts", json!([keys, {"encoding": "base64", "commitment": "processed"}]))
+            .call(
+                "getMultipleAccounts",
+                json!([keys, {"encoding": "base64", "commitment": "processed"}]),
+            )
             .await?;
-        v["value"].as_array().ok_or_else(|| anyhow::anyhow!("bad getMultipleAccounts"))?.iter().map(parse_account).collect()
+        v["value"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("bad getMultipleAccounts"))?
+            .iter()
+            .map(parse_account)
+            .collect()
     }
 
     pub async fn send(&self, wire_b64: &str) -> anyhow::Result<String> {
@@ -106,14 +140,29 @@ impl Rpc {
         let val = &v["value"];
         Ok(SimResult {
             err: val.get("err").filter(|e| !e.is_null()).cloned(),
-            logs: val["logs"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default(),
+            logs: val["logs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|l| l.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
             units_consumed: val["unitsConsumed"].as_u64(),
         })
     }
 
     /// Returns (slot, err) per signature; `None` = not seen yet.
-    pub async fn signature_statuses(&self, sigs: &[String]) -> anyhow::Result<Vec<Option<(u64, Option<Value>)>>> {
-        let v = self.call("getSignatureStatuses", json!([sigs, {"searchTransactionHistory": false}])).await?;
+    pub async fn signature_statuses(
+        &self,
+        sigs: &[String],
+    ) -> anyhow::Result<Vec<Option<(u64, Option<Value>)>>> {
+        let v = self
+            .call(
+                "getSignatureStatuses",
+                json!([sigs, {"searchTransactionHistory": false}]),
+            )
+            .await?;
         Ok(v["value"]
             .as_array()
             .map(|a| {
@@ -122,7 +171,10 @@ impl Rpc {
                         if s.is_null() {
                             None
                         } else {
-                            Some((s["slot"].as_u64().unwrap_or(0), s.get("err").filter(|e| !e.is_null()).cloned()))
+                            Some((
+                                s["slot"].as_u64().unwrap_or(0),
+                                s.get("err").filter(|e| !e.is_null()).cloned(),
+                            ))
                         }
                     })
                     .collect()
@@ -131,7 +183,11 @@ impl Rpc {
     }
 
     /// (token account, mint, raw amount, token program) for every token account the owner holds.
-    pub async fn token_accounts(&self, owner: &Pubkey, program: &Pubkey) -> anyhow::Result<Vec<(Pubkey, Pubkey, u64)>> {
+    pub async fn token_accounts(
+        &self,
+        owner: &Pubkey,
+        program: &Pubkey,
+    ) -> anyhow::Result<Vec<(Pubkey, Pubkey, u64)>> {
         let v = self
             .call(
                 "getTokenAccountsByOwner",
@@ -153,12 +209,19 @@ impl Rpc {
         Ok(out)
     }
 
-    pub async fn signatures_for_address(&self, pk: &Pubkey, limit: usize, before: Option<&str>) -> anyhow::Result<Vec<Value>> {
+    pub async fn signatures_for_address(
+        &self,
+        pk: &Pubkey,
+        limit: usize,
+        before: Option<&str>,
+    ) -> anyhow::Result<Vec<Value>> {
         let mut opts = json!({"limit": limit, "commitment": "confirmed"});
         if let Some(b) = before {
             opts["before"] = json!(b);
         }
-        let v = self.call("getSignaturesForAddress", json!([pk.to_string(), opts])).await?;
+        let v = self
+            .call("getSignaturesForAddress", json!([pk.to_string(), opts]))
+            .await?;
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 

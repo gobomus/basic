@@ -10,13 +10,21 @@ use crate::pda::ata;
 pub fn set_compute_unit_limit(units: u32) -> Instruction {
     let mut data = vec![2u8];
     data.extend_from_slice(&units.to_le_bytes());
-    Instruction { program_id: COMPUTE_BUDGET_PROGRAM, accounts: vec![], data }
+    Instruction {
+        program_id: COMPUTE_BUDGET_PROGRAM,
+        accounts: vec![],
+        data,
+    }
 }
 
 pub fn set_compute_unit_price(micro_lamports: u64) -> Instruction {
     let mut data = vec![3u8];
     data.extend_from_slice(&micro_lamports.to_le_bytes());
-    Instruction { program_id: COMPUTE_BUDGET_PROGRAM, accounts: vec![], data }
+    Instruction {
+        program_id: COMPUTE_BUDGET_PROGRAM,
+        accounts: vec![],
+        data,
+    }
 }
 
 pub fn system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
@@ -30,7 +38,12 @@ pub fn system_transfer(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction
 }
 
 /// `CreateIdempotent` on the Associated Token Account program.
-pub fn create_ata_idempotent(payer: &Pubkey, owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Instruction {
+pub fn create_ata_idempotent(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
     Instruction {
         program_id: ATA_PROGRAM,
         accounts: vec![
@@ -46,7 +59,12 @@ pub fn create_ata_idempotent(payer: &Pubkey, owner: &Pubkey, mint: &Pubkey, toke
 }
 
 /// SPL Token `CloseAccount` (same layout on Token-2022). Reclaims rent.
-pub fn close_token_account(account: &Pubkey, destination: &Pubkey, owner: &Pubkey, token_program: &Pubkey) -> Instruction {
+pub fn close_token_account(
+    account: &Pubkey,
+    destination: &Pubkey,
+    owner: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
     Instruction {
         program_id: *token_program,
         accounts: vec![
@@ -73,8 +91,14 @@ mod tests {
 
     #[test]
     fn layouts() {
-        assert_eq!(set_compute_unit_limit(200_000).data, vec![2, 0x40, 0x0d, 0x03, 0x00]);
-        assert_eq!(set_compute_unit_price(5).data, vec![3, 5, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            set_compute_unit_limit(200_000).data,
+            vec![2, 0x40, 0x0d, 0x03, 0x00]
+        );
+        assert_eq!(
+            set_compute_unit_price(5).data,
+            vec![3, 5, 0, 0, 0, 0, 0, 0, 0]
+        );
         let t = system_transfer(&Pubkey::new_unique(), &Pubkey::new_unique(), 1);
         assert_eq!(t.data, vec![2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
     }

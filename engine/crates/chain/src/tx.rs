@@ -39,19 +39,33 @@ pub fn build(
     }
     ixs.extend(body);
     if fees.tip_lamports > 0 {
-        let to = tip_account.ok_or_else(|| anyhow::anyhow!("tip requested but no tip account known"))?;
+        let to =
+            tip_account.ok_or_else(|| anyhow::anyhow!("tip requested but no tip account known"))?;
         ixs.push(ixs::system_transfer(&payer.pubkey(), to, fees.tip_lamports));
     }
     let msg = v0::Message::try_compile(&payer.pubkey(), &ixs, &[], blockhash)?;
     let tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[payer])?;
     let bytes = bincode::serialize(&tx)?;
-    anyhow::ensure!(bytes.len() <= 1232, "transaction too large: {} bytes", bytes.len());
-    Ok(SignedTx { signature: tx.signatures[0], wire_b64: base64::engine::general_purpose::STANDARD.encode(bytes), tx })
+    anyhow::ensure!(
+        bytes.len() <= 1232,
+        "transaction too large: {} bytes",
+        bytes.len()
+    );
+    Ok(SignedTx {
+        signature: tx.signatures[0],
+        wire_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        tx,
+    })
 }
 
 /// Unsigned-equivalent message for `simulateTransaction` with `sigVerify=false`
 /// on behalf of any address (used by the `simulate` command — no keys needed).
-pub fn build_unsigned_b64(payer: &Pubkey, body: Vec<Instruction>, cu_limit: u32, blockhash: Hash) -> anyhow::Result<String> {
+pub fn build_unsigned_b64(
+    payer: &Pubkey,
+    body: Vec<Instruction>,
+    cu_limit: u32,
+    blockhash: Hash,
+) -> anyhow::Result<String> {
     let mut ixs = vec![ixs::set_compute_unit_limit(cu_limit)];
     ixs.extend(body);
     let msg = v0::Message::try_compile(payer, &ixs, &[], blockhash)?;

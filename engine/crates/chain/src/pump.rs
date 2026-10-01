@@ -182,7 +182,12 @@ pub struct CompleteEvent {
 impl CompleteEvent {
     pub fn decode(data: &[u8]) -> Result<Self, Eof> {
         let mut r = Reader::new(data);
-        Ok(Self { user: r.pubkey()?, mint: r.pubkey()?, bonding_curve: r.pubkey()?, timestamp: r.i64()? })
+        Ok(Self {
+            user: r.pubkey()?,
+            mint: r.pubkey()?,
+            bonding_curve: r.pubkey()?,
+            timestamp: r.i64()?,
+        })
     }
 }
 
@@ -255,7 +260,15 @@ impl BondingCurve {
         let is_mayhem_mode = r.opt(|r| r.bool()).unwrap_or(false);
         let is_cashback_coin = r.opt(|r| r.bool()).unwrap_or(false);
         let quote_mint = r.opt(|r| r.pubkey()).unwrap_or_default();
-        Ok(Self { state, token_total_supply, complete, creator, is_mayhem_mode, is_cashback_coin, quote_mint })
+        Ok(Self {
+            state,
+            token_total_supply,
+            complete,
+            creator,
+            is_mayhem_mode,
+            is_cashback_coin,
+            quote_mint,
+        })
     }
 }
 
@@ -285,7 +298,8 @@ pub fn sell_quote_for_tokens(s: &CurveState, tokens: u64, total_fee_bps: u64) ->
     if tokens == 0 || s.virtual_token_reserves == 0 {
         return 0;
     }
-    let gross = tokens as u128 * s.virtual_quote_reserves as u128 / (s.virtual_token_reserves as u128 + tokens as u128);
+    let gross = tokens as u128 * s.virtual_quote_reserves as u128
+        / (s.virtual_token_reserves as u128 + tokens as u128);
     let fee = (gross * total_fee_bps as u128).div_ceil(10_000);
     gross.saturating_sub(fee) as u64
 }
@@ -310,8 +324,20 @@ pub struct CurveCoin {
 }
 
 impl CurveCoin {
-    pub fn sol_paired(mint: Pubkey, creator: Pubkey, base_token_program: Pubkey, is_mayhem_mode: bool) -> Self {
-        Self { mint, creator, base_token_program, is_mayhem_mode, quote_mint: WSOL_MINT, quote_token_program: TOKEN_PROGRAM }
+    pub fn sol_paired(
+        mint: Pubkey,
+        creator: Pubkey,
+        base_token_program: Pubkey,
+        is_mayhem_mode: bool,
+    ) -> Self {
+        Self {
+            mint,
+            creator,
+            base_token_program,
+            is_mayhem_mode,
+            quote_mint: WSOL_MINT,
+            quote_token_program: TOKEN_PROGRAM,
+        }
     }
 }
 
@@ -319,11 +345,21 @@ impl CurveCoin {
 pub fn pick_fee_recipients(is_mayhem: bool, salt: u64) -> (Pubkey, Pubkey) {
     let i = (salt % 8) as usize;
     let j = ((salt / 8) % 8) as usize;
-    let fee = if is_mayhem { PUMP_RESERVED_FEE_RECIPIENTS[i] } else { PUMP_FEE_RECIPIENTS[i] };
+    let fee = if is_mayhem {
+        PUMP_RESERVED_FEE_RECIPIENTS[i]
+    } else {
+        PUMP_FEE_RECIPIENTS[i]
+    };
     (fee, PUMP_BUYBACK_FEE_RECIPIENTS[j])
 }
 
-fn v2_accounts(c: &CurveCoin, user: &Pubkey, fee_recipient: &Pubkey, buyback: &Pubkey, is_buy: bool) -> Vec<AccountMeta> {
+fn v2_accounts(
+    c: &CurveCoin,
+    user: &Pubkey,
+    fee_recipient: &Pubkey,
+    buyback: &Pubkey,
+    is_buy: bool,
+) -> Vec<AccountMeta> {
     let bc = pda::bonding_curve(&c.mint);
     let cv = pda::creator_vault(&c.creator);
     let uva = pda::pump_user_volume_accumulator(user);
@@ -350,7 +386,10 @@ fn v2_accounts(c: &CurveCoin, user: &Pubkey, fee_recipient: &Pubkey, buyback: &P
         AccountMeta::new_readonly(pda::sharing_config(&c.mint), false),
     ];
     if is_buy {
-        a.push(AccountMeta::new_readonly(pda::pump_global_volume_accumulator(), false));
+        a.push(AccountMeta::new_readonly(
+            pda::pump_global_volume_accumulator(),
+            false,
+        ));
     }
     a.extend([
         AccountMeta::new(uva, false),
@@ -377,14 +416,28 @@ pub fn buy_exact_quote_in_v2(
     let mut data = ix_disc("buy_exact_quote_in_v2").to_vec();
     data.extend_from_slice(&spendable_quote_in.to_le_bytes());
     data.extend_from_slice(&min_tokens_out.to_le_bytes());
-    Instruction { program_id: PUMP_PROGRAM, accounts: v2_accounts(c, user, &fee, &buyback, true), data }
+    Instruction {
+        program_id: PUMP_PROGRAM,
+        accounts: v2_accounts(c, user, &fee, &buyback, true),
+        data,
+    }
 }
 
 /// `sell_v2`: sell `amount` tokens for at least `min_sol_output` lamports.
-pub fn sell_v2(c: &CurveCoin, user: &Pubkey, amount: u64, min_sol_output: u64, salt: u64) -> Instruction {
+pub fn sell_v2(
+    c: &CurveCoin,
+    user: &Pubkey,
+    amount: u64,
+    min_sol_output: u64,
+    salt: u64,
+) -> Instruction {
     let (fee, buyback) = pick_fee_recipients(c.is_mayhem_mode, salt);
     let mut data = ix_disc("sell_v2").to_vec();
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&min_sol_output.to_le_bytes());
-    Instruction { program_id: PUMP_PROGRAM, accounts: v2_accounts(c, user, &fee, &buyback, false), data }
+    Instruction {
+        program_id: PUMP_PROGRAM,
+        accounts: v2_accounts(c, user, &fee, &buyback, false),
+        data,
+    }
 }

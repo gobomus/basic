@@ -20,49 +20,107 @@ fn idl(name: &str) -> Value {
 }
 
 fn find<'a>(arr: &'a Value, name: &str) -> &'a Value {
-    arr.as_array().unwrap().iter().find(|x| x["name"] == name).unwrap_or_else(|| panic!("{name} not in IDL"))
+    arr.as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == name)
+        .unwrap_or_else(|| panic!("{name} not in IDL"))
 }
 
 fn disc_of(v: &Value) -> Vec<u8> {
-    v["discriminator"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect()
+    v["discriminator"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap() as u8)
+        .collect()
 }
 
 #[test]
 fn discriminators_match_idl() {
     let p = idl("pump.json");
     let a = idl("pump_amm.json");
-    for n in ["buy", "buy_exact_sol_in", "buy_v2", "buy_exact_quote_in_v2", "sell", "sell_v2"] {
-        assert_eq!(pump::ix_disc(n).to_vec(), disc_of(find(&p["instructions"], n)), "pump ix {n}");
+    for n in [
+        "buy",
+        "buy_exact_sol_in",
+        "buy_v2",
+        "buy_exact_quote_in_v2",
+        "sell",
+        "sell_v2",
+    ] {
+        assert_eq!(
+            pump::ix_disc(n).to_vec(),
+            disc_of(find(&p["instructions"], n)),
+            "pump ix {n}"
+        );
     }
     for n in ["buy", "sell", "buy_exact_quote_in"] {
-        assert_eq!(pump_amm::ix_disc(n).to_vec(), disc_of(find(&a["instructions"], n)), "amm ix {n}");
+        assert_eq!(
+            pump_amm::ix_disc(n).to_vec(),
+            disc_of(find(&a["instructions"], n)),
+            "amm ix {n}"
+        );
     }
     for n in ["TradeEvent", "CreateEvent", "CompleteEvent"] {
-        assert_eq!(pump::event_disc(n).to_vec(), disc_of(find(&p["events"], n)), "pump event {n}");
+        assert_eq!(
+            pump::event_disc(n).to_vec(),
+            disc_of(find(&p["events"], n)),
+            "pump event {n}"
+        );
     }
     for n in ["BuyEvent", "SellEvent"] {
-        assert_eq!(pump_amm::event_disc(n).to_vec(), disc_of(find(&a["events"], n)), "amm event {n}");
+        assert_eq!(
+            pump_amm::event_disc(n).to_vec(),
+            disc_of(find(&a["events"], n)),
+            "amm event {n}"
+        );
     }
     for (idl_v, n) in [(&p, "BondingCurve"), (&a, "Pool"), (&a, "GlobalConfig")] {
-        assert_eq!(anchor_disc("account", n).to_vec(), disc_of(find(&idl_v["accounts"], n)), "account {n}");
+        assert_eq!(
+            anchor_disc("account", n).to_vec(),
+            disc_of(find(&idl_v["accounts"], n)),
+            "account {n}"
+        );
     }
 }
 
 /// Resolve every IDL account (fixed address or PDA recipe) from the accounts
 /// we actually built, and compare address + writable + signer flags.
-fn check_ix_against_idl(ix: &Instruction, idl_v: &Value, name: &str, program: &Pubkey, extra: &HashMap<&str, Pubkey>) {
+fn check_ix_against_idl(
+    ix: &Instruction,
+    idl_v: &Value,
+    name: &str,
+    program: &Pubkey,
+    extra: &HashMap<&str, Pubkey>,
+) {
     let def = find(&idl_v["instructions"], name);
     let accs = def["accounts"].as_array().unwrap();
-    assert!(ix.accounts.len() >= accs.len(), "{name}: built {} accounts, IDL has {}", ix.accounts.len(), accs.len());
+    assert!(
+        ix.accounts.len() >= accs.len(),
+        "{name}: built {} accounts, IDL has {}",
+        ix.accounts.len(),
+        accs.len()
+    );
     let mut by_name: HashMap<String, Pubkey> = HashMap::new();
     for (i, a) in accs.iter().enumerate() {
-        by_name.insert(a["name"].as_str().unwrap().to_string(), ix.accounts[i].pubkey);
+        by_name.insert(
+            a["name"].as_str().unwrap().to_string(),
+            ix.accounts[i].pubkey,
+        );
     }
     for (i, a) in accs.iter().enumerate() {
         let n = a["name"].as_str().unwrap();
         let meta = &ix.accounts[i];
-        assert_eq!(meta.is_writable, a["writable"].as_bool().unwrap_or(false), "{name}.{n} writable");
-        assert_eq!(meta.is_signer, a["signer"].as_bool().unwrap_or(false), "{name}.{n} signer");
+        assert_eq!(
+            meta.is_writable,
+            a["writable"].as_bool().unwrap_or(false),
+            "{name}.{n} writable"
+        );
+        assert_eq!(
+            meta.is_signer,
+            a["signer"].as_bool().unwrap_or(false),
+            "{name}.{n} signer"
+        );
         if let Some(addr) = a["address"].as_str() {
             assert_eq!(meta.pubkey.to_string(), addr, "{name}.{n} address");
         }
@@ -70,10 +128,20 @@ fn check_ix_against_idl(ix: &Instruction, idl_v: &Value, name: &str, program: &P
             let mut seeds: Vec<Vec<u8>> = vec![];
             for s in pda_def["seeds"].as_array().unwrap() {
                 match s["kind"].as_str().unwrap() {
-                    "const" => seeds.push(s["value"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect()),
+                    "const" => seeds.push(
+                        s["value"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.as_u64().unwrap() as u8)
+                            .collect(),
+                    ),
                     "account" => {
                         let path = s["path"].as_str().unwrap();
-                        let pk = extra.get(path).copied().or_else(|| by_name.get(path).copied())
+                        let pk = extra
+                            .get(path)
+                            .copied()
+                            .or_else(|| by_name.get(path).copied())
                             .unwrap_or_else(|| panic!("{name}.{n}: unresolved seed path {path}"));
                         seeds.push(pk.to_bytes().to_vec());
                     }
@@ -82,9 +150,16 @@ fn check_ix_against_idl(ix: &Instruction, idl_v: &Value, name: &str, program: &P
             }
             let prog = match pda_def.get("program") {
                 None => *program,
-                Some(p) if p["kind"] == "const" => {
-                    Pubkey::new_from_array(p["value"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect::<Vec<_>>().try_into().unwrap())
-                }
+                Some(p) if p["kind"] == "const" => Pubkey::new_from_array(
+                    p["value"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_u64().unwrap() as u8)
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap(),
+                ),
                 Some(p) => by_name[p["path"].as_str().unwrap()],
             };
             let refs: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
@@ -93,7 +168,11 @@ fn check_ix_against_idl(ix: &Instruction, idl_v: &Value, name: &str, program: &P
         }
     }
     assert_eq!(ix.program_id, *program);
-    assert_eq!(&ix.data[..8], &disc_of(def)[..], "{name} discriminator in data");
+    assert_eq!(
+        &ix.data[..8],
+        &disc_of(def)[..],
+        "{name} discriminator in data"
+    );
 }
 
 #[test]
@@ -123,7 +202,10 @@ fn pump_curve_builders_match_idl() {
         // user token accounts use the coin's token program
         let b = pump::buy_exact_quote_in_v2(&coin, &user, 1, 1, 0);
         assert_eq!(b.accounts[14].pubkey, pda::ata(&user, &mint, &tp));
-        assert_eq!(b.accounts[15].pubkey, pda::ata(&user, &WSOL_MINT, &TOKEN_PROGRAM));
+        assert_eq!(
+            b.accounts[15].pubkey,
+            pda::ata(&user, &WSOL_MINT, &TOKEN_PROGRAM)
+        );
         assert_eq!(&b.data[8..16], &1u64.to_le_bytes());
     }
 }
@@ -134,7 +216,11 @@ fn pump_amm_builders_match_idl_and_sdk_remaining_accounts() {
     let user = Pubkey::new_unique();
     let base_mint = Pubkey::new_unique();
     for (cashback, has_creator) in [(false, true), (true, true), (false, false), (true, false)] {
-        let coin_creator = if has_creator { Pubkey::new_unique() } else { Pubkey::default() };
+        let coin_creator = if has_creator {
+            Pubkey::new_unique()
+        } else {
+            Pubkey::default()
+        };
         let coin = AmmCoin {
             pool: Pubkey::new_unique(),
             base_mint,
@@ -152,7 +238,10 @@ fn pump_amm_builders_match_idl_and_sdk_remaining_accounts() {
         let extra = HashMap::from([("pool.coin_creator", coin_creator)]);
 
         let buys = pump_amm::buy_instructions(&coin, &user, 1000, 2000);
-        let swap = buys.iter().find(|i| i.program_id == PUMP_AMM_PROGRAM).unwrap();
+        let swap = buys
+            .iter()
+            .find(|i| i.program_id == PUMP_AMM_PROGRAM)
+            .unwrap();
         check_ix_against_idl(swap, &a, "buy", &PUMP_AMM_PROGRAM, &extra);
         let rem = &swap.accounts[23..];
         let uva = pda::amm_user_volume_accumulator(&user);
@@ -164,14 +253,26 @@ fn pump_amm_builders_match_idl_and_sdk_remaining_accounts() {
             expect.push((pda::amm_pool_v2(&base_mint), false));
         }
         expect.push((coin.buyback_fee_recipient, false));
-        expect.push((pda::ata(&coin.buyback_fee_recipient, &WSOL_MINT, &TOKEN_PROGRAM), true));
-        assert_eq!(rem.iter().map(|m| (m.pubkey, m.is_writable)).collect::<Vec<_>>(), expect, "buy remaining (cashback={cashback})");
+        expect.push((
+            pda::ata(&coin.buyback_fee_recipient, &WSOL_MINT, &TOKEN_PROGRAM),
+            true,
+        ));
+        assert_eq!(
+            rem.iter()
+                .map(|m| (m.pubkey, m.is_writable))
+                .collect::<Vec<_>>(),
+            expect,
+            "buy remaining (cashback={cashback})"
+        );
         assert_eq!(swap.data.len(), 8 + 8 + 8 + 1);
         // WSOL wrap: ata(base), ata(wsol), transfer, sync, buy, close
         assert_eq!(buys.len(), 6);
 
         let sells = pump_amm::sell_instructions(&coin, &user, 1000, 1);
-        let swap = sells.iter().find(|i| i.program_id == PUMP_AMM_PROGRAM).unwrap();
+        let swap = sells
+            .iter()
+            .find(|i| i.program_id == PUMP_AMM_PROGRAM)
+            .unwrap();
         check_ix_against_idl(swap, &a, "sell", &PUMP_AMM_PROGRAM, &extra);
         let rem = &swap.accounts[21..];
         let mut expect = vec![];
@@ -183,8 +284,17 @@ fn pump_amm_builders_match_idl_and_sdk_remaining_accounts() {
             expect.push((pda::amm_pool_v2(&base_mint), false));
         }
         expect.push((coin.buyback_fee_recipient, false));
-        expect.push((pda::ata(&coin.buyback_fee_recipient, &WSOL_MINT, &TOKEN_PROGRAM), true));
-        assert_eq!(rem.iter().map(|m| (m.pubkey, m.is_writable)).collect::<Vec<_>>(), expect, "sell remaining");
+        expect.push((
+            pda::ata(&coin.buyback_fee_recipient, &WSOL_MINT, &TOKEN_PROGRAM),
+            true,
+        ));
+        assert_eq!(
+            rem.iter()
+                .map(|m| (m.pubkey, m.is_writable))
+                .collect::<Vec<_>>(),
+            expect,
+            "sell remaining"
+        );
         assert_eq!(sells.len(), 3); // ata(wsol), sell, close
     }
 }
@@ -208,16 +318,46 @@ impl<'a> Enc<'a> {
     fn value(&mut self, ty: &Value) -> Value {
         if let Some(s) = ty.as_str() {
             return match s {
-                "u8" => { let v = (self.next() % 256) as u8; self.out.push(v); Value::from(v) }
-                "bool" => { let v = self.next() % 2 == 1; self.out.push(v as u8); Value::from(v) }
-                "u16" => { let v = (self.next() % 65536) as u16; self.out.extend(v.to_le_bytes()); Value::from(v) }
-                "u32" => { let v = self.next() as u32; self.out.extend(v.to_le_bytes()); Value::from(v) }
-                "u64" => { let v = self.next() >> 2; self.out.extend(v.to_le_bytes()); Value::from(v) }
-                "i64" => { let v = (self.next() >> 2) as i64; self.out.extend(v.to_le_bytes()); Value::from(v) }
-                "u128" | "i128" => { let v = (self.next() >> 8) as u128; self.out.extend(v.to_le_bytes()); Value::from(v.to_string()) }
+                "u8" => {
+                    let v = (self.next() % 256) as u8;
+                    self.out.push(v);
+                    Value::from(v)
+                }
+                "bool" => {
+                    let v = self.next() % 2 == 1;
+                    self.out.push(v as u8);
+                    Value::from(v)
+                }
+                "u16" => {
+                    let v = (self.next() % 65536) as u16;
+                    self.out.extend(v.to_le_bytes());
+                    Value::from(v)
+                }
+                "u32" => {
+                    let v = self.next() as u32;
+                    self.out.extend(v.to_le_bytes());
+                    Value::from(v)
+                }
+                "u64" => {
+                    let v = self.next() >> 2;
+                    self.out.extend(v.to_le_bytes());
+                    Value::from(v)
+                }
+                "i64" => {
+                    let v = (self.next() >> 2) as i64;
+                    self.out.extend(v.to_le_bytes());
+                    Value::from(v)
+                }
+                "u128" | "i128" => {
+                    let v = (self.next() >> 8) as u128;
+                    self.out.extend(v.to_le_bytes());
+                    Value::from(v.to_string())
+                }
                 "pubkey" => {
                     let mut b = [0u8; 32];
-                    for c in b.chunks_mut(8) { c.copy_from_slice(&self.next().to_le_bytes()); }
+                    for c in b.chunks_mut(8) {
+                        c.copy_from_slice(&self.next().to_le_bytes());
+                    }
                     self.out.extend(b);
                     Value::from(Pubkey::new_from_array(b).to_string())
                 }
@@ -255,7 +395,12 @@ impl<'a> Enc<'a> {
         panic!("unsupported type {ty}")
     }
     fn encode_struct(types: &'a Value, name: &str, seed: u64) -> (Vec<u8>, HashMap<String, Value>) {
-        let mut e = Enc { types, seed, out: vec![], fields: HashMap::new() };
+        let mut e = Enc {
+            types,
+            seed,
+            out: vec![],
+            fields: HashMap::new(),
+        };
         let t = &find(types, name)["type"];
         for f in t["fields"].as_array().unwrap() {
             let v = e.value(&f["type"]);
@@ -277,21 +422,38 @@ fn trade_event_decodes_idl_encoded_bytes() {
         let mut data = EVENT_IX_TAG.to_vec();
         data.extend(pump::event_disc("TradeEvent"));
         data.extend(&bytes);
-        let Some(pump::PumpEvent::Trade(e)) = pump::decode_event_ix(&data) else { panic!("decode failed") };
+        let Some(pump::PumpEvent::Trade(e)) = pump::decode_event_ix(&data) else {
+            panic!("decode failed")
+        };
         assert_eq!(e.mint, pk(&f["mint"]));
         assert_eq!(e.user, pk(&f["user"]));
         assert_eq!(e.creator, pk(&f["creator"]));
         assert_eq!(e.sol_amount, f["sol_amount"].as_u64().unwrap());
         assert_eq!(e.token_amount, f["token_amount"].as_u64().unwrap());
         assert_eq!(e.is_buy, f["is_buy"].as_bool().unwrap());
-        assert_eq!(e.virtual_sol_reserves, f["virtual_sol_reserves"].as_u64().unwrap());
-        assert_eq!(e.virtual_token_reserves, f["virtual_token_reserves"].as_u64().unwrap());
-        assert_eq!(e.real_sol_reserves, f["real_sol_reserves"].as_u64().unwrap());
+        assert_eq!(
+            e.virtual_sol_reserves,
+            f["virtual_sol_reserves"].as_u64().unwrap()
+        );
+        assert_eq!(
+            e.virtual_token_reserves,
+            f["virtual_token_reserves"].as_u64().unwrap()
+        );
+        assert_eq!(
+            e.real_sol_reserves,
+            f["real_sol_reserves"].as_u64().unwrap()
+        );
         assert_eq!(e.fee_basis_points, f["fee_basis_points"].as_u64().unwrap());
-        assert_eq!(e.creator_fee_basis_points, f["creator_fee_basis_points"].as_u64().unwrap());
+        assert_eq!(
+            e.creator_fee_basis_points,
+            f["creator_fee_basis_points"].as_u64().unwrap()
+        );
         assert_eq!(e.ix_name, f["ix_name"].as_str().unwrap());
         assert_eq!(e.mayhem_mode, f["mayhem_mode"].as_bool().unwrap());
-        assert_eq!(e.buyback_fee_basis_points, f["buyback_fee_basis_points"].as_u64().unwrap());
+        assert_eq!(
+            e.buyback_fee_basis_points,
+            f["buyback_fee_basis_points"].as_u64().unwrap()
+        );
         assert_eq!(e.quote_mint, Some(pk(&f["quote_mint"])));
     }
 }
@@ -302,7 +464,9 @@ fn create_and_complete_events_decode() {
     let (bytes, f) = Enc::encode_struct(&p["types"], "CreateEvent", 42);
     let mut data = pump::event_disc("CreateEvent").to_vec();
     data.extend(&bytes);
-    let Some(pump::PumpEvent::Create(e)) = pump::decode_event(&data) else { panic!() };
+    let Some(pump::PumpEvent::Create(e)) = pump::decode_event(&data) else {
+        panic!()
+    };
     assert_eq!(e.mint, pk(&f["mint"]));
     assert_eq!(e.creator, pk(&f["creator"]));
     assert_eq!(e.symbol, f["symbol"].as_str().unwrap());
@@ -312,7 +476,9 @@ fn create_and_complete_events_decode() {
     let (bytes, f) = Enc::encode_struct(&p["types"], "CompleteEvent", 43);
     let mut data = pump::event_disc("CompleteEvent").to_vec();
     data.extend(&bytes);
-    let Some(pump::PumpEvent::Complete(e)) = pump::decode_event(&data) else { panic!() };
+    let Some(pump::PumpEvent::Complete(e)) = pump::decode_event(&data) else {
+        panic!()
+    };
     assert_eq!(e.mint, pk(&f["mint"]));
 }
 
@@ -331,16 +497,42 @@ fn amm_events_decode_idl_encoded_bytes() {
             assert_eq!(e.user, pk(&f["user"]));
             assert_eq!(e.coin_creator, pk(&f["coin_creator"]));
             assert_eq!(e.protocol_fee_recipient, pk(&f["protocol_fee_recipient"]));
-            assert_eq!(e.pool_base_token_reserves, f["pool_base_token_reserves"].as_u64().unwrap());
-            assert_eq!(e.pool_quote_token_reserves, f["pool_quote_token_reserves"].as_u64().unwrap());
-            let base_field = if is_buy { "base_amount_out" } else { "base_amount_in" };
+            assert_eq!(
+                e.pool_base_token_reserves,
+                f["pool_base_token_reserves"].as_u64().unwrap()
+            );
+            assert_eq!(
+                e.pool_quote_token_reserves,
+                f["pool_quote_token_reserves"].as_u64().unwrap()
+            );
+            let base_field = if is_buy {
+                "base_amount_out"
+            } else {
+                "base_amount_in"
+            };
             assert_eq!(e.base_amount, f[base_field].as_u64().unwrap());
-            let uq = if is_buy { "user_quote_amount_in" } else { "user_quote_amount_out" };
+            let uq = if is_buy {
+                "user_quote_amount_in"
+            } else {
+                "user_quote_amount_out"
+            };
             assert_eq!(e.user_quote_amount, f[uq].as_u64().unwrap());
-            assert_eq!(e.lp_fee_basis_points, f["lp_fee_basis_points"].as_u64().unwrap());
-            assert_eq!(e.coin_creator_fee_basis_points, f["coin_creator_fee_basis_points"].as_u64().unwrap());
-            assert_eq!(e.buyback_fee_basis_points, f["buyback_fee_basis_points"].as_u64().unwrap());
-            assert_eq!(e.virtual_quote_reserves.to_string(), f["virtual_quote_reserves"].as_str().unwrap());
+            assert_eq!(
+                e.lp_fee_basis_points,
+                f["lp_fee_basis_points"].as_u64().unwrap()
+            );
+            assert_eq!(
+                e.coin_creator_fee_basis_points,
+                f["coin_creator_fee_basis_points"].as_u64().unwrap()
+            );
+            assert_eq!(
+                e.buyback_fee_basis_points,
+                f["buyback_fee_basis_points"].as_u64().unwrap()
+            );
+            assert_eq!(
+                e.virtual_quote_reserves.to_string(),
+                f["virtual_quote_reserves"].as_str().unwrap()
+            );
         }
     }
 }
@@ -353,7 +545,10 @@ fn accounts_decode_idl_encoded_bytes() {
     data.extend(&bytes);
     let bc = pump::BondingCurve::decode(&data).unwrap();
     assert_eq!(bc.creator, pk(&f["creator"]));
-    assert_eq!(bc.state.virtual_quote_reserves, f["virtual_quote_reserves"].as_u64().unwrap());
+    assert_eq!(
+        bc.state.virtual_quote_reserves,
+        f["virtual_quote_reserves"].as_u64().unwrap()
+    );
     assert_eq!(bc.complete, f["complete"].as_bool().unwrap());
     assert_eq!(bc.is_mayhem_mode, f["is_mayhem_mode"].as_bool().unwrap());
     assert_eq!(bc.quote_mint, pk(&f["quote_mint"]));
@@ -364,20 +559,41 @@ fn accounts_decode_idl_encoded_bytes() {
     data.extend(&bytes);
     let pool = pump_amm::Pool::decode(&data).unwrap();
     assert_eq!(pool.base_mint, pk(&f["base_mint"]));
-    assert_eq!(pool.pool_quote_token_account, pk(&f["pool_quote_token_account"]));
+    assert_eq!(
+        pool.pool_quote_token_account,
+        pk(&f["pool_quote_token_account"])
+    );
     assert_eq!(pool.coin_creator, pk(&f["coin_creator"]));
-    assert_eq!(pool.is_cashback_coin, f["is_cashback_coin"].as_bool().unwrap());
-    assert_eq!(pool.virtual_quote_reserves.to_string(), f["virtual_quote_reserves"].as_str().unwrap());
+    assert_eq!(
+        pool.is_cashback_coin,
+        f["is_cashback_coin"].as_bool().unwrap()
+    );
+    assert_eq!(
+        pool.virtual_quote_reserves.to_string(),
+        f["virtual_quote_reserves"].as_str().unwrap()
+    );
 
     let (bytes, f) = Enc::encode_struct(&a["types"], "GlobalConfig", 11);
     let mut data = anchor_disc("account", "GlobalConfig").to_vec();
     data.extend(&bytes);
     let g = pump_amm::GlobalConfig::decode(&data).unwrap();
-    assert_eq!(g.protocol_fee_recipients[7], pk(&f["protocol_fee_recipients"][7]));
+    assert_eq!(
+        g.protocol_fee_recipients[7],
+        pk(&f["protocol_fee_recipients"][7])
+    );
     assert_eq!(g.reserved_fee_recipient, pk(&f["reserved_fee_recipient"]));
-    assert_eq!(g.reserved_fee_recipients[6], pk(&f["reserved_fee_recipients"][6]));
-    assert_eq!(g.buyback_fee_recipients[0], pk(&f["buyback_fee_recipients"][0]));
-    assert_eq!(g.buyback_fee_recipients[7], pk(&f["buyback_fee_recipients"][7]));
+    assert_eq!(
+        g.reserved_fee_recipients[6],
+        pk(&f["reserved_fee_recipients"][6])
+    );
+    assert_eq!(
+        g.buyback_fee_recipients[0],
+        pk(&f["buyback_fee_recipients"][0])
+    );
+    assert_eq!(
+        g.buyback_fee_recipients[7],
+        pk(&f["buyback_fee_recipients"][7])
+    );
 }
 
 #[test]
@@ -390,7 +606,10 @@ fn quote_math_is_consistent() {
     };
     let toks = pump::buy_tokens_for_quote(&s, 1_000_000_000, 125);
     // ~1 SOL into a fresh curve buys roughly 34.5M tokens
-    assert!((34_000_000_000_000..35_000_000_000_000).contains(&toks), "{toks}");
+    assert!(
+        (34_000_000_000_000..35_000_000_000_000).contains(&toks),
+        "{toks}"
+    );
     let after = pump::CurveState {
         virtual_token_reserves: s.virtual_token_reserves - toks,
         virtual_quote_reserves: s.virtual_quote_reserves + 987_000_000,

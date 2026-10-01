@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::prelude::{
-    subscribe_update::UpdateOneof, subscribe_update_deshred::UpdateOneof as DeshredOneof, CommitmentLevel,
-    SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestFilterDeshredTransactions,
-    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    subscribe_update::UpdateOneof, subscribe_update_deshred::UpdateOneof as DeshredOneof,
+    CommitmentLevel, SubscribeDeshredRequest, SubscribeRequest,
+    SubscribeRequestFilterDeshredTransactions, SubscribeRequestFilterSlots,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
 
 use crate::consts::{PUMP_AMM_PROGRAM, PUMP_PROGRAM};
@@ -51,12 +52,22 @@ pub struct Filters {
 #[derive(Debug)]
 pub enum FeedEvent {
     Tx(Box<ChainTx>),
-    Slot { slot: u64, status: i32 },
-    Status { source: &'static str, connected: bool, detail: String },
+    Slot {
+        slot: u64,
+        status: i32,
+    },
+    Status {
+        source: &'static str,
+        connected: bool,
+        detail: String,
+    },
 }
 
 fn token(cfg: &GeyserConfig) -> Option<String> {
-    cfg.x_token_env.as_ref().and_then(|v| std::env::var(v).ok()).filter(|s| !s.is_empty())
+    cfg.x_token_env
+        .as_ref()
+        .and_then(|v| std::env::var(v).ok())
+        .filter(|s| !s.is_empty())
 }
 
 async fn connect(cfg: &GeyserConfig) -> anyhow::Result<GeyserGrpcClient> {
@@ -75,12 +86,28 @@ async fn connect(cfg: &GeyserConfig) -> anyhow::Result<GeyserGrpcClient> {
 
 fn request(cfg: &GeyserConfig, f: &Filters) -> SubscribeRequest {
     let mut txs = HashMap::new();
-    let base = SubscribeRequestFilterTransactions { vote: Some(false), failed: Some(false), ..Default::default() };
+    let base = SubscribeRequestFilterTransactions {
+        vote: Some(false),
+        failed: Some(false),
+        ..Default::default()
+    };
     if !f.leaders.is_empty() {
-        txs.insert("leaders".into(), SubscribeRequestFilterTransactions { account_include: f.leaders.clone(), ..base.clone() });
+        txs.insert(
+            "leaders".into(),
+            SubscribeRequestFilterTransactions {
+                account_include: f.leaders.clone(),
+                ..base.clone()
+            },
+        );
     }
     if !f.mints.is_empty() {
-        txs.insert("mints".into(), SubscribeRequestFilterTransactions { account_include: f.mints.clone(), ..base.clone() });
+        txs.insert(
+            "mints".into(),
+            SubscribeRequestFilterTransactions {
+                account_include: f.mints.clone(),
+                ..base.clone()
+            },
+        );
     }
     if cfg.firehose {
         txs.insert(
@@ -92,7 +119,13 @@ fn request(cfg: &GeyserConfig, f: &Filters) -> SubscribeRequest {
         );
     }
     let mut slots = HashMap::new();
-    slots.insert("slots".into(), SubscribeRequestFilterSlots { filter_by_commitment: Some(false), interslot_updates: Some(false) });
+    slots.insert(
+        "slots".into(),
+        SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(false),
+            interslot_updates: Some(false),
+        },
+    );
     SubscribeRequest {
         transactions: txs,
         slots,
@@ -102,7 +135,11 @@ fn request(cfg: &GeyserConfig, f: &Filters) -> SubscribeRequest {
 }
 
 /// Run the transactions stream forever (reconnecting), pushing into `out`.
-pub async fn run(cfg: GeyserConfig, mut filters: watch::Receiver<Filters>, out: mpsc::Sender<FeedEvent>) {
+pub async fn run(
+    cfg: GeyserConfig,
+    mut filters: watch::Receiver<Filters>,
+    out: mpsc::Sender<FeedEvent>,
+) {
     let mut backoff = Duration::from_millis(250);
     loop {
         let res: anyhow::Result<()> = async {
@@ -149,7 +186,13 @@ pub async fn run(cfg: GeyserConfig, mut filters: watch::Receiver<Filters>, out: 
         match res {
             Ok(()) => return,
             Err(e) => {
-                let _ = out.send(FeedEvent::Status { source: "geyser", connected: false, detail: e.to_string() }).await;
+                let _ = out
+                    .send(FeedEvent::Status {
+                        source: "geyser",
+                        connected: false,
+                        detail: e.to_string(),
+                    })
+                    .await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
@@ -158,7 +201,11 @@ pub async fn run(cfg: GeyserConfig, mut filters: watch::Receiver<Filters>, out: 
 }
 
 /// Pre-execution stream for leader wallets only.
-pub async fn run_deshred(cfg: GeyserConfig, mut filters: watch::Receiver<Filters>, out: mpsc::Sender<FeedEvent>) {
+pub async fn run_deshred(
+    cfg: GeyserConfig,
+    mut filters: watch::Receiver<Filters>,
+    out: mpsc::Sender<FeedEvent>,
+) {
     let mut backoff = Duration::from_millis(500);
     loop {
         let res: anyhow::Result<()> = async {
@@ -203,7 +250,13 @@ pub async fn run_deshred(cfg: GeyserConfig, mut filters: watch::Receiver<Filters
         match res {
             Ok(()) => return,
             Err(e) => {
-                let _ = out.send(FeedEvent::Status { source: "deshred", connected: false, detail: e.to_string() }).await;
+                let _ = out
+                    .send(FeedEvent::Status {
+                        source: "deshred",
+                        connected: false,
+                        detail: e.to_string(),
+                    })
+                    .await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(10));
             }

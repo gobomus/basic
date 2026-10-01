@@ -70,8 +70,17 @@ pub fn venue_of(tx: &ChainTx) -> Venue {
 /// How we can execute a copy of this swap.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Template {
-    Curve { coin: CurveCoin, state: CurveState, fee_bps: u64 },
-    Amm { coin: AmmCoin, base_reserve: u64, quote_reserve: u128, fee_bps: u64 },
+    Curve {
+        coin: CurveCoin,
+        state: CurveState,
+        fee_bps: u64,
+    },
+    Amm {
+        coin: AmmCoin,
+        base_reserve: u64,
+        quote_reserve: u128,
+        fee_bps: u64,
+    },
     /// No direct builder: route through an aggregator.
     Generic,
 }
@@ -103,12 +112,24 @@ fn token_program_of(tx: &ChainTx, mint: &Pubkey) -> (Pubkey, u8) {
         .iter()
         .chain(tx.pre_tokens.iter())
         .find(|b| b.mint == *mint)
-        .map(|b| (if b.program == Pubkey::default() { TOKEN_PROGRAM } else { b.program }, b.decimals))
+        .map(|b| {
+            (
+                if b.program == Pubkey::default() {
+                    TOKEN_PROGRAM
+                } else {
+                    b.program
+                },
+                b.decimals,
+            )
+        })
         .unwrap_or((TOKEN_PROGRAM, PUMP_TOKEN_DECIMALS))
 }
 
 fn token_balance(bals: &[crate::model::TokenBal], owner: &Pubkey, mint: &Pubkey) -> u64 {
-    bals.iter().filter(|b| b.owner == *owner && b.mint == *mint).map(|b| b.amount).sum()
+    bals.iter()
+        .filter(|b| b.owner == *owner && b.mint == *mint)
+        .map(|b| b.amount)
+        .sum()
 }
 
 fn fraction_sold(tx: &ChainTx, owner: &Pubkey, mint: &Pubkey, sold: u64) -> Option<f64> {
@@ -123,7 +144,9 @@ pub fn pump_events(tx: &ChainTx) -> Vec<PumpEvent> {
         .filter_map(|ix| pump::decode_event_ix(&ix.data))
         .collect();
     if out.is_empty() {
-        out = program_data_logs(tx).filter_map(|b| pump::decode_event(&b)).collect();
+        out = program_data_logs(tx)
+            .filter_map(|b| pump::decode_event(&b))
+            .collect();
     }
     out
 }
@@ -135,7 +158,9 @@ pub fn amm_events(tx: &ChainTx) -> Vec<SwapEventData> {
         .filter_map(|ix| pump_amm::decode_event_ix(&ix.data))
         .collect();
     if out.is_empty() {
-        out = program_data_logs(tx).filter_map(|b| pump_amm::decode_event(&b)).collect();
+        out = program_data_logs(tx)
+            .filter_map(|b| pump_amm::decode_event(&b))
+            .collect();
     }
     out
 }
@@ -162,9 +187,17 @@ fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> DetectedSwap {
         token_program: tp,
         price_sol: e.price_sol(),
         pool_sol: Some(e.real_sol_reserves),
-        fraction_sold: if e.is_buy { None } else { fraction_sold(tx, &e.user, &e.mint, e.token_amount) },
+        fraction_sold: if e.is_buy {
+            None
+        } else {
+            fraction_sold(tx, &e.user, &e.mint, e.token_amount)
+        },
         exact: true,
-        template: Template::Curve { coin, state: e.curve_state(), fee_bps: e.total_fee_bps() },
+        template: Template::Curve {
+            coin,
+            state: e.curve_state(),
+            fee_bps: e.total_fee_bps(),
+        },
         creator: Some(e.creator),
         migrated: false,
     }
@@ -178,7 +211,9 @@ fn amm_template(tx: &ChainTx, e: &SwapEventData) -> Option<(AmmCoin, Pubkey)> {
     let ix = tx.all_ixs().find(|ix| {
         ix.program == PUMP_AMM_PROGRAM
             && ix.accounts.first() == Some(&e.pool)
-            && (ix.data.starts_with(&buy) || ix.data.starts_with(&sell) || ix.data.starts_with(&bxq))
+            && (ix.data.starts_with(&buy)
+                || ix.data.starts_with(&sell)
+                || ix.data.starts_with(&bxq))
     })?;
     let a = &ix.accounts;
     let fixed = if ix.data.starts_with(&sell) { 21 } else { 23 };
@@ -229,7 +264,11 @@ fn amm_swap(tx: &ChainTx, e: &SwapEventData) -> Option<DetectedSwap> {
         token_program: tp,
         price_sol: e.price(dec, 9),
         pool_sol: Some(e.effective_quote_reserves() as u64),
-        fraction_sold: if e.is_buy { None } else { fraction_sold(tx, &e.user, &mint, e.base_amount) },
+        fraction_sold: if e.is_buy {
+            None
+        } else {
+            fraction_sold(tx, &e.user, &mint, e.base_amount)
+        },
         exact: true,
         template: Template::Amm {
             base_reserve: e.pool_base_token_reserves,
@@ -242,10 +281,15 @@ fn amm_swap(tx: &ChainTx, e: &SwapEventData) -> Option<DetectedSwap> {
     })
 }
 
-/// Balance-delta detection for any venue.
-fn generic_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
-    let Some(idx) = tx.key_index(wallet) else { return vec![] };
-    let (Some(pre), Some(post)) = (tx.pre_balances.get(idx), tx.post_balances.get(idx)) else { return vec![] };
+/// Balance-delta detection for any venue. Also used for our own fills: it
+/// captures the true SOL cost including fees, tips and rent.
+pub fn balance_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
+    let Some(idx) = tx.key_index(wallet) else {
+        return vec![];
+    };
+    let (Some(pre), Some(post)) = (tx.pre_balances.get(idx), tx.post_balances.get(idx)) else {
+        return vec![];
+    };
     let mut sol_delta = *post as i128 - *pre as i128;
     if tx.fee_payer() == Some(wallet) {
         sol_delta += tx.fee as i128;
@@ -264,7 +308,13 @@ fn generic_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     mints.dedup();
     let deltas: Vec<(Pubkey, i128)> = mints
         .into_iter()
-        .map(|m| (m, token_balance(&tx.post_tokens, wallet, &m) as i128 - token_balance(&tx.pre_tokens, wallet, &m) as i128))
+        .map(|m| {
+            (
+                m,
+                token_balance(&tx.post_tokens, wallet, &m) as i128
+                    - token_balance(&tx.pre_tokens, wallet, &m) as i128,
+            )
+        })
         .filter(|(_, d)| *d != 0)
         .collect();
     if deltas.len() != 1 {
@@ -291,7 +341,11 @@ fn generic_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
         token_program: tp,
         price_sol: price,
         pool_sol: None,
-        fraction_sold: if side == Side::Sell { fraction_sold(tx, wallet, &mint, toks) } else { None },
+        fraction_sold: if side == Side::Sell {
+            fraction_sold(tx, wallet, &mint, toks)
+        } else {
+            None
+        },
         exact: false,
         template: Template::Generic,
         creator: None,
@@ -311,9 +365,14 @@ pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
             _ => None,
         })
         .collect();
-    out.extend(amm_events(tx).iter().filter(|e| e.user == *wallet).filter_map(|e| amm_swap(tx, e)));
+    out.extend(
+        amm_events(tx)
+            .iter()
+            .filter(|e| e.user == *wallet)
+            .filter_map(|e| amm_swap(tx, e)),
+    );
     if out.is_empty() && tx.has_meta {
-        out = generic_swaps(tx, wallet);
+        out = balance_swaps(tx, wallet);
     }
     out
 }
@@ -333,7 +392,7 @@ pub fn all_swaps(tx: &ChainTx) -> Vec<DetectedSwap> {
     out.extend(amm_events(tx).iter().filter_map(|e| amm_swap(tx, e)));
     if out.is_empty() && tx.has_meta {
         for s in tx.signers().to_vec() {
-            out.extend(generic_swaps(tx, &s));
+            out.extend(balance_swaps(tx, &s));
         }
     }
     out
@@ -341,7 +400,10 @@ pub fn all_swaps(tx: &ChainTx) -> Vec<DetectedSwap> {
 
 /// Token creation / migration lifecycle events.
 pub fn lifecycle(tx: &ChainTx) -> Vec<PumpEvent> {
-    pump_events(tx).into_iter().filter(|e| !matches!(e, PumpEvent::Trade(_))).collect()
+    pump_events(tx)
+        .into_iter()
+        .filter(|e| !matches!(e, PumpEvent::Trade(_)))
+        .collect()
 }
 
 /// A leader buy seen *before execution* (deshred feed): only the instruction
@@ -361,7 +423,11 @@ pub fn pre_exec_pump_buys(tx: &ChainTx, wallet: &Pubkey) -> Vec<PreExecBuy> {
     let v2_buy = pump::ix_disc("buy_v2");
     let v2_exact = pump::ix_disc("buy_exact_quote_in_v2");
     let mut out = Vec::new();
-    for ix in tx.top.iter().filter(|ix| ix.program == PUMP_PROGRAM && ix.data.len() >= 24) {
+    for ix in tx
+        .top
+        .iter()
+        .filter(|ix| ix.program == PUMP_PROGRAM && ix.data.len() >= 24)
+    {
         let d = &ix.data;
         let arg = |i: usize| u64::from_le_bytes(d[8 + 8 * i..16 + 8 * i].try_into().unwrap());
         let (mint_i, user_i, sol) = if d.starts_with(&legacy_buy) {
@@ -377,7 +443,11 @@ pub fn pre_exec_pump_buys(tx: &ChainTx, wallet: &Pubkey) -> Vec<PreExecBuy> {
         };
         if ix.accounts.get(user_i) == Some(wallet) {
             if let Some(m) = ix.accounts.get(mint_i) {
-                out.push(PreExecBuy { wallet: *wallet, mint: *m, sol_amount: sol });
+                out.push(PreExecBuy {
+                    wallet: *wallet,
+                    mint: *m,
+                    sol_amount: sol,
+                });
             }
         }
     }

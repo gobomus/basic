@@ -1,0 +1,151 @@
+# copybot production configuration (template).
+#   cp config/copybot.example.toml config/copybot.toml   # git-ignored
+# Secrets are NEVER written here — only the NAMES of environment variables
+# that hold them (see .env.example). Validated by the test suite.
+
+# shadow = decide + log only, paper = simulated fills, live = real transactions.
+# Start in shadow and promote only when the go-live gates in docs/07-roadmap.md pass.
+mode = "shadow"
+
+# Exit policy used when a leader has no override.
+default_exit = "ladder_trail"
+# Evaluated counterfactually on every position and logged, never traded.
+# This is how challengers accumulate evidence before promotion.
+shadow_exits = ["mirror_leader", "fast_scalp", "moonbag"]
+
+[sizing]
+copy_pct = 0.10            # copy 10% of the leader's SOL size
+min_buy_sol = 0.05         # below this, fees + tips eat the edge
+max_buy_sol = 1.0
+max_pool_impact_pct = 0.01 # never be more than 1% of pool SOL reserves
+follow_adds = true         # copy the leader's follow-up buys
+max_adds = 2
+
+[filters]
+min_leader_buy_sol = 0.5   # ignore dust / test buys
+max_leader_buy_sol = 200.0
+venues = []                # empty = all decoded venues
+min_pool_sol = 15.0
+max_token_age_secs = 604800
+max_detection_slot_lag = 2 # we are >2 slots behind → skip
+max_price_drift_pct = 0.20 # price already +20% over leader fill → skip
+
+[risk]
+max_position_sol = 2.0
+max_total_exposure_sol = 6.0
+max_open_positions = 8
+min_sol_reserve = 0.15
+daily_loss_limit_sol = 2.0
+max_buy_slippage_bps = 1500
+max_sell_slippage_bps = 3000
+
+# ---------------------------------------------------------------- exit policies
+
+[exits.ladder_trail]
+stop_loss_pct = 0.35
+take_profit = [
+  { at_multiple = 1.8, sell_fraction = 0.40 },
+  { at_multiple = 3.5, sell_fraction = 0.30 },
+]
+trailing = { activate_at_multiple = 1.4, drawdown_pct = 0.30 }
+max_hold_secs = 14400
+stale_secs = 1800
+on_leader_sell = { action = "tighten", drawdown_pct = 0.12 }
+exit_on_dev_sell = true
+liquidity_drop_pct = 0.40
+
+# Baseline: behave like a classic copy bot. Every other policy is judged against it.
+[exits.mirror_leader]
+stop_loss_pct = 0.50
+on_leader_sell = { action = "mirror" }
+
+[exits.fast_scalp]
+stop_loss_pct = 0.20
+take_profit = [{ at_multiple = 1.35, sell_fraction = 1.0 }]
+max_hold_secs = 600
+on_leader_sell = { action = "sell_all" }
+exit_on_dev_sell = true
+
+[exits.moonbag]
+stop_loss_pct = 0.45
+take_profit = [
+  { at_multiple = 2.0, sell_fraction = 0.50 },
+  { at_multiple = 5.0, sell_fraction = 0.25 },
+]
+trailing = { activate_at_multiple = 5.0, drawdown_pct = 0.45 }
+on_leader_sell = { action = "ignore" }
+liquidity_drop_pct = 0.50
+
+# ---------------------------------------------------------------- leaders
+# Only add wallets that pass the selection gates in docs/04-wallet-selection.md.
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_1"
+label = "swing-1"
+copy_pct = 0.15
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_2"
+label = "migration-hunter"
+exit = "fast_scalp"
+max_buy_sol = 0.5
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_3"
+label = "probation"
+enabled = false
+
+# ================================================================ infrastructure
+
+[infra]
+rpc_url_env = "RPC_URL"              # e.g. a Helius / Triton / QuickNode HTTPS RPC URL with key
+jito_block_engine = "https://frankfurt.mainnet.block-engine.jito.wtf"
+tip_accounts = []                    # empty = fetched from the block engine at startup
+feed_stale_secs = 5
+
+[infra.geyser]                       # any Yellowstone-gRPC endpoint (Triton, LaserStream, Shyft, ...)
+endpoint = "https://YOUR-GRPC-ENDPOINT:443"
+x_token_env = "GEYSER_X_TOKEN"
+firehose = true                      # stream every Pump / PumpSwap trade (prices, features, data)
+deshred = false                      # pre-execution stream, only if your provider supports it
+
+# Every order is ONE signed transaction pushed to all senders in parallel.
+# It can execute at most once. Check each provider's docs for URL + tip rules.
+[[infra.senders]]
+name = "jito"
+url = "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions"
+accepts_jito_tip = true
+
+[[infra.senders]]
+name = "helius-sender"
+url = "http://fra-sender.helius-rpc.com/fast"
+accepts_jito_tip = true
+
+[[infra.senders]]
+name = "rpc"
+url = "https://YOUR-RPC-URL"         # plain sendTransaction fallback
+accepts_jito_tip = false
+
+[infra.fees]
+cu_limit_buy = 260000
+cu_limit_sell = 220000
+cu_price_micro_lamports = 300000     # priority fee
+tip_lamports_buy = 1000000           # 0.001 SOL
+tip_lamports_sell = 1000000
+urgent_tip_multiplier = 3            # stop-loss / dev-dump / liquidity-pull exits
+
+[infra.wallet]
+keystore = "keys/hot-1.json"         # created by: copybot wallet new --out keys/hot-1.json
+passphrase_env = "KEYSTORE_PASSPHRASE"
+
+[infra.telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"
+chat_id = 0                          # your chat id; 0 = alerts disabled
+
+[infra.storage]
+journal_dir = "data/journal"         # always on: JSONL of every signal, order, fill, exit
+postgres_url_env = "DATABASE_URL"    # optional: schema/postgres/001_state.sql
+clickhouse_url = ""                  # optional: http://host:8123 for schema/clickhouse
+
+[infra.jupiter]                      # fallback route for venues without a direct builder
+base_url = "https://lite-api.jup.ag/swap/v1"

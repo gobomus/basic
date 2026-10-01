@@ -112,8 +112,15 @@ impl SwapEventData {
     }
 
     pub fn total_fee_bps(&self) -> u64 {
-        let creator = if self.coin_creator == Pubkey::default() { 0 } else { self.coin_creator_fee_basis_points };
-        self.lp_fee_basis_points + self.protocol_fee_basis_points + creator + self.buyback_fee_basis_points
+        let creator = if self.coin_creator == Pubkey::default() {
+            0
+        } else {
+            self.coin_creator_fee_basis_points
+        };
+        self.lp_fee_basis_points
+            + self.protocol_fee_basis_points
+            + creator
+            + self.buyback_fee_basis_points
     }
 }
 
@@ -251,7 +258,12 @@ impl GlobalConfig {
 // ------------------------------------------------------------------ quoting
 
 /// Base tokens out for spending exactly `quote` (fees included). Port of SDK `buyQuoteInput`.
-pub fn buy_base_for_quote(base_reserve: u64, effective_quote_reserve: u128, quote: u64, total_fee_bps: u64) -> u64 {
+pub fn buy_base_for_quote(
+    base_reserve: u64,
+    effective_quote_reserve: u128,
+    quote: u64,
+    total_fee_bps: u64,
+) -> u64 {
     if base_reserve == 0 || effective_quote_reserve == 0 || quote < 2 {
         return 0;
     }
@@ -266,7 +278,12 @@ pub fn buy_base_for_quote(base_reserve: u64, effective_quote_reserve: u128, quot
 }
 
 /// Quote received for selling `base` after fees. Port of SDK `sellBaseInput`.
-pub fn sell_quote_for_base(base_reserve: u64, effective_quote_reserve: u128, base: u64, total_fee_bps: u64) -> u64 {
+pub fn sell_quote_for_base(
+    base_reserve: u64,
+    effective_quote_reserve: u128,
+    base: u64,
+    total_fee_bps: u64,
+) -> u64 {
     if base_reserve == 0 || base == 0 {
         return 0;
     }
@@ -294,8 +311,16 @@ pub struct AmmCoin {
 }
 
 impl AmmCoin {
-    pub fn from_pool(pool_key: Pubkey, p: &Pool, base_token_program: Pubkey, quote_token_program: Pubkey, g: &GlobalConfig, salt: u64) -> Self {
-        let (protocol_fee_recipient, buyback_fee_recipient) = g.pick_recipients(p.is_mayhem_mode, salt);
+    pub fn from_pool(
+        pool_key: Pubkey,
+        p: &Pool,
+        base_token_program: Pubkey,
+        quote_token_program: Pubkey,
+        g: &GlobalConfig,
+        salt: u64,
+    ) -> Self {
+        let (protocol_fee_recipient, buyback_fee_recipient) =
+            g.pick_recipients(p.is_mayhem_mode, salt);
         Self {
             pool: pool_key,
             base_mint: p.base_mint,
@@ -326,77 +351,153 @@ fn swap_accounts(c: &AmmCoin, user: &Pubkey, is_buy: bool) -> Vec<AccountMeta> {
         AccountMeta::new(c.pool_base_token_account, false),
         AccountMeta::new(c.pool_quote_token_account, false),
         AccountMeta::new_readonly(c.protocol_fee_recipient, false),
-        AccountMeta::new(pda::ata(&c.protocol_fee_recipient, &c.quote_mint, &c.quote_token_program), false),
+        AccountMeta::new(
+            pda::ata(
+                &c.protocol_fee_recipient,
+                &c.quote_mint,
+                &c.quote_token_program,
+            ),
+            false,
+        ),
         AccountMeta::new_readonly(c.base_token_program, false),
         AccountMeta::new_readonly(c.quote_token_program, false),
         AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
         AccountMeta::new_readonly(ATA_PROGRAM, false),
         AccountMeta::new_readonly(pda::amm_event_authority(), false),
         AccountMeta::new_readonly(PUMP_AMM_PROGRAM, false),
-        AccountMeta::new(pda::ata(&ccva, &c.quote_mint, &c.quote_token_program), false),
+        AccountMeta::new(
+            pda::ata(&ccva, &c.quote_mint, &c.quote_token_program),
+            false,
+        ),
         AccountMeta::new_readonly(ccva, false),
     ];
     if is_buy {
-        a.push(AccountMeta::new_readonly(pda::amm_global_volume_accumulator(), false));
-        a.push(AccountMeta::new(pda::amm_user_volume_accumulator(user), false));
+        a.push(AccountMeta::new_readonly(
+            pda::amm_global_volume_accumulator(),
+            false,
+        ));
+        a.push(AccountMeta::new(
+            pda::amm_user_volume_accumulator(user),
+            false,
+        ));
     }
-    a.push(AccountMeta::new_readonly(pda::fee_config_for(&PUMP_AMM_PROGRAM), false));
+    a.push(AccountMeta::new_readonly(
+        pda::fee_config_for(&PUMP_AMM_PROGRAM),
+        false,
+    ));
     a.push(AccountMeta::new_readonly(PUMP_FEE_PROGRAM, false));
 
     // Remaining accounts, in SDK order.
     let uva = pda::amm_user_volume_accumulator(user);
     if c.is_cashback_coin {
-        a.push(AccountMeta::new(pda::ata(&uva, &c.quote_mint, &c.quote_token_program), false));
+        a.push(AccountMeta::new(
+            pda::ata(&uva, &c.quote_mint, &c.quote_token_program),
+            false,
+        ));
         if !is_buy {
             a.push(AccountMeta::new(uva, false));
         }
     }
     if c.coin_creator != Pubkey::default() {
-        a.push(AccountMeta::new_readonly(pda::amm_pool_v2(&c.base_mint), false));
+        a.push(AccountMeta::new_readonly(
+            pda::amm_pool_v2(&c.base_mint),
+            false,
+        ));
     }
     a.push(AccountMeta::new_readonly(c.buyback_fee_recipient, false));
-    a.push(AccountMeta::new(pda::ata(&c.buyback_fee_recipient, &c.quote_mint, &c.quote_token_program), false));
+    a.push(AccountMeta::new(
+        pda::ata(
+            &c.buyback_fee_recipient,
+            &c.quote_mint,
+            &c.quote_token_program,
+        ),
+        false,
+    ));
     a
 }
 
 /// Full instruction list for a buy: base ATA, WSOL wrap, `buy`, WSOL close.
-pub fn buy_instructions(c: &AmmCoin, user: &Pubkey, base_amount_out: u64, max_quote_amount_in: u64) -> Vec<Instruction> {
+pub fn buy_instructions(
+    c: &AmmCoin,
+    user: &Pubkey,
+    base_amount_out: u64,
+    max_quote_amount_in: u64,
+) -> Vec<Instruction> {
     let mut data = ix_disc("buy").to_vec();
     data.extend_from_slice(&base_amount_out.to_le_bytes());
     data.extend_from_slice(&max_quote_amount_in.to_le_bytes());
     data.push(1); // OptionBool(track_volume = true), as the SDK passes { 0: true }
-    let swap = Instruction { program_id: PUMP_AMM_PROGRAM, accounts: swap_accounts(c, user, true), data };
+    let swap = Instruction {
+        program_id: PUMP_AMM_PROGRAM,
+        accounts: swap_accounts(c, user, true),
+        data,
+    };
 
-    let mut out = vec![ixs::create_ata_idempotent(user, user, &c.base_mint, &c.base_token_program)];
+    let mut out = vec![ixs::create_ata_idempotent(
+        user,
+        user,
+        &c.base_mint,
+        &c.base_token_program,
+    )];
     wrap_around(&mut out, c, user, max_quote_amount_in, swap);
     out
 }
 
 /// Full instruction list for a sell: WSOL ATA, `sell`, WSOL close.
-pub fn sell_instructions(c: &AmmCoin, user: &Pubkey, base_amount_in: u64, min_quote_amount_out: u64) -> Vec<Instruction> {
+pub fn sell_instructions(
+    c: &AmmCoin,
+    user: &Pubkey,
+    base_amount_in: u64,
+    min_quote_amount_out: u64,
+) -> Vec<Instruction> {
     let mut data = ix_disc("sell").to_vec();
     data.extend_from_slice(&base_amount_in.to_le_bytes());
     data.extend_from_slice(&min_quote_amount_out.to_le_bytes());
-    let swap = Instruction { program_id: PUMP_AMM_PROGRAM, accounts: swap_accounts(c, user, false), data };
+    let swap = Instruction {
+        program_id: PUMP_AMM_PROGRAM,
+        accounts: swap_accounts(c, user, false),
+        data,
+    };
     let mut out = Vec::new();
     wrap_around(&mut out, c, user, 0, swap);
     out
 }
 
-fn wrap_around(out: &mut Vec<Instruction>, c: &AmmCoin, user: &Pubkey, wrap_lamports: u64, swap: Instruction) {
+fn wrap_around(
+    out: &mut Vec<Instruction>,
+    c: &AmmCoin,
+    user: &Pubkey,
+    wrap_lamports: u64,
+    swap: Instruction,
+) {
     let wsol = c.quote_mint == WSOL_MINT;
     let wsol_ata = pda::ata(user, &WSOL_MINT, &TOKEN_PROGRAM);
     if wsol {
-        out.push(ixs::create_ata_idempotent(user, user, &WSOL_MINT, &TOKEN_PROGRAM));
+        out.push(ixs::create_ata_idempotent(
+            user,
+            user,
+            &WSOL_MINT,
+            &TOKEN_PROGRAM,
+        ));
         if wrap_lamports > 0 {
             out.push(ixs::system_transfer(user, &wsol_ata, wrap_lamports));
             out.push(ixs::sync_native(&wsol_ata));
         }
     } else {
-        out.push(ixs::create_ata_idempotent(user, user, &c.quote_mint, &c.quote_token_program));
+        out.push(ixs::create_ata_idempotent(
+            user,
+            user,
+            &c.quote_mint,
+            &c.quote_token_program,
+        ));
     }
     out.push(swap);
     if wsol {
-        out.push(ixs::close_token_account(&wsol_ata, user, user, &TOKEN_PROGRAM));
+        out.push(ixs::close_token_account(
+            &wsol_ata,
+            user,
+            user,
+            &TOKEN_PROGRAM,
+        ));
     }
 }

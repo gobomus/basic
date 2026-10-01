@@ -34,15 +34,20 @@ Fixed cost per transaction (tip + priority fee) is assumed at ~0.001 SOL; the He
 - [x] Repo reorganised; legacy archived.
 - [x] `engine-core`: types, config, sizing, exit policies, replay, wallet scoring, with tests.
 - [x] Schemas: ClickHouse firehose and snapshots; Postgres journal.
-- [ ] Provider accounts: gRPC plus shred feed, Sender / Jito / one more landing service.
-- [ ] `ingest` + `decoders` crates in this order:
-  1. Pump curve and PumpSwap;
-  2. Raydium LaunchLab and CPMM;
-  3. Meteora DBC and DAMM v2;
-  4. Raydium AMM v4 and CLMM, Meteora DLMM, Orca;
-  5. Jupiter inner routes.
-- [ ] `recorder` into ClickHouse; Grafana with the basic latency and coverage panels.
-- [ ] `research/` Python package: backfill, round-trip reconstruction, copy simulation (reuses replay logic via a small CLI or PyO3 binding), wallet scoring.
+- [x] `chain` crate:
+  - Pump.fun curve and PumpSwap builders and decoders, verified against the official IDLs and SDK;
+  - universal swap detection for every venue;
+  - Yellowstone gRPC and deshred feeds, RPC client, multi-sender.
+- [x] `copybot` binary:
+  - live engine in shadow, paper or live mode;
+  - Telegram control, journal, kill switches, restart recovery;
+  - `check`, `simulate`, `leader-report`, `bench` and `wallet` tools.
+- [x] Deployment: `deploy/setup.sh`, systemd unit, docker-compose, CI.
+- [ ] **Live-chain verification on the production server:** `copybot check` → `copybot simulate` (curve + PumpSwap coin) → shadow mode.
+- [ ] Provider accounts: gRPC (+ deshred if offered), RPC, Sender/Jito.
+- [ ] Direct builders for Raydium LaunchLab and Meteora DBC/DAMM v2 (Jupiter fallback until then).
+- [ ] Token feature service: holders, snipers, bundlers, dev history, socials.
+- [ ] `research/` Python package: backfill, copy simulation, exit tuning.
 
 **Gate 0:**
 - Decode coverage ≥ 99% of candidate leaders' swaps over 7 days.

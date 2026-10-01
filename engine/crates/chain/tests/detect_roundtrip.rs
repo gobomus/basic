@@ -13,7 +13,11 @@ use engine_core::types::{FeedSource, Side, Venue};
 use solana_sdk::pubkey::Pubkey;
 
 fn to_ix(i: &solana_sdk::instruction::Instruction) -> Ix {
-    Ix { program: i.program_id, accounts: i.accounts.iter().map(|m| m.pubkey).collect(), data: i.data.clone() }
+    Ix {
+        program: i.program_id,
+        accounts: i.accounts.iter().map(|m| m.pubkey).collect(),
+        data: i.data.clone(),
+    }
 }
 
 fn base_tx(leader: Pubkey) -> ChainTx {
@@ -39,7 +43,14 @@ fn base_tx(leader: Pubkey) -> ChainTx {
     }
 }
 
-fn trade_event_bytes(mint: Pubkey, user: Pubkey, creator: Pubkey, is_buy: bool, sol: u64, tokens: u64) -> Vec<u8> {
+fn trade_event_bytes(
+    mint: Pubkey,
+    user: Pubkey,
+    creator: Pubkey,
+    is_buy: bool,
+    sol: u64,
+    tokens: u64,
+) -> Vec<u8> {
     let mut d = EVENT_IX_TAG.to_vec();
     d.extend(pump::event_disc("TradeEvent"));
     d.extend(mint.to_bytes());
@@ -48,7 +59,12 @@ fn trade_event_bytes(mint: Pubkey, user: Pubkey, creator: Pubkey, is_buy: bool, 
     d.push(is_buy as u8);
     d.extend(user.to_bytes());
     d.extend(1_700_000_000i64.to_le_bytes());
-    for v in [31_000_000_000u64, 1_040_000_000_000_000, 1_000_000_000, 760_000_000_000_000] {
+    for v in [
+        31_000_000_000u64,
+        1_040_000_000_000_000,
+        1_000_000_000,
+        760_000_000_000_000,
+    ] {
         d.extend(v.to_le_bytes());
     }
     d.extend(PUMP_FEE_RECIPIENTS[0].to_bytes());
@@ -69,16 +85,42 @@ fn pump_curve_buy_is_detected_exactly() {
     let ix = pump::buy_exact_quote_in_v2(&coin, &leader, 2_000_000_000, 1, 3);
     let mut tx = base_tx(leader);
     tx.top.push(to_ix(&ix));
-    tx.inner.push((0, vec![Ix { program: PUMP_PROGRAM, accounts: vec![pda::pump_event_authority()], data: trade_event_bytes(mint, leader, creator, true, 1_975_000_000, 60_000_000_000_000) }]));
-    tx.post_tokens.push(TokenBal { account: pda::ata(&leader, &mint, &TOKEN_2022_PROGRAM), mint, owner: leader, program: TOKEN_2022_PROGRAM, amount: 60_000_000_000_000, decimals: 6 });
+    tx.inner.push((
+        0,
+        vec![Ix {
+            program: PUMP_PROGRAM,
+            accounts: vec![pda::pump_event_authority()],
+            data: trade_event_bytes(
+                mint,
+                leader,
+                creator,
+                true,
+                1_975_000_000,
+                60_000_000_000_000,
+            ),
+        }],
+    ));
+    tx.post_tokens.push(TokenBal {
+        account: pda::ata(&leader, &mint, &TOKEN_2022_PROGRAM),
+        mint,
+        owner: leader,
+        program: TOKEN_2022_PROGRAM,
+        amount: 60_000_000_000_000,
+        decimals: 6,
+    });
 
     let swaps = detect::swaps_by(&tx, &leader);
     assert_eq!(swaps.len(), 1);
     let s = &swaps[0];
-    assert_eq!((s.side, s.venue, s.mint, s.sol_amount, s.exact), (Side::Buy, Venue::PumpFunCurve, mint, 1_975_000_000, true));
+    assert_eq!(
+        (s.side, s.venue, s.mint, s.sol_amount, s.exact),
+        (Side::Buy, Venue::PumpFunCurve, mint, 1_975_000_000, true)
+    );
     assert_eq!(s.token_program, TOKEN_2022_PROGRAM);
     match &s.template {
-        Template::Curve { coin: c, fee_bps, .. } => {
+        Template::Curve {
+            coin: c, fee_bps, ..
+        } => {
             assert_eq!(c, &coin);
             assert_eq!(*fee_bps, 125);
         }
@@ -99,9 +141,24 @@ fn pump_curve_sell_reports_fraction() {
     let creator = Pubkey::new_unique();
     let mut tx = base_tx(leader);
     tx.inner.push((0, vec![]));
-    tx.top.push(Ix { program: PUMP_PROGRAM, accounts: vec![], data: vec![] });
-    tx.inner[0].1.push(Ix { program: PUMP_PROGRAM, accounts: vec![], data: trade_event_bytes(mint, leader, creator, false, 500_000_000, 25_000_000_000) });
-    tx.pre_tokens.push(TokenBal { account: Pubkey::new_unique(), mint, owner: leader, program: TOKEN_PROGRAM, amount: 100_000_000_000, decimals: 6 });
+    tx.top.push(Ix {
+        program: PUMP_PROGRAM,
+        accounts: vec![],
+        data: vec![],
+    });
+    tx.inner[0].1.push(Ix {
+        program: PUMP_PROGRAM,
+        accounts: vec![],
+        data: trade_event_bytes(mint, leader, creator, false, 500_000_000, 25_000_000_000),
+    });
+    tx.pre_tokens.push(TokenBal {
+        account: Pubkey::new_unique(),
+        mint,
+        owner: leader,
+        program: TOKEN_PROGRAM,
+        amount: 100_000_000_000,
+        decimals: 6,
+    });
     let s = &detect::swaps_by(&tx, &leader)[0];
     assert_eq!(s.side, Side::Sell);
     assert!((s.fraction_sold.unwrap() - 0.25).abs() < 1e-9);
@@ -111,7 +168,21 @@ fn amm_event_bytes(pool: Pubkey, user: Pubkey, coin_creator: Pubkey, fee_rcpt: P
     let mut d = EVENT_IX_TAG.to_vec();
     d.extend(pump_amm::event_disc("BuyEvent"));
     d.extend(1_700_000_000i64.to_le_bytes()); // timestamp
-    for v in [5_000_000_000u64, 0, 0, 0, 900_000_000_000_000, 120_000_000_000, 1_000_000_000, 20, 2_000_000, 93, 9_300_000, 1_002_000_000, 1_012_000_000] {
+    for v in [
+        5_000_000_000u64,
+        0,
+        0,
+        0,
+        900_000_000_000_000,
+        120_000_000_000,
+        1_000_000_000,
+        20,
+        2_000_000,
+        93,
+        9_300_000,
+        1_002_000_000,
+        1_012_000_000,
+    ] {
         d.extend(v.to_le_bytes());
     }
     d.extend(pool.to_bytes());
@@ -147,12 +218,36 @@ fn pumpswap_buy_rebuilds_identical_template() {
         for i in pump_amm::buy_instructions(&coin, &leader, 5_000_000_000, 1_100_000_000) {
             tx.top.push(to_ix(&i));
         }
-        let swap_idx = tx.top.iter().position(|i| i.program == PUMP_AMM_PROGRAM).unwrap();
-        tx.inner.push((swap_idx, vec![Ix { program: PUMP_AMM_PROGRAM, accounts: vec![], data: amm_event_bytes(coin.pool, leader, coin.coin_creator, coin.protocol_fee_recipient) }]));
+        let swap_idx = tx
+            .top
+            .iter()
+            .position(|i| i.program == PUMP_AMM_PROGRAM)
+            .unwrap();
+        tx.inner.push((
+            swap_idx,
+            vec![Ix {
+                program: PUMP_AMM_PROGRAM,
+                accounts: vec![],
+                data: amm_event_bytes(
+                    coin.pool,
+                    leader,
+                    coin.coin_creator,
+                    coin.protocol_fee_recipient,
+                ),
+            }],
+        ));
         let s = &detect::swaps_by(&tx, &leader)[0];
-        assert_eq!((s.venue, s.side, s.mint, s.sol_amount), (Venue::PumpSwap, Side::Buy, coin.base_mint, 1_012_000_000));
+        assert_eq!(
+            (s.venue, s.side, s.mint, s.sol_amount),
+            (Venue::PumpSwap, Side::Buy, coin.base_mint, 1_012_000_000)
+        );
         match &s.template {
-            Template::Amm { coin: c, base_reserve, fee_bps, .. } => {
+            Template::Amm {
+                coin: c,
+                base_reserve,
+                fee_bps,
+                ..
+            } => {
                 assert_eq!(c, &coin, "cashback={cashback}");
                 assert_eq!(*base_reserve, 900_000_000_000_000);
                 assert_eq!(*fee_bps, 20 + 93 + 30);
@@ -168,9 +263,19 @@ fn generic_venue_detected_from_balances() {
     let mint = Pubkey::new_unique();
     let mut tx = base_tx(leader);
     tx.post_balances = vec![10_000_000_000 - 750_000_000 - 5000];
-    tx.post_tokens.push(TokenBal { account: Pubkey::new_unique(), mint, owner: leader, program: TOKEN_PROGRAM, amount: 3_000_000_000, decimals: 6 });
+    tx.post_tokens.push(TokenBal {
+        account: Pubkey::new_unique(),
+        mint,
+        owner: leader,
+        program: TOKEN_PROGRAM,
+        amount: 3_000_000_000,
+        decimals: 6,
+    });
     let s = &detect::swaps_by(&tx, &leader)[0];
-    assert_eq!((s.side, s.sol_amount, s.token_amount, s.exact), (Side::Buy, 750_000_000, 3_000_000_000, false));
+    assert_eq!(
+        (s.side, s.sol_amount, s.token_amount, s.exact),
+        (Side::Buy, 750_000_000, 3_000_000_000, false)
+    );
     assert!((s.price_sol - 0.00025).abs() < 1e-12); // 0.75 SOL for 3,000 tokens
     assert_eq!(s.template, Template::Generic);
 

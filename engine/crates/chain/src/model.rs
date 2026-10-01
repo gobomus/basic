@@ -82,7 +82,10 @@ impl ChainTx {
     }
 
     pub fn now_ns() -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
 
     // ------------------------------------------------------------ from Geyser
@@ -103,17 +106,30 @@ impl ChainTx {
         let ix = |prog: u32, accs: &[u8], data: &[u8]| -> Option<Ix> {
             Some(Ix {
                 program: *keys.get(prog as usize)?,
-                accounts: accs.iter().filter_map(|a| keys.get(*a as usize).copied()).collect(),
+                accounts: accs
+                    .iter()
+                    .filter_map(|a| keys.get(*a as usize).copied())
+                    .collect(),
                 data: data.to_vec(),
             })
         };
-        let top = msg.instructions.iter().filter_map(|i| ix(i.program_id_index, &i.accounts, &i.data)).collect();
+        let top = msg
+            .instructions
+            .iter()
+            .filter_map(|i| ix(i.program_id_index, &i.accounts, &i.data))
+            .collect();
         let (inner, pre_tokens, post_tokens, logs, fee, failed, pre_b, post_b) = match meta {
             Some(m) => (
                 m.inner_instructions
                     .iter()
                     .map(|g| {
-                        (g.index as usize, g.instructions.iter().filter_map(|i| ix(i.program_id_index, &i.accounts, &i.data)).collect())
+                        (
+                            g.index as usize,
+                            g.instructions
+                                .iter()
+                                .filter_map(|i| ix(i.program_id_index, &i.accounts, &i.data))
+                                .collect(),
+                        )
                     })
                     .collect(),
                 token_bals_geyser(&m.pre_token_balances, &keys),
@@ -135,7 +151,11 @@ impl ChainTx {
             source: FeedSource::Geyser,
             failed,
             fee,
-            num_signers: msg.header.as_ref().map(|h| h.num_required_signatures as usize).unwrap_or(1),
+            num_signers: msg
+                .header
+                .as_ref()
+                .map(|h| h.num_required_signatures as usize)
+                .unwrap_or(1),
             keys,
             top,
             inner,
@@ -157,15 +177,27 @@ impl ChainTx {
         let tx = info.transaction.as_ref()?;
         let msg = tx.message.as_ref()?;
         let mut keys: Vec<Pubkey> = msg.account_keys.iter().filter_map(|k| to_pk(k)).collect();
-        keys.extend(info.loaded_writable_addresses.iter().filter_map(|k| to_pk(k)));
-        keys.extend(info.loaded_readonly_addresses.iter().filter_map(|k| to_pk(k)));
+        keys.extend(
+            info.loaded_writable_addresses
+                .iter()
+                .filter_map(|k| to_pk(k)),
+        );
+        keys.extend(
+            info.loaded_readonly_addresses
+                .iter()
+                .filter_map(|k| to_pk(k)),
+        );
         let top = msg
             .instructions
             .iter()
             .filter_map(|i| {
                 Some(Ix {
                     program: *keys.get(i.program_id_index as usize)?,
-                    accounts: i.accounts.iter().filter_map(|a| keys.get(*a as usize).copied()).collect(),
+                    accounts: i
+                        .accounts
+                        .iter()
+                        .filter_map(|a| keys.get(*a as usize).copied())
+                        .collect(),
                     data: i.data.clone(),
                 })
             })
@@ -179,7 +211,11 @@ impl ChainTx {
             source: FeedSource::Shred,
             failed: false,
             fee: 0,
-            num_signers: msg.header.as_ref().map(|h| h.num_required_signatures as usize).unwrap_or(1),
+            num_signers: msg
+                .header
+                .as_ref()
+                .map(|h| h.num_required_signatures as usize)
+                .unwrap_or(1),
             keys,
             top,
             inner: vec![],
@@ -201,11 +237,18 @@ impl ChainTx {
         let mut keys: Vec<Pubkey> = Vec::new();
         for k in msg["accountKeys"].as_array().into_iter().flatten() {
             // json encoding: strings; jsonParsed: {pubkey: ..}
-            let s = k.as_str().or_else(|| k["pubkey"].as_str()).unwrap_or_default();
+            let s = k
+                .as_str()
+                .or_else(|| k["pubkey"].as_str())
+                .unwrap_or_default();
             keys.push(s.parse()?);
         }
         for part in ["writable", "readonly"] {
-            for k in meta["loadedAddresses"][part].as_array().into_iter().flatten() {
+            for k in meta["loadedAddresses"][part]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
                 keys.push(k.as_str().unwrap_or_default().parse()?);
             }
         }
@@ -220,7 +263,12 @@ impl ChainTx {
                 data: bs58::decode(i["data"].as_str()?).into_vec().ok()?,
             })
         };
-        let top = msg["instructions"].as_array().into_iter().flatten().filter_map(ix).collect();
+        let top = msg["instructions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(ix)
+            .collect();
         let inner = meta["innerInstructions"]
             .as_array()
             .into_iter()
@@ -228,11 +276,20 @@ impl ChainTx {
             .map(|g| {
                 (
                     g["index"].as_u64().unwrap_or(0) as usize,
-                    g["instructions"].as_array().into_iter().flatten().filter_map(ix).collect(),
+                    g["instructions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(ix)
+                        .collect(),
                 )
             })
             .collect();
-        let u64s = |x: &Value| x.as_array().map(|a| a.iter().filter_map(|n| n.as_u64()).collect()).unwrap_or_default();
+        let u64s = |x: &Value| {
+            x.as_array()
+                .map(|a| a.iter().filter_map(|n| n.as_u64()).collect())
+                .unwrap_or_default()
+        };
         Ok(Self {
             signature: tx["signatures"][0].as_str().unwrap_or_default().to_string(),
             slot: v["slot"].as_u64().unwrap_or(0),
@@ -247,7 +304,14 @@ impl ChainTx {
             post_tokens: token_bals_json(&meta["postTokenBalances"], &keys),
             pre_balances: u64s(&meta["preBalances"]),
             post_balances: u64s(&meta["postBalances"]),
-            logs: meta["logMessages"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default(),
+            logs: meta["logMessages"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|l| l.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
             keys,
             top,
             inner,
@@ -260,7 +324,10 @@ fn to_pk(b: &[u8]) -> Option<Pubkey> {
     Some(Pubkey::new_from_array(b.try_into().ok()?))
 }
 
-fn token_bals_geyser(v: &[yellowstone_grpc_proto::prelude::TokenBalance], keys: &[Pubkey]) -> Vec<TokenBal> {
+fn token_bals_geyser(
+    v: &[yellowstone_grpc_proto::prelude::TokenBalance],
+    keys: &[Pubkey],
+) -> Vec<TokenBal> {
     v.iter()
         .filter_map(|b| {
             let amt = b.ui_token_amount.as_ref()?;
@@ -284,8 +351,16 @@ fn token_bals_json(v: &Value, keys: &[Pubkey]) -> Vec<TokenBal> {
             Some(TokenBal {
                 account: *keys.get(b["accountIndex"].as_u64()? as usize)?,
                 mint: b["mint"].as_str()?.parse().ok()?,
-                owner: b["owner"].as_str().unwrap_or_default().parse().unwrap_or_default(),
-                program: b["programId"].as_str().unwrap_or_default().parse().unwrap_or_default(),
+                owner: b["owner"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default(),
+                program: b["programId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .parse()
+                    .unwrap_or_default(),
                 amount: b["uiTokenAmount"]["amount"].as_str()?.parse().ok()?,
                 decimals: b["uiTokenAmount"]["decimals"].as_u64().unwrap_or(0) as u8,
             })

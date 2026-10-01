@@ -1,0 +1,20 @@
+[Unit]
+Description=copybot — Solana copy-trading engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=copybot
+WorkingDirectory=/opt/copybot
+EnvironmentFile=/etc/copybot.env
+ExecStart=/opt/copybot/copybot run -c /opt/copybot/config/copybot.toml
+# On restart the engine re-adopts any tokens still in the wallet.
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
