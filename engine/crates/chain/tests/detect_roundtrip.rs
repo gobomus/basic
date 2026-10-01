@@ -283,3 +283,81 @@ fn generic_venue_detected_from_balances() {
     tx.failed = true;
     assert!(detect::swaps_by(&tx, &leader).is_empty());
 }
+
+#[test]
+fn meteora_dbc_buy_detected_with_template() {
+    use chain::meteora_dbc::{self as dbc, DbcCoin};
+    let leader = Pubkey::new_unique();
+    let coin = DbcCoin {
+        pool: Pubkey::new_unique(),
+        config: Pubkey::new_unique(),
+        base_mint: Pubkey::new_unique(),
+        quote_mint: WSOL_MINT,
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        base_token_program: TOKEN_PROGRAM,
+        quote_token_program: TOKEN_PROGRAM,
+        needs_ix_sysvar: true,
+    };
+    let mut tx = base_tx(leader);
+    for i in dbc::buy_instructions(&coin, &leader, 500_000_000, 1) {
+        tx.top.push(to_ix(&i));
+    }
+    let idx = tx
+        .top
+        .iter()
+        .position(|i| i.program == dbc::DBC_PROGRAM)
+        .unwrap();
+    // EvtSwap2 with next_sqrt_price for P = 3e-5 lamports per raw unit
+    let sqrt = (3e-5f64.sqrt() * 18_446_744_073_709_551_616.0) as u128;
+    let mut ev = EVENT_IX_TAG.to_vec();
+    ev.extend(dbc::event_disc("EvtSwap2"));
+    ev.extend(coin.pool.to_bytes());
+    ev.extend(coin.config.to_bytes());
+    ev.push(1); // QuoteToBase
+    ev.push(0);
+    ev.extend(500_000_000u64.to_le_bytes());
+    ev.extend(1u64.to_le_bytes());
+    ev.push(0);
+    for v in [500_000_000u64, 495_000_000, 0, 16_000_000_000_000] {
+        ev.extend(v.to_le_bytes());
+    }
+    ev.extend(sqrt.to_le_bytes());
+    for v in [5_000_000u64, 0, 0, 42_000_000_000, 85_000_000_000, 0] {
+        ev.extend(v.to_le_bytes());
+    }
+    tx.inner.push((
+        idx,
+        vec![Ix {
+            program: dbc::DBC_PROGRAM,
+            accounts: vec![],
+            data: ev,
+        }],
+    ));
+    tx.post_balances = vec![10_000_000_000 - 500_000_000 - 5000];
+    tx.post_tokens.push(TokenBal {
+        account: Pubkey::new_unique(),
+        mint: coin.base_mint,
+        owner: leader,
+        program: TOKEN_PROGRAM,
+        amount: 16_000_000_000_000,
+        decimals: 6,
+    });
+
+    let s = &detect::swaps_by(&tx, &leader)[0];
+    assert_eq!(
+        (s.venue, s.side, s.mint),
+        (Venue::MeteoraDbc, Side::Buy, coin.base_mint)
+    );
+    assert_eq!(s.pool_sol, Some(42_000_000_000));
+    assert!((s.price_sol - 3e-5 * 1e6 / 1e9).abs() < 1e-15);
+    match &s.template {
+        Template::Dbc {
+            coin: c, fee_bps, ..
+        } => {
+            assert_eq!(c, &coin);
+            assert_eq!(*fee_bps, 100); // 5_000_000 / 500_000_000
+        }
+        t => panic!("{t:?}"),
+    }
+}

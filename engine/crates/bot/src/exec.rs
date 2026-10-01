@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chain::detect::Template;
+use chain::meteora_dbc;
 use chain::pda;
 use chain::pump::{self};
 use chain::pump_amm::{self, AmmCoin, GlobalConfig, Pool};
@@ -173,6 +174,20 @@ impl Exec {
                     base_out,
                 ))
             }
+            Template::Dbc {
+                coin,
+                price_raw,
+                fee_bps,
+            } => {
+                let expected = meteora_dbc::estimate_buy(*price_raw, sol_in, *fee_bps);
+                anyhow::ensure!(expected > 0, "DBC quote is zero");
+                let min_out = pump::apply_slippage_down(expected, slippage_bps);
+                Ok((
+                    meteora_dbc::buy_instructions(coin, &me, sol_in, min_out),
+                    expected,
+                    min_out,
+                ))
+            }
             Template::Generic => anyhow::bail!("generic venue: use the Jupiter route"),
         }
     }
@@ -214,6 +229,18 @@ impl Exec {
                 let min_out = pump::apply_slippage_down(expected, slippage_bps);
                 (
                     pump_amm::sell_instructions(coin, &me, tokens, min_out),
+                    expected,
+                )
+            }
+            Template::Dbc {
+                coin,
+                price_raw,
+                fee_bps,
+            } => {
+                let expected = meteora_dbc::estimate_sell(*price_raw, tokens, *fee_bps);
+                let min_out = pump::apply_slippage_down(expected, slippage_bps);
+                (
+                    meteora_dbc::sell_instructions(coin, &me, tokens, min_out),
                     expected,
                 )
             }

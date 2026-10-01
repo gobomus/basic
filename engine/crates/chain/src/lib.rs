@@ -5,6 +5,7 @@ pub mod consts;
 pub mod detect;
 pub mod geyser;
 pub mod ixs;
+pub mod meteora_dbc;
 pub mod model;
 pub mod pda;
 pub mod pump;

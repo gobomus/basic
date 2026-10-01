@@ -721,6 +721,9 @@ impl Engine {
                 fee_bps,
                 ..
             } => pump_amm::buy_base_for_quote(*base_reserve, *quote_reserve, lamports, *fee_bps),
+            Template::Dbc {
+                price_raw, fee_bps, ..
+            } => chain::meteora_dbc::estimate_buy(*price_raw, lamports, *fee_bps),
             Template::Generic => {
                 if s.price_sol > 0.0 {
                     ((lamports_to_sol(lamports) / s.price_sol)
@@ -1112,6 +1115,9 @@ impl Engine {
                     fee_bps,
                     ..
                 } => pump_amm::sell_quote_for_base(*base_reserve, *quote_reserve, tokens, *fee_bps),
+                Template::Dbc {
+                    price_raw, fee_bps, ..
+                } => chain::meteora_dbc::estimate_sell(*price_raw, tokens, *fee_bps),
                 Template::Generic => {
                     sol_to_lamports(price_now * tokens as f64 / 10f64.powi(p.decimals as i32))
                 }
@@ -1420,9 +1426,9 @@ impl Engine {
         };
         let size = lamports_to_sol(p.cost_lamports);
         let fee_bps = match self.tokens.get(&mint).map(|t| &t.template) {
-            Some(Template::Curve { fee_bps, .. }) | Some(Template::Amm { fee_bps, .. }) => {
-                *fee_bps as f64
-            }
+            Some(Template::Curve { fee_bps, .. })
+            | Some(Template::Amm { fee_bps, .. })
+            | Some(Template::Dbc { fee_bps, .. }) => *fee_bps as f64,
             _ => 100.0,
         };
         let cost = CostModel {

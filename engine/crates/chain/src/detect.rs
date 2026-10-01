@@ -14,6 +14,7 @@ use engine_core::types::{Side, Venue};
 
 use crate::borsh::EVENT_IX_TAG;
 use crate::consts::*;
+use crate::meteora_dbc::{self as dbc, DbcCoin};
 use crate::model::ChainTx;
 use crate::pda;
 use crate::pump::{self, CurveCoin, CurveState, PumpEvent, TradeEvent};
@@ -24,7 +25,7 @@ const RAYDIUM_AMM_V4: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt
 const RAYDIUM_CPMM: Pubkey = pubkey!("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
 const RAYDIUM_CLMM: Pubkey = pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 const RAYDIUM_LAUNCHLAB: Pubkey = pubkey!("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj");
-const METEORA_DBC: Pubkey = pubkey!("dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN");
+const METEORA_DBC: Pubkey = dbc::DBC_PROGRAM;
 const METEORA_DAMM_V2: Pubkey = pubkey!("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
 const METEORA_DLMM: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const ORCA_WHIRLPOOL: Pubkey = pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
@@ -79,6 +80,12 @@ pub enum Template {
         coin: AmmCoin,
         base_reserve: u64,
         quote_reserve: u128,
+        fee_bps: u64,
+    },
+    /// Meteora DBC: raw spot price (quote units per base unit) after the observed swap.
+    Dbc {
+        coin: DbcCoin,
+        price_raw: f64,
         fee_bps: u64,
     },
     /// No direct builder: route through an aggregator.
@@ -353,6 +360,64 @@ pub fn balance_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     }]
 }
 
+/// Meteora DBC swap instructions in the tx: (payer, coin, event).
+fn dbc_swaps(tx: &ChainTx) -> Vec<(Pubkey, DbcCoin, Option<dbc::SwapEvt>)> {
+    let events: Vec<dbc::SwapEvt> = tx
+        .all_ixs()
+        .filter(|ix| ix.program == dbc::DBC_PROGRAM && ix.data.starts_with(&EVENT_IX_TAG))
+        .filter_map(|ix| dbc::decode_event_ix(&ix.data))
+        .collect();
+    tx.all_ixs()
+        .filter(|ix| ix.program == dbc::DBC_PROGRAM)
+        .filter_map(|ix| {
+            let coin = DbcCoin::from_swap_ix(&ix.accounts, &ix.data)?;
+            let payer = DbcCoin::payer_of(&ix.accounts)?;
+            let ev = events.iter().find(|e| e.pool == coin.pool).cloned();
+            Some((payer, coin, ev))
+        })
+        .collect()
+}
+
+/// Upgrade balance-delta swaps that went through Meteora DBC with an exact
+/// price and an execution template.
+fn enrich_dbc(tx: &ChainTx, swaps: &mut [DetectedSwap]) {
+    let d = dbc_swaps(tx);
+    if d.is_empty() {
+        return;
+    }
+    for s in swaps
+        .iter_mut()
+        .filter(|s| matches!(s.template, Template::Generic))
+    {
+        let Some((_, coin, ev)) = d
+            .iter()
+            .find(|(payer, c, _)| *payer == s.wallet && c.base_mint == s.mint)
+        else {
+            continue;
+        };
+        if coin.quote_mint != WSOL_MINT {
+            continue;
+        }
+        s.venue = Venue::MeteoraDbc;
+        let (price_raw, fee_bps) = match ev {
+            Some(e) => {
+                s.price_sol = dbc::price_sol(e.next_sqrt_price, s.token_decimals);
+                s.pool_sol = e.quote_reserve;
+                (
+                    dbc::price_raw_from_sqrt(e.next_sqrt_price),
+                    e.fee_bps_estimate(),
+                )
+            }
+            None => (s.price_sol * 1e9 / 10f64.powi(s.token_decimals as i32), 200),
+        };
+        s.template = Template::Dbc {
+            coin: coin.clone(),
+            price_raw,
+            fee_bps,
+        };
+    }
+}
+
 /// Swaps executed by `wallet` in this transaction.
 pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     if tx.failed {
@@ -373,6 +438,7 @@ pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     );
     if out.is_empty() && tx.has_meta {
         out = balance_swaps(tx, wallet);
+        enrich_dbc(tx, &mut out);
     }
     out
 }
@@ -394,6 +460,7 @@ pub fn all_swaps(tx: &ChainTx) -> Vec<DetectedSwap> {
         for s in tx.signers().to_vec() {
             out.extend(balance_swaps(tx, &s));
         }
+        enrich_dbc(tx, &mut out);
     }
     out
 }

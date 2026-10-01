@@ -111,6 +111,9 @@ fn check_ix_against_idl(
     for (i, a) in accs.iter().enumerate() {
         let n = a["name"].as_str().unwrap();
         let meta = &ix.accounts[i];
+        if a["optional"].as_bool() == Some(true) && meta.pubkey == *program {
+            continue; // Anchor: absent optional account is passed as the program id
+        }
         assert_eq!(
             meta.is_writable,
             a["writable"].as_bool().unwrap_or(false),
@@ -623,4 +626,139 @@ fn quote_math_is_consistent() {
     assert!(out > 9_700_000_000 && out < 9_900_000_000, "{out}");
     let q = pump_amm::sell_quote_for_base(1_000_000_000_000, 100_000_000_000, out, 125);
     assert!(q < 1_000_000_000 && q > 950_000_000, "{q}");
+}
+
+// ---------------------------------------------------------------- Meteora DBC
+
+#[test]
+fn meteora_dbc_matches_sdk_idl() {
+    use chain::meteora_dbc::{self as dbc, DbcCoin};
+    let d = idl("meteora_dbc.json");
+    assert_eq!(d["address"], dbc::DBC_PROGRAM.to_string());
+    for n in ["swap", "swap2"] {
+        assert_eq!(
+            dbc::ix_disc(n).to_vec(),
+            disc_of(find(&d["instructions"], n)),
+            "dbc ix {n}"
+        );
+    }
+    for n in ["EvtSwap", "EvtSwap2"] {
+        assert_eq!(
+            dbc::event_disc(n).to_vec(),
+            disc_of(find(&d["events"], n)),
+            "dbc event {n}"
+        );
+    }
+    let user = Pubkey::new_unique();
+    for needs_sysvar in [false, true] {
+        let coin = DbcCoin {
+            pool: Pubkey::new_unique(),
+            config: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: WSOL_MINT,
+            base_vault: Pubkey::new_unique(),
+            quote_vault: Pubkey::new_unique(),
+            base_token_program: TOKEN_2022_PROGRAM,
+            quote_token_program: TOKEN_PROGRAM,
+            needs_ix_sysvar: needs_sysvar,
+        };
+        let buys = dbc::buy_instructions(&coin, &user, 1_000_000_000, 5);
+        let swap = buys
+            .iter()
+            .find(|i| i.program_id == dbc::DBC_PROGRAM)
+            .unwrap();
+        check_ix_against_idl(swap, &d, "swap", &dbc::DBC_PROGRAM, &HashMap::new());
+        assert_eq!(swap.accounts.len(), 15 + needs_sysvar as usize);
+        // buy: input = user's WSOL ATA, output = user's base ATA
+        assert_eq!(
+            swap.accounts[3].pubkey,
+            pda::ata(&user, &WSOL_MINT, &TOKEN_PROGRAM)
+        );
+        assert_eq!(
+            swap.accounts[4].pubkey,
+            pda::ata(&user, &coin.base_mint, &TOKEN_2022_PROGRAM)
+        );
+        assert_eq!(&swap.data[8..16], &1_000_000_000u64.to_le_bytes());
+        assert_eq!(
+            swap.accounts[13].pubkey,
+            Pubkey::find_program_address(&[b"__event_authority"], &dbc::DBC_PROGRAM).0
+        );
+        // ata(base), ata(wsol), transfer, sync, swap, close
+        assert_eq!(buys.len(), 6);
+        let rebuilt = DbcCoin::from_swap_ix(
+            &swap.accounts.iter().map(|m| m.pubkey).collect::<Vec<_>>(),
+            &swap.data,
+        )
+        .unwrap();
+        assert_eq!(rebuilt, coin, "template round trip");
+
+        let sells = dbc::sell_instructions(&coin, &user, 777, 1);
+        let swap = sells
+            .iter()
+            .find(|i| i.program_id == dbc::DBC_PROGRAM)
+            .unwrap();
+        check_ix_against_idl(swap, &d, "swap", &dbc::DBC_PROGRAM, &HashMap::new());
+        assert_eq!(
+            swap.accounts[3].pubkey,
+            pda::ata(&user, &coin.base_mint, &TOKEN_2022_PROGRAM)
+        );
+    }
+}
+
+#[test]
+fn meteora_dbc_events_decode_idl_encoded_bytes() {
+    use chain::meteora_dbc as dbc;
+    let d = idl("meteora_dbc.json");
+    for (name, v2) in [("EvtSwap", false), ("EvtSwap2", true)] {
+        for seed in 1..100u64 {
+            let (bytes, f) = Enc::encode_struct(&d["types"], name, seed * 6151);
+            let mut data = EVENT_IX_TAG.to_vec();
+            data.extend(dbc::event_disc(name));
+            data.extend(&bytes);
+            let e = dbc::decode_event_ix(&data).expect("decode");
+            assert_eq!(e.pool, pk(&f["pool"]));
+            assert_eq!(e.config, pk(&f["config"]));
+            assert_eq!(e.is_buy, f["trade_direction"].as_u64().unwrap() == 1);
+            let r = &f["swap_result"];
+            assert_eq!(e.output_amount, r["output_amount"].as_u64().unwrap());
+            assert_eq!(
+                e.next_sqrt_price.to_string(),
+                r["next_sqrt_price"].as_str().unwrap()
+            );
+            let fees = r["trading_fee"].as_u64().unwrap()
+                + r["protocol_fee"].as_u64().unwrap()
+                + r["referral_fee"].as_u64().unwrap();
+            assert_eq!(e.total_fee, fees);
+            if v2 {
+                assert_eq!(
+                    e.input_amount,
+                    r["included_fee_input_amount"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    e.quote_reserve,
+                    Some(f["quote_reserve_amount"].as_u64().unwrap())
+                );
+                assert_eq!(
+                    e.migration_threshold,
+                    Some(f["migration_threshold"].as_u64().unwrap())
+                );
+            } else {
+                assert_eq!(e.input_amount, r["actual_input_amount"].as_u64().unwrap());
+            }
+        }
+    }
+}
+
+#[test]
+fn dbc_price_math() {
+    use chain::meteora_dbc as dbc;
+    // sqrt(P) in Q64.64 for P = 4e-5 lamports per raw token unit
+    let p: f64 = 4e-5;
+    let sqrt_q64 = (p.sqrt() * 18_446_744_073_709_551_616.0) as u128;
+    assert!((dbc::price_raw_from_sqrt(sqrt_q64) - p).abs() / p < 1e-9);
+    // 6-decimals token: 4e-5 lamports/unit = 40 lamports/token = 4e-8 SOL/token
+    assert!((dbc::price_sol(sqrt_q64, 6) - 4e-8).abs() < 1e-15);
+    let out = dbc::estimate_buy(p, 1_000_000_000, 100);
+    assert!((out as f64 - 0.99e9 / p).abs() / (out as f64) < 1e-9);
+    assert!(dbc::estimate_sell(p, out, 100) < 1_000_000_000);
 }
