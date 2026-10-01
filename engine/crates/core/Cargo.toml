@@ -1,0 +1,11 @@
+[package]
+name = "engine-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure, I/O-free domain logic shared by the live engine and the offline replay/backtest tools."
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true

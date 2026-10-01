@@ -1,0 +1,95 @@
+# Reference engine configuration.
+# Copy to config/engine.toml (git-ignored) and edit. This file is parsed by the
+# engine-core test suite, so keep it valid when changing the config structs.
+
+# shadow = decide + log only, paper = simulated fills, live = real transactions.
+# Start in shadow and promote only when the go-live gates in docs/07-roadmap.md pass.
+mode = "shadow"
+
+# Exit policy used when a leader has no override.
+default_exit = "ladder_trail"
+# Evaluated counterfactually on every position and logged, never traded.
+# This is how challengers accumulate evidence before promotion.
+shadow_exits = ["mirror_leader", "fast_scalp", "moonbag"]
+
+[sizing]
+copy_pct = 0.10            # copy 10% of the leader's SOL size
+min_buy_sol = 0.05         # below this, fees + tips eat the edge
+max_buy_sol = 1.0
+max_pool_impact_pct = 0.01 # never be more than 1% of pool SOL reserves
+follow_adds = true         # copy the leader's follow-up buys
+max_adds = 2
+
+[filters]
+min_leader_buy_sol = 0.5   # ignore dust / test buys
+max_leader_buy_sol = 200.0
+venues = []                # empty = all decoded venues
+min_pool_sol = 15.0
+max_token_age_secs = 604800
+max_detection_slot_lag = 2 # we are >2 slots behind → skip
+max_price_drift_pct = 0.20 # price already +20% over leader fill → skip
+
+[risk]
+max_position_sol = 2.0
+max_total_exposure_sol = 6.0
+max_open_positions = 8
+min_sol_reserve = 0.15
+daily_loss_limit_sol = 2.0
+max_buy_slippage_bps = 1500
+max_sell_slippage_bps = 3000
+
+# ---------------------------------------------------------------- exit policies
+
+[exits.ladder_trail]
+stop_loss_pct = 0.35
+take_profit = [
+  { at_multiple = 1.8, sell_fraction = 0.40 },
+  { at_multiple = 3.5, sell_fraction = 0.30 },
+]
+trailing = { activate_at_multiple = 1.4, drawdown_pct = 0.30 }
+max_hold_secs = 14400
+stale_secs = 1800
+on_leader_sell = { action = "tighten", drawdown_pct = 0.12 }
+exit_on_dev_sell = true
+liquidity_drop_pct = 0.40
+
+# Baseline: behave like a classic copy bot. Every other policy is judged against it.
+[exits.mirror_leader]
+stop_loss_pct = 0.50
+on_leader_sell = { action = "mirror" }
+
+[exits.fast_scalp]
+stop_loss_pct = 0.20
+take_profit = [{ at_multiple = 1.35, sell_fraction = 1.0 }]
+max_hold_secs = 600
+on_leader_sell = { action = "sell_all" }
+exit_on_dev_sell = true
+
+[exits.moonbag]
+stop_loss_pct = 0.45
+take_profit = [
+  { at_multiple = 2.0, sell_fraction = 0.50 },
+  { at_multiple = 5.0, sell_fraction = 0.25 },
+]
+trailing = { activate_at_multiple = 5.0, drawdown_pct = 0.45 }
+on_leader_sell = { action = "ignore" }
+liquidity_drop_pct = 0.50
+
+# ---------------------------------------------------------------- leaders
+# Only add wallets that pass the selection gates in docs/04-wallet-selection.md.
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_1"
+label = "swing-1"
+copy_pct = 0.15
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_2"
+label = "migration-hunter"
+exit = "fast_scalp"
+max_buy_sol = 0.5
+
+[[leaders]]
+address = "REPLACE_WITH_LEADER_WALLET_3"
+label = "probation"
+enabled = false
