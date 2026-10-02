@@ -43,6 +43,7 @@ flowchart LR
   - a shred feed for the earliest view of leader transactions;
   - two Geyser gRPC providers for confirmed data with logs and balances;
   - an RPC websocket as last resort.
+- **Free feed (proof of concept).** With no paid plan, `chain::wsfeed` uses the standard RPC WebSocket: `logsSubscribe` per leader, `getTransaction`, then a read of the coin's pool accounts so the engine decides on the current price; a poller prices open positions with one batched `getMultipleAccounts`. It produces the same `ChainTx` and `StateUpdate` events as the gRPC feed, so everything downstream is identical. It is 1-3 s slower, which makes it a conservative estimate of what the fast feed earns.
 - **Dedupe by signature.** The first arrival wins. Record `source` and `observed_at` on every event so per-feed latency is always measurable (`copy_signals.detect_latency_ms`).
 - **Subscription scope:**
   - **Leaders:** transactions that mention any active, probation or candidate leader address. This is the copy signal.

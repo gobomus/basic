@@ -112,8 +112,10 @@ control_socket = "data/copybot.sock" # copybot ctl status | positions | stop ...
 [infra.ws]                           # the free feed
 # url_env = "WS_URL"                 # default: RPC_URL with https -> wss
 commitment = "confirmed"             # earliest point a transaction can be fetched
-poll_ms = 1200                       # price check of open positions
+poll_ms = 1200                       # price check of open positions (use 3000 on a metered free key)
 idle_poll_ms = 10000                 # closed positions still tracked for exit scoring
+fetch_rps = 4                        # RPC calls/s for leader transactions; 8 is fine on a free keyed RPC
+max_leader_swaps_per_min = 20        # a wallet swapping more often than this is a bot: its excess is ignored
 
 [infra.paper]
 latency_ms = 1200                    # detection -> our transaction landing. Honest default for the free feed.

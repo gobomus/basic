@@ -9,6 +9,22 @@ An honest status of every feature category those platforms offer, as of this com
 - 📦 raw data is recorded; the analytics on top are not built yet
 - ⬜ not built
 
+## Free proof-of-concept path (no paid plan)
+| Feature | Status | Where |
+|---|---|---|
+| Follow leaders over the standard RPC WebSocket (`logsSubscribe`) | 🟢 | `chain::wsfeed`; works on the public RPC, 8/8 subscriptions accepted, leader swaps decoded live |
+| Decide on the **current** pool price (pool accounts read before each leader buy is handed to the engine) | 🟢 | `wsfeed::fetch_and_emit`, `chain::state` |
+| Price open positions (Pump curve + PumpSwap) from accounts, one batched `getMultipleAccounts` per tick; migration detected | 🟢 | `wsfeed::poll_loop`; account-derived price equals event-derived price on live coins |
+| Paper fills that land after a delay at the then-current pool, with the on-chain slippage check | 🟢 | `[infra.paper] latency_ms`, `engine::on_paper_buy / on_paper_sell` |
+| `copybot report`: PnL after costs, by leader, by exit policy, alternative exits, bootstrap CI, go / no-go checklist | 🟢 | `report.rs` |
+| Run with nothing installed | 🟢 | `.github/workflows/paper-run.yml` (Actions tab → Run workflow) |
+| Free leader vetting from chain history | 🟢 | `copybot leader-report` (works on the public RPC) |
+| Other venues (DBC, LaunchLab, Raydium, Meteora, Orca) priced on the free feed | ⬜ | need the paid feed; the free config restricts to Pump curve + PumpSwap |
+| Missed-trade backfill after a WebSocket drop | ⬜ | drops are counted in the report |
+| Dev-sell exit on the free feed | 🟢 | the creator of every held coin is added to the followed wallets while we hold it (`engine::push_filters`); tested with a simulated dev dump |
+
+Known limits of the free feed: it sees a leader trade about 1-3 s after it lands (one confirmation plus two RPC round trips), so the free result is a **conservative** estimate of what a fast feed would earn on the same leaders.
+
 ## Copy trading (GMGN, BasedBot, Axiom, Padre)
 | Feature | Status | Where |
 |---|---|---|

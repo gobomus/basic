@@ -25,8 +25,9 @@ pub fn median(xs: &[f64]) -> Option<f64> {
 
 /// Gross profit / gross loss. `None` when there are no losses.
 pub fn profit_factor(pnls: &[f64]) -> Option<f64> {
-    let gains: f64 = pnls.iter().filter(|x| **x > 0.0).sum();
-    let losses: f64 = -pnls.iter().filter(|x| **x < 0.0).sum::<f64>();
+    // fold from +0.0: `Iterator::sum` of nothing is -0.0, which would print as "-0.00"
+    let gains: f64 = pnls.iter().filter(|x| **x > 0.0).fold(0.0, |a, b| a + b);
+    let losses: f64 = pnls.iter().filter(|x| **x < 0.0).fold(0.0, |a, b| a - b);
     if losses <= 0.0 {
         None
     } else {
@@ -46,5 +47,7 @@ mod tests {
         assert_eq!(mean(&[1.0, 3.0]), Some(2.0));
         assert_eq!(profit_factor(&[2.0, -1.0, 1.0]), Some(3.0));
         assert_eq!(profit_factor(&[1.0]), None);
+        let all_losers = profit_factor(&[-1.0, -2.0]).unwrap();
+        assert!(all_losers == 0.0 && all_losers.is_sign_positive());
     }
 }

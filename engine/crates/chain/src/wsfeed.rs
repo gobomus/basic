@@ -48,6 +48,15 @@ pub struct WsConfig {
     /// Poll interval when only closed positions are still being tracked for scoring.
     #[serde(default = "d_idle")]
     pub idle_poll_ms: u64,
+    /// RPC calls per second the feed may spend fetching leader transactions
+    /// (and the pool reads before each leader buy). Keeps free tiers (public
+    /// endpoint, Helius free = 10/s) from rate-limiting the engine.
+    #[serde(default = "d_rps")]
+    pub fetch_rps: f64,
+    /// A leader producing more swap transactions per minute than this is
+    /// almost certainly a bot; the excess is ignored so it cannot starve the others.
+    #[serde(default = "d_leader_cap")]
+    pub max_leader_swaps_per_min: u32,
 }
 
 fn d_commitment() -> String {
@@ -59,6 +68,12 @@ fn d_poll() -> u64 {
 fn d_idle() -> u64 {
     10_000
 }
+fn d_rps() -> f64 {
+    4.0 // what the public Solana endpoint tolerates per method
+}
+fn d_leader_cap() -> u32 {
+    30
+}
 
 impl Default for WsConfig {
     fn default() -> Self {
@@ -67,6 +82,8 @@ impl Default for WsConfig {
             commitment: d_commitment(),
             poll_ms: d_poll(),
             idle_poll_ms: d_idle(),
+            fetch_rps: d_rps(),
+            max_leader_swaps_per_min: d_leader_cap(),
         }
     }
 }
@@ -100,6 +117,7 @@ pub enum WsMsg {
     },
     Slot(u64),
     Logs {
+        sub: u64,
         slot: u64,
         signature: String,
         failed: bool,
@@ -122,6 +140,7 @@ pub fn parse_msg(text: &str) -> WsMsg {
         return match m {
             "slotNotification" => r["slot"].as_u64().map(WsMsg::Slot).unwrap_or(WsMsg::Other),
             "logsNotification" => WsMsg::Logs {
+                sub: v["params"]["subscription"].as_u64().unwrap_or(0),
                 slot: r["context"]["slot"].as_u64().unwrap_or(0),
                 signature: r["value"]["signature"]
                     .as_str()
@@ -156,6 +175,88 @@ fn invokes_swap_program(logs: &Value) -> bool {
                 .is_some_and(|(id, rest)| rest.starts_with("invoke") && ids.iter().any(|x| x == id))
         })
     })
+}
+
+/// Token bucket shared by every feed RPC call.
+struct Limiter {
+    rps: f64,
+    state: tokio::sync::Mutex<(f64, Instant)>,
+}
+
+impl Limiter {
+    fn new(rps: f64) -> Self {
+        let rps = rps.max(0.5);
+        Self {
+            rps,
+            state: tokio::sync::Mutex::new((rps.min(4.0), Instant::now())),
+        }
+    }
+
+    /// Wait for a token; false if none became available within `max_wait`.
+    async fn acquire(&self, max_wait: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            let need = {
+                let mut g = self.state.lock().await;
+                let now = Instant::now();
+                g.0 =
+                    (g.0 + now.duration_since(g.1).as_secs_f64() * self.rps).min(self.rps.max(4.0));
+                g.1 = now;
+                if g.0 >= 1.0 {
+                    g.0 -= 1.0;
+                    return true;
+                }
+                Duration::from_secs_f64((1.0 - g.0) / self.rps)
+            };
+            if start.elapsed() + need > max_wait {
+                return false;
+            }
+            tokio::time::sleep(need).await;
+        }
+    }
+}
+
+/// Sliding one-minute window of notification times, per leader.
+struct LeaderRate {
+    cap: usize,
+    seen: HashMap<u64, VecDeque<Instant>>,
+    warned: HashMap<u64, Instant>,
+}
+
+impl LeaderRate {
+    fn new(cap: u32) -> Self {
+        Self {
+            cap: cap as usize,
+            seen: HashMap::new(),
+            warned: HashMap::new(),
+        }
+    }
+
+    /// True if this leader's notification may be processed. `Err(n)` when over
+    /// the cap (n = swaps in the last minute) and a warning is due.
+    fn allow(&mut self, sub: u64) -> Result<bool, usize> {
+        let now = Instant::now();
+        let q = self.seen.entry(sub).or_default();
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
+        {
+            q.pop_front();
+        }
+        if q.len() >= self.cap {
+            let due = self
+                .warned
+                .get(&sub)
+                .is_none_or(|t| now.duration_since(*t) > Duration::from_secs(60));
+            if due {
+                self.warned.insert(sub, now);
+                return Err(q.len());
+            }
+            return Ok(false);
+        }
+        q.push_back(now);
+        Ok(true)
+    }
 }
 
 /// Bounded set of recently seen signatures.
@@ -345,6 +446,8 @@ async fn session(
     reconcile(&mut ws, cfg, &mut subs, &want).await?;
 
     let gate = Arc::new(tokio::sync::Semaphore::new(MAX_FETCHES));
+    let limiter = Arc::new(Limiter::new(cfg.fetch_rps));
+    let mut rate = LeaderRate::new(cfg.max_leader_swaps_per_min);
     let mut ping = tokio::time::interval(Duration::from_secs(10));
     let mut last_rx = Instant::now();
     loop {
@@ -378,12 +481,27 @@ async fn session(
                     WsMsg::Slot(slot) => {
                         let _ = out.send(FeedEvent::Slot { slot, status: 0 }).await;
                     }
-                    WsMsg::Logs { slot, signature, failed, swap } => {
+                    WsMsg::Logs { sub, slot, signature, failed, swap } => {
                         if !failed && swap && !signature.is_empty() && seen.insert(&signature) {
-                            tokio::spawn(fetch_and_emit(
-                                rpc.clone(), signature, slot, ChainTx::now_ns(),
-                                leaders.clone(), out.clone(), gate.clone(),
-                            ));
+                            match rate.allow(sub) {
+                                Ok(true) => {
+                                    tokio::spawn(fetch_and_emit(
+                                        rpc.clone(), signature, slot, ChainTx::now_ns(),
+                                        leaders.clone(), out.clone(), gate.clone(), limiter.clone(),
+                                    ));
+                                }
+                                Ok(false) => {}
+                                Err(n) => {
+                                    let who = match subs.active.get(&sub) {
+                                        Some(Sub::Leader(l)) => l.clone(),
+                                        _ => format!("subscription {sub}"),
+                                    };
+                                    tracing::warn!(
+                                        "{who} made {n} swaps in a minute: that is a bot, not a copyable trader. Ignoring its excess (cap {}/min)",
+                                        cfg.max_leader_swaps_per_min
+                                    );
+                                }
+                            }
                         }
                     }
                     WsMsg::Failed { id, message } => {
@@ -418,14 +536,15 @@ fn parse_leaders(v: &[String]) -> HashSet<Pubkey> {
 
 // ------------------------------------------------------------------ fetching
 
-/// Waits between `getTransaction` attempts: a confirmed notification can
-/// arrive slightly before the node can serve the transaction.
-const FETCH_STEPS_MS: [u64; 9] = [0, 100, 100, 150, 150, 300, 400, 800, 1000];
+/// A confirmed notification can arrive slightly before the node can serve the
+/// transaction; retry briefly, within the rate budget, then give up (a copy
+/// this late is not worth making anyway).
+const FETCH_DEADLINE: Duration = Duration::from_secs(4);
 
-/// Transactions fetched concurrently. A leader that fires many swaps per
-/// second (a bot) cannot flood a free RPC: excess notifications are dropped.
-const MAX_FETCHES: usize = 6;
+/// Transactions fetched concurrently.
+const MAX_FETCHES: usize = 8;
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_emit(
     rpc: Rpc,
     sig: String,
@@ -434,32 +553,41 @@ async fn fetch_and_emit(
     leaders: Arc<HashSet<Pubkey>>,
     out: mpsc::Sender<FeedEvent>,
     gate: Arc<tokio::sync::Semaphore>,
+    limiter: Arc<Limiter>,
 ) {
-    let _permit = match tokio::time::timeout(Duration::from_secs(2), gate.acquire_owned()).await {
+    let deadline = Instant::now() + FETCH_DEADLINE;
+    let _permit = match tokio::time::timeout(FETCH_DEADLINE, gate.acquire_owned()).await {
         Ok(Ok(p)) => p,
-        _ => {
-            tracing::warn!(
-                "fetch queue full: dropping {sig} (leader trading too fast for this RPC)"
-            );
-            return;
-        }
+        _ => return,
     };
     let mut found = None;
-    for step in FETCH_STEPS_MS {
-        if step > 0 {
-            tokio::time::sleep(Duration::from_millis(step)).await;
+    let mut attempt = 0u32;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if !limiter.acquire(left).await {
+            tracing::debug!("{sig}: out of RPC budget, dropped");
+            return;
         }
-        match rpc.transaction_json_once(&sig).await {
+        attempt += 1;
+        let wait_ms = match rpc.transaction_json_once(&sig).await {
             Ok(v) if !v.is_null() => {
                 found = Some(v);
                 break;
             }
-            Ok(_) => {}
-            Err(e) => tracing::debug!("getTransaction {sig}: {e}"),
+            Ok(_) => 150, // not served yet
+            Err(e) => {
+                tracing::debug!("getTransaction {sig}: {e}");
+                // rate limited: back off harder
+                (300 * u64::from(attempt)).min(1200)
+            }
+        };
+        if Instant::now() + Duration::from_millis(wait_ms) >= deadline {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
     }
     let Some(v) = found else {
-        tracing::warn!("transaction {sig} (slot {slot_hint}) never became available");
+        tracing::debug!("transaction {sig} (slot {slot_hint}) not available in time");
         return;
     };
     let mut tx = match ChainTx::from_rpc_json(&v) {
@@ -482,7 +610,7 @@ async fn fetch_and_emit(
             want.push((s.mint, s.template, s.token_decimals, s.token_program));
         }
     }
-    if !want.is_empty() {
+    if !want.is_empty() && limiter.acquire(Duration::from_secs(1)).await {
         let items: Vec<_> = want.iter().map(|w| (w.1.clone(), w.2)).collect();
         match state::read(&rpc, &items).await {
             Ok((slot, refreshed)) => {
@@ -617,6 +745,7 @@ mod tests {
         assert_eq!(
             parse_msg(ok),
             WsMsg::Logs {
+                sub: 24040,
                 slot: 5_208_469,
                 signature: "5h6x".into(),
                 failed: false,
@@ -675,6 +804,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(ws_url(&c, "https://x"), "wss://example.org/ws");
+    }
+
+    #[tokio::test]
+    async fn limiter_spaces_calls_and_gives_up_when_the_wait_is_too_long() {
+        let l = Limiter::new(10.0); // burst of 4, then one token per 100 ms
+        let t = Instant::now();
+        for _ in 0..4 {
+            assert!(l.acquire(Duration::from_millis(1)).await);
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(50),
+            "burst is immediate"
+        );
+        assert!(l.acquire(Duration::from_secs(1)).await);
+        assert!(
+            t.elapsed() >= Duration::from_millis(80),
+            "then spaced at the configured rate"
+        );
+        // nothing left and the caller will not wait: refused
+        assert!(!l.acquire(Duration::from_millis(5)).await);
+    }
+
+    #[test]
+    fn a_bot_leader_is_capped_without_affecting_others() {
+        let mut r = LeaderRate::new(3);
+        for _ in 0..3 {
+            assert_eq!(r.allow(1), Ok(true));
+        }
+        assert_eq!(r.allow(1), Err(3), "first excess triggers one warning");
+        assert_eq!(r.allow(1), Ok(false), "later excess is dropped quietly");
+        assert_eq!(r.allow(2), Ok(true), "another leader is unaffected");
     }
 
     #[test]

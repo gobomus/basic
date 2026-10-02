@@ -166,6 +166,8 @@ struct Position {
     max_mult: f64,
     leader_exit_mult: Option<f64>,
     exited_ms: Option<i64>,
+    /// Why the most recent sell was issued (stop loss, trailing, leader sell, ...).
+    last_exit_reason: Option<String>,
 }
 
 impl Position {
@@ -452,13 +454,27 @@ impl Engine {
         if self.mode == RunMode::Live {
             leaders.push(self.me.to_string()); // our own fills
         }
+        // Creators of coins we hold: their sells are the dev-dump exit signal.
+        for m in self.positions.keys() {
+            let creator = self
+                .tokens
+                .get(m)
+                .and_then(|t| t.creator)
+                .filter(|c| *c != Pubkey::default());
+            if let Some(c) = creator {
+                let c = c.to_string();
+                if !leaders.contains(&c) {
+                    leaders.push(c);
+                }
+            }
+        }
         let mints = self
             .positions
             .keys()
             .chain(self.afterlife.keys())
             .map(|k| k.to_string())
             .collect();
-        let _ = self.filters.send(Filters { leaders, mints });
+        self.filters.send_replace(Filters { leaders, mints });
     }
 
     fn label(&self, l: &Pubkey) -> String {
@@ -500,7 +516,7 @@ impl Engine {
                     }
                     Some(FeedEvent::Status { source, connected, detail }) => {
                         self.journal.record("feed", json!({"source": source, "connected": connected, "detail": detail}));
-                        if !connected { tracing::warn!("{source} disconnected: {detail}"); } else { tracing::info!("{source} connected"); }
+                        if !connected { tracing::warn!("{source} disconnected: {detail}"); } else { tracing::info!("{source} connected {detail}"); }
                     }
                     None => { self.alert("feed closed — engine stopping"); return; }
                 },
@@ -1169,6 +1185,7 @@ impl Engine {
             max_mult: 1.0,
             leader_exit_mult: None,
             exited_ms: None,
+            last_exit_reason: None,
         };
         self.journal.record(
             "position_adopt",
@@ -1239,6 +1256,7 @@ impl Engine {
             max_mult: 1.0,
             leader_exit_mult: None,
             exited_ms: None,
+            last_exit_reason: None,
         };
         self.journal.record("position_open", json!({"mint": s.mint.to_string(), "leader": s.wallet.to_string(), "mode": self.mode, "cost_lamports": cost, "tokens": tokens, "entry_price": price, "exit_policy": p.policy_name}));
         self.positions.insert(s.mint, p);
@@ -1409,6 +1427,7 @@ impl Engine {
         if tokens == 0 {
             return;
         }
+        p.last_exit_reason = Some(reason.trim_end_matches("+retry").to_string());
         if mode != RunMode::Live {
             if let (Some(delay), Some(rpc)) = (paper_delay, rpc) {
                 // paper: lands `latency_ms` from now at the pool as it is then
@@ -1837,7 +1856,7 @@ impl Engine {
         };
         self.journal.record(
             "position_exit",
-            json!({"mint": mint.to_string(), "leader": p.leader.to_string(), "pnl_sol": pnl, "ret": ret, "held_ms": now_ms() - p.opened_ms, "max_mult": p.max_mult, "min_mult": p.min_mult, "leader_exit_mult": p.leader_exit_mult}),
+            json!({"mint": mint.to_string(), "leader": p.leader.to_string(), "pnl_sol": pnl, "ret": ret, "held_ms": now_ms() - p.opened_ms, "max_mult": p.max_mult, "min_mult": p.min_mult, "leader_exit_mult": p.leader_exit_mult, "exit_reason": p.last_exit_reason}),
         );
         self.alert(format!(
             "{} EXIT {} · {:+.4} SOL ({:+.1}%) · peak {:.2}x · leader {}",
@@ -2743,6 +2762,45 @@ mod tests {
             .collect();
         assert_eq!(exits.len(), 1);
         assert!(exits[0]["pnl_sol"].as_f64().unwrap() < 0.0);
+    }
+
+    #[tokio::test]
+    async fn the_creator_of_a_held_coin_is_followed_for_dev_sells() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, _rx) = engine(d, leader, "ladder_trail");
+        assert!(!e.filters.borrow().leaders.contains(&creator.to_string()));
+        e.on_tx(&leader_buy(700, mint, leader, creator));
+        assert!(e.positions.contains_key(&mint));
+        assert!(
+            e.filters.borrow().leaders.contains(&creator.to_string()),
+            "feed must watch the dev while we hold the coin"
+        );
+        // the dev dumps: exit_on_dev_sell (ladder_trail) fires
+        let dev_sell = trade_tx(
+            701,
+            Ev {
+                mint,
+                user: creator,
+                creator,
+                is_buy: false,
+                sol: 2_000_000_000,
+                tokens: 1,
+                vsol: 28_000_000_000,
+                vtok: VTOK,
+                real_sol: 28_000_000_000,
+            },
+            1_000_000_000_000,
+        );
+        e.on_tx(&dev_sell);
+        assert!(e.positions.is_empty(), "dev sell closed the position");
+        // once flat the dev is no longer followed
+        assert!(!e.filters.borrow().leaders.contains(&creator.to_string()));
     }
 
     #[tokio::test]

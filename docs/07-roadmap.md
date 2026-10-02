@@ -59,6 +59,8 @@ Fixed cost per transaction (tip + priority fee) is assumed at ~0.001 SOL; the He
 - Shadow exits active. Feature service writing snapshots at decision points.
 - Kill-switch plumbing tested via `copybot ctl`.
 
+`copybot report` prints this gate as a checklist, computed from the journal (paper runs on the free feed count: a slower feed makes the result conservative).
+
 **Gate 1:**
 - At least 300 shadow signals.
 - Simulated copier return after costs (using the measured detection latency and an assumed +1 slot to land) is positive, with a bootstrap CI above 0, on the leader set as a whole.

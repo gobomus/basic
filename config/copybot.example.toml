@@ -114,6 +114,12 @@ feed_stale_secs = 5
 nonce_accounts = []                  # `copybot wallet nonce-create --count 4` prints these
 control_socket = "data/copybot.sock"   # `copybot ctl status | pause | flatten ...`
 
+# No paid gRPC yet? Delete [infra.geyser] and add [infra.ws] instead: the free
+# WebSocket feed (see config/poc.example.toml). Paid gRPC is faster; free is enough to prove an edge.
+[infra.paper]                        # shadow / paper modes only: simulated execution
+latency_ms = 1000                    # fills are priced from the pool this long after detection (0 = instant, optimistic)
+afterlife_secs = 7200                # keep scoring alternative exits on closed positions this long
+
 [infra.geyser]                       # any Yellowstone-gRPC endpoint (Triton, LaserStream, Shyft, ...)
 endpoint = "https://YOUR-GRPC-ENDPOINT:443"
 x_token_env = "GEYSER_X_TOKEN"

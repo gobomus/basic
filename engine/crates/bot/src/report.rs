@@ -12,11 +12,18 @@ use serde_json::Value;
 
 /// Fewer closed trades than this prove nothing either way.
 const MIN_TRADES: usize = 30;
+/// Go / no-go gate (docs/07-roadmap.md, Gate 1) before risking money.
+const GATE_SIGNALS: usize = 300;
+const GATE_TRADES: usize = 100;
+const GATE_LEADERS: usize = 3;
+/// A leader counts as individually positive only with at least this many trades.
+const GATE_LEADER_TRADES: usize = 5;
 
 #[derive(Default)]
 struct Trade {
     leader: String,
     policy: String,
+    reason: String,
     pnl: f64,
     ret: f64,
     held_ms: i64,
@@ -69,6 +76,25 @@ fn read_journal(dir: &str, since_ms: Option<i64>) -> anyhow::Result<Vec<Value>> 
     Ok(out)
 }
 
+/// 95% bootstrap confidence interval of the mean (deterministic).
+fn bootstrap_ci(xs: &[f64]) -> Option<(f64, f64)> {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    if xs.len() < 2 {
+        return None;
+    }
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut means: Vec<f64> = (0..4000)
+        .map(|_| {
+            (0..xs.len())
+                .map(|_| xs[rng.gen_range(0..xs.len())])
+                .sum::<f64>()
+                / xs.len() as f64
+        })
+        .collect();
+    means.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    Some((means[100], means[3899]))
+}
+
 fn pct(x: f64) -> String {
     format!("{:+.1}%", x * 100.0)
 }
@@ -102,6 +128,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     let mut shadows: BTreeMap<String, Agg> = BTreeMap::new();
     let mut shadow_positions = 0usize;
     let mut live_policy_pnl: BTreeMap<String, Agg> = BTreeMap::new();
+    let mut feed_drops = 0usize;
     let (mut first, mut last) = (i64::MAX, 0i64);
     let mut modes: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -129,6 +156,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                     slot_lags.push(l);
                 }
             }
+            "feed" if r["connected"] == false => feed_drops += 1,
             "position_open" => {
                 if let (Some(m), Some(p)) = (r["mint"].as_str(), r["exit_policy"].as_str()) {
                     policy_of.insert(m.to_string(), p.to_string());
@@ -155,6 +183,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                 let t = Trade {
                     leader: r["leader"].as_str().unwrap_or_default().to_string(),
                     policy: policy_of.get(mint).cloned().unwrap_or_default(),
+                    reason: r["exit_reason"].as_str().unwrap_or("").to_string(),
                     pnl: r["pnl_sol"].as_f64().unwrap_or(0.0),
                     ret: r["ret"].as_f64().unwrap_or(0.0),
                     held_ms: r["held_ms"].as_i64().unwrap_or(0),
@@ -210,6 +239,12 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         let s: Vec<String> = v.iter().take(6).map(|(k, n)| format!("{k} {n}")).collect();
         writeln!(o, "  top skip reasons: {}", s.join(" · "))?;
     }
+    if feed_drops > 0 {
+        writeln!(
+            o,
+            "  data feed dropped {feed_drops} time(s): leader trades during those gaps were missed"
+        )?;
+    }
     if let Some(m) = median(&slot_lags) {
         writeln!(
             o,
@@ -253,6 +288,14 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
             pct(median(&rets).unwrap_or(0.0)),
             sol(total / trades.len() as f64)
         )?;
+        if let Some((lo, hi)) = bootstrap_ci(&rets) {
+            writeln!(
+                o,
+                "  mean return per trade, 95% confidence interval: {} to {}",
+                pct(lo),
+                pct(hi)
+            )?;
+        }
         writeln!(
             o,
             "  profit factor {} · avg hold {:.1} min · avg peak {:.2}x (what a perfect exit would have seen)",
@@ -292,6 +335,35 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                 o,
                 "  {:<22} {:>6} {:>5.0}% {:>12} {:>10}",
                 name,
+                a.n,
+                a.win_rate() * 100.0,
+                sol(a.pnl),
+                pct(mean(&a.rets).unwrap_or(0.0))
+            )?;
+        }
+    }
+
+    // ---- why positions closed
+    if trades.iter().any(|t| !t.reason.is_empty()) {
+        let mut by_reason: BTreeMap<&str, Agg> = BTreeMap::new();
+        for t in &trades {
+            by_reason
+                .entry(if t.reason.is_empty() {
+                    "(unknown)"
+                } else {
+                    &t.reason
+                })
+                .or_default()
+                .add(t.pnl, t.ret);
+        }
+        writeln!(o, "\nBY EXIT REASON (which rule closed the position)")?;
+        let mut rows: Vec<_> = by_reason.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1.n));
+        for (r, a) in rows {
+            writeln!(
+                o,
+                "  {:<14} trades {:>3} · win {:>3.0}% · PnL {} SOL · avg {}",
+                r,
                 a.n,
                 a.win_rate() * 100.0,
                 sol(a.pnl),
@@ -351,25 +423,70 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     }
 
     // ---- verdict
-    writeln!(o, "\nVERDICT")?;
+    writeln!(o, "\nGO / NO-GO CHECKLIST (before any real money)")?;
     let n = trades.len();
+    let ci = bootstrap_ci(&rets);
+    let mut by_leader_pnl: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
+    for t in &trades {
+        let e = by_leader_pnl.entry(t.leader.as_str()).or_default();
+        e.0 += 1;
+        e.1 += t.pnl;
+    }
+    let positive_leaders = by_leader_pnl
+        .values()
+        .filter(|(c, p)| *c >= GATE_LEADER_TRADES && *p > 0.0)
+        .count();
+    let mark = |ok: bool| if ok { "[x]" } else { "[ ]" };
+    writeln!(
+        o,
+        "  {} {GATE_SIGNALS}+ leader buys seen ({signals})",
+        mark(signals >= GATE_SIGNALS)
+    )?;
+    writeln!(
+        o,
+        "  {} {GATE_TRADES}+ closed trades ({n})",
+        mark(n >= GATE_TRADES)
+    )?;
+    writeln!(
+        o,
+        "  {} mean return per trade is positive with 95% confidence{}",
+        mark(ci.is_some_and(|(lo, _)| lo > 0.0)),
+        ci.map_or(String::new(), |(lo, hi)| format!(
+            " ({} to {})",
+            pct(lo),
+            pct(hi)
+        ))
+    )?;
+    writeln!(
+        o,
+        "  {} at least {GATE_LEADERS} leaders individually in profit with {GATE_LEADER_TRADES}+ trades ({positive_leaders})",
+        mark(positive_leaders >= GATE_LEADERS)
+    )?;
+
+    writeln!(o, "\nVERDICT")?;
     if n < MIN_TRADES {
         writeln!(
             o,
             "  Too early: {n} closed trades, need at least {MIN_TRADES} before any conclusion. Keep running."
         )?;
-    } else if total > 0.0 && profit_factor(&pnls).is_none_or(|p| p > 1.2) {
-        writeln!(
-            o,
-            "  Positive after costs over {n} trades ({} SOL). Check it is not one lucky trade: the BY LEADER table should show several leaders in profit.",
-            sol(total)
-        )?;
     } else {
-        writeln!(
-            o,
-            "  Not profitable after costs over {n} trades ({} SOL). Change leaders or exits (see the tables) before risking money.",
-            sol(total)
-        )?;
+        match ci {
+            Some((lo, _)) if lo > 0.0 => writeln!(
+                o,
+                "  Edge likely: the average trade is positive after costs, with statistical confidence ({} SOL over {n} trades). Tick the remaining boxes above before going live.",
+                sol(total)
+            )?,
+            Some((_, hi)) if hi < 0.0 => writeln!(
+                o,
+                "  Losing after costs over {n} trades ({} SOL). Change leaders or exits (see the tables) before risking money.",
+                sol(total)
+            )?,
+            _ => writeln!(
+                o,
+                "  Inconclusive over {n} trades ({} SOL): the results are still consistent with no edge. Keep running.",
+                sol(total)
+            )?,
+        }
     }
     Ok(o)
 }
@@ -393,7 +510,7 @@ mod tests {
             json!({"kind":"position_open","ts":1_200,"mint":"M1","mode":"paper","exit_policy":"fast_scalp"}),
             json!({"kind":"fill","ts":1_300,"side":"buy","simulated":true,"slippage_bps":120.0,"latency_ms":1000}),
             json!({"kind":"fill","ts":1_310,"side":"buy","simulated":true,"failed":"slippage"}),
-            json!({"kind":"position_exit","ts":2_000,"mint":"M1","leader":"LEADERaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pnl_sol":0.02,"ret":0.2,"held_ms":120000,"max_mult":1.5}),
+            json!({"kind":"position_exit","ts":2_000,"mint":"M1","leader":"LEADERaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pnl_sol":0.02,"ret":0.2,"held_ms":120000,"max_mult":1.5,"exit_reason":"TakeProfit"}),
             json!({"kind":"position_close","ts":3_000,"mint":"M1","cost_lamports":100_000_000u64,"shadows":[
                 {"policy":"fast_scalp","pnl_sol":0.02,"ret":0.2},{"policy":"moonbag","pnl_sol":-0.05,"ret":-0.5}]}),
         ];
@@ -408,7 +525,12 @@ mod tests {
         assert!(out.contains("trades 1 · win rate 100%"));
         assert!(out.contains("alpha"));
         assert!(out.contains("fast_scalp"));
+        assert!(
+            out.contains("BY EXIT REASON") && out.contains("TakeProfit"),
+            "{out}"
+        );
         assert!(out.contains("Too early: 1 closed trades"));
+        assert!(out.contains("[ ] 300+ leader buys seen (2)"));
         // the better alternative is listed first
         let alt = out.split("ALTERNATIVE EXITS").nth(1).unwrap();
         assert!(alt.find("fast_scalp").unwrap() < alt.find("moonbag").unwrap());
@@ -420,10 +542,30 @@ mod tests {
         }
         write(dir.path(), &recs);
         let out = run(dir.path().to_str().unwrap(), None).unwrap();
+        assert!(out.contains("Losing after costs over 40 trades"), "{out}");
         assert!(
-            out.contains("Not profitable after costs over 40 trades"),
+            out.contains("confidence interval: -10.0% to -10.0%"),
             "{out}"
         );
+
+        // 60 winners with some spread: edge likely, checklist ticks
+        recs.clear();
+        for i in 0..60 {
+            let r = 0.05 + (i % 5) as f64 * 0.01;
+            recs.push(json!({"kind":"position_exit","ts":10+i,"mint":format!("W{i}"),"leader":format!("LEAD{}", i % 4),"pnl_sol":r * 0.1,"ret":r,"held_ms":1000,"max_mult":1.2}));
+        }
+        write(dir.path(), &recs);
+        let out = run(dir.path().to_str().unwrap(), None).unwrap();
+        assert!(out.contains("Edge likely"), "{out}");
+        assert!(
+            out.contains("[x] mean return per trade is positive with 95% confidence"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[x] at least 3 leaders individually in profit"),
+            "{out}"
+        );
+        assert!(out.contains("[ ] 100+ closed trades (60)"), "{out}");
     }
 
     #[test]

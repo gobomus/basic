@@ -1,6 +1,83 @@
-# Runbook: getting copybot live, step by step
+# Runbook
 
-This is the order to follow. **Do not skip the shadow and simulation steps.** They are how we prove the bot works on the real chain before any money moves.
+Two paths. **Start with Path A: it is free and risks nothing.** Move to Path B only when Path A's report shows an edge.
+
+| | Path A: free proof of concept | Path B: live trading |
+|---|---|---|
+| Money | none (paper mode: simulated fills) | real SOL, small to start |
+| Data feed | standard RPC WebSocket (free) | paid Yellowstone gRPC (faster) |
+| Cost | $0 | gRPC plan + server + tips |
+| Speed | sees a leader trade ~1-3 s after it lands | sub-second |
+| Purpose | find out **whether copying these wallets makes money after costs** | execute it fast |
+
+---
+
+# Path A: free proof of concept
+
+Paper mode follows your chosen wallets on live Solana and simulates every copy **as it would really have landed**: priced from the pool 1.2 s after detection (configurable), with the same slippage limit a real transaction has, so late or run-away fills are missed or worse, exactly as on-chain. All fees are charged. Then `copybot report` tells you what it earned.
+
+## A1. Pick leader wallets
+Candidates: GMGN smart-money / KOL lists, Axiom, KOLscan (copy 3-10 addresses). Then vet each one on-chain, free:
+```bash
+copybot leader-report <WALLET>        # profit, win rate, hold time, bot check
+```
+Rules of thumb for the free feed:
+- **1 to 60 swaps per hour is ideal.** A wallet doing hundreds of swaps an hour is a bot: it cannot be copied (you would only be its exit liquidity) and it floods a free RPC.
+- Skip wallets that flip tokens within seconds (the report flags them).
+- Prefer wallets that trade Pump.fun / PumpSwap coins; those are the venues the free feed can price.
+
+## A2. Run it: three ways
+
+**Way 1: GitHub Actions (nothing to install).** In the repository on GitHub: **Actions → paper-run → Run workflow**, paste the wallet addresses, choose hours (max 5.5), Run. When it finishes, open the run: the **summary page shows the report** and the full journal is attached as a download. Repeat on different days; every run is independent. Free for public repositories; private ones use your monthly free minutes. Optional: add a repository secret `RPC_URL` with a free key (below), otherwise the public Solana endpoint is used.
+
+**Way 2: your own computer.** One-time install of Rust (<https://rustup.rs>), then:
+```bash
+git clone https://github.com/gobomus/basic.git && cd basic
+git checkout claude/solana-copy-trading-bot-xlkuzm
+cd engine && cargo build --release -p bot && cd ..
+cp config/poc.example.toml config/copybot.toml      # then put your wallets under [[leaders]]
+export RPC_URL=https://api.mainnet-beta.solana.com    # public and free; see "RPC options"
+./engine/target/release/copybot check                 # every line OK
+./engine/target/release/copybot run                   # leave it running; Ctrl-C stops it cleanly
+```
+Or generate the config from a list of wallets: `python3 scripts/make_poc_config.py config/copybot.toml "WALLET1, WALLET2"`.
+
+**Way 3: a free always-on server** (for multi-day runs), e.g. Oracle Cloud "Always Free" or any small VPS: same commands as Way 2, run under `tmux` or the systemd unit in `deploy/`.
+
+## A3. Watch it
+```bash
+copybot ctl status          # signals, copies, skips, open positions, simulated PnL
+copybot ctl positions       # what is open right now
+copybot report              # the proof: see below
+copybot ctl stop            # graceful: open paper positions are marked out, alternative exits scored
+```
+Everything is also written to `data/journal/*.jsonl` (one JSON per line).
+
+## A4. Read the report
+`copybot report` prints, after every modelled cost:
+- the **signal funnel**: what leaders did, what was copied, why trades were skipped, how many entries missed because the price ran past slippage;
+- **results**: trades, win rate, total PnL, expectancy per trade, profit factor;
+- **by leader**: who earns it and who loses it;
+- **alternative exits**: the same entries and price paths replayed under every exit policy, so one run compares exit styles;
+- a **verdict**. It refuses to conclude anything below 30 closed trades.
+
+**Go / no-go for Path B:** at least 100 closed trades over several days, positive PnL after costs, profit in more than one leader (not one lucky trade), and the winning exit policy identified. If it is negative: change leaders or exits and run again. That is what Path A is for.
+
+## RPC options (all free)
+| | Limits | Notes |
+|---|---|---|
+| Public `https://api.mainnet-beta.solana.com` | rate-limited per IP, no SLA | works with a handful of leaders; nothing to sign up for |
+| Helius free | 1M credits/month, 10 requests/s | set `poll_ms = 3000` in `[infra.ws]` to stay under the monthly budget |
+| Alchemy free | 30M compute units/month, 25 requests/s | |
+| dRPC free | large monthly quota, 100 requests/s | |
+
+Cost model of the feed: every leader swap costs about 2 calls; while positions are open, one batched call per `poll_ms` prices all of them. WebSocket traffic is not metered per call. The free feed prices **Pump.fun curve and PumpSwap** coins; other venues need the paid feed.
+
+---
+
+# Path B: live trading with paid infrastructure
+
+Do not start here. Everything below needs a Path A result that justifies it.
 
 ## What you need to buy or set up (one time)
 
