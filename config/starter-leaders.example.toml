@@ -1,0 +1,38 @@
+# Starter leader candidates, vetted on 2026-10-02 with `copybot leader-report`
+# (each wallet's last 300-360 on-chain transactions, read from PublicNode's free RPC).
+# Candidate pool: KOLscan's public daily leaderboard (survivorship-biased), screened for activity,
+# then vetted by the engine's own on-chain round-trip accounting.
+#
+# NOT a recommendation. This is a free screen of a short window; a wallet that was profitable
+# for a few days can stop. Paper mode (`copybot run`, then `copybot report`) is the real test:
+# it charges every fee and a realistic delay, and tells you what COPYING each wallet earns.
+#
+# Paste the blocks you want under [[leaders]] in your config (config/poc.example.toml).
+
+[[leaders]]
+address = "215nhcAHjQQGgwpQSJQ7zR26etbjjtVdW74NLzwEgQjP"
+label = "kol-215nh"      # 34 round trips, +182.6 SOL, win 62%, profit factor 4.5, median hold 86 min
+
+[[leaders]]
+address = "C4Svaa7djC8d3CVxaohrsedccaKqimNoJrWe9iNPdix5"
+label = "kol-C4Sva"      # 28 round trips, +44.4 SOL, win 57%, profit factor 4.6, median hold 4 min
+
+[[leaders]]
+address = "CCUcjek5p6DLoH2YNtjizxYhAnStXAQAGVxhp1cYJF7w"
+label = "kol-CCUcj"      # 44 round trips, +33.3 SOL, win 77%, profit factor 2.5, median hold 4 min
+
+[[leaders]]
+address = "9FNz4MjPUmnJqTf6yEDbL1D4SsHVh7uA8zRHhR5K138r"
+label = "kol-9FNz4"      # 44 round trips, +33.2 SOL, win 64%, profit factor 2.2, median hold 9 min
+
+[[leaders]]
+address = "CkPFGv2Wv1vwdWjtXioEgb8jhZQfs3eVZez3QCetu7xD"
+label = "kol-CkPFG"      # 37 round trips, +31.8 SOL, win 40%, profit factor 3.6, median hold 99 s
+
+[[leaders]]
+address = "4DdrfiDHpmx55i4SPssxVzS9ZaKLb8qr45NKY9Er9nNh"
+label = "kol-4Ddrf"      # 104 round trips, +21.8 SOL, win 60%, profit factor 3.7, median hold 58 s
+
+[[leaders]]
+address = "AEeJUPCiGR3yCoukTh1G58o4LYsUEyzrXtfmfMc2kJMX"
+label = "kol-AEeJU"      # 85 round trips, +3.8 SOL, win 25%, profit factor 1.7, median hold 36 min

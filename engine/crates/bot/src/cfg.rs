@@ -243,6 +243,30 @@ mod tests {
     }
 
     #[test]
+    fn starter_leaders_file_is_valid_toml_with_real_addresses() {
+        let s = include_str!("../../../../config/starter-leaders.example.toml");
+        let t: toml::Table = toml::from_str(s).expect("valid TOML");
+        let leaders = t["leaders"].as_array().expect("[[leaders]]");
+        assert!(!leaders.is_empty());
+        for l in leaders {
+            let a = l["address"].as_str().unwrap();
+            a.parse::<chain::solana_sdk::pubkey::Pubkey>()
+                .unwrap_or_else(|e| panic!("{a}: {e}"));
+        }
+        // pasted into the POC config in place of its placeholders, the result must still load
+        let poc = include_str!("../../../../config/poc.example.toml");
+        let i = poc.find("[[leaders]]").unwrap();
+        let j = poc
+            .find(
+                "# ================================================================ infrastructure",
+            )
+            .unwrap();
+        let merged = format!("{}{}\n{}", &poc[..i], s, &poc[j..]);
+        let c = BotConfig::from_toml(&merged).expect("merged config loads");
+        assert_eq!(c.engine.leaders.len(), leaders.len());
+    }
+
+    #[test]
     fn a_feed_is_required() {
         let s = include_str!("../../../../config/poc.example.toml")
             .replace("[infra.ws]", "[infra.unused_ws]");

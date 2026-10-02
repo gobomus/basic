@@ -17,11 +17,13 @@ Two paths. **Start with Path A: it is free and risks nothing.** Move to Path B o
 Paper mode follows your chosen wallets on live Solana and simulates every copy **as it would really have landed**: priced from the pool 1.2 s after detection (configurable), with the same slippage limit a real transaction has, so late or run-away fills are missed or worse, exactly as on-chain. All fees are charged. Then `copybot report` tells you what it earned.
 
 ## A1. Pick leader wallets
-Candidates: GMGN smart-money / KOL lists, Axiom, KOLscan (copy 3-10 addresses). Then vet each one on-chain, free:
+**Quick start:** `config/starter-leaders.example.toml` holds seven candidates already vetted this way (with the numbers next to each), ready to paste under `[[leaders]]`. Treat them as a starting point, not a recommendation.
+
+To pick your own: GMGN smart-money / KOL lists, Axiom, KOLscan (copy 3-10 addresses). Then vet each one on-chain, free:
 ```bash
 copybot leader-report <WALLET> [<WALLET> ...]    # profit, win rate, hold time, bot check; several wallets get a comparison table
 ```
-It reads the wallet's last `--limit` transactions (default 1000; use `--limit 150` for a quick look: a free RPC is slow, about 1-2 s per transaction).
+It reads the wallet's last `--limit` transactions (default 1000; `--limit 300` is a good first look) at about 4 per second, with a pause between wallets so a free RPC does not cut you off. History reads work best on PublicNode's free endpoint (`RPC_URL=https://solana-rpc.publicnode.com copybot leader-report ...`); for following wallets live, use the public Solana endpoint or a free keyed one (PublicNode's live stream arrives too late).
 Rules of thumb for the free feed:
 - **1 to 60 swaps per hour is ideal.** A wallet doing hundreds of swaps an hour is a bot: it cannot be copied (you would only be its exit liquidity) and it floods a free RPC.
 - Skip wallets whose median hold is under 20 s (the report rejects them: nothing can copy that). Holds of 20-120 s are "fast flippers": the report notes them as candidates, and paper mode measures what survives your feed's delay.
