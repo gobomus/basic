@@ -16,7 +16,8 @@ __pycache__/
 keys/
 config/*.local.toml
 config/engine.toml
-config/copybot.toml
+config/copybot*.toml
+!config/copybot*.example.toml
 
 # Data
 data/

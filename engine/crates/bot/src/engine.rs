@@ -595,7 +595,8 @@ impl Engine {
             if s.wallet == self.me {
                 continue; // handled below with true balance deltas
             }
-            if is_leader {
+            // a leader moving money (SOL to USDC, staking) is not entering a coin
+            if is_leader && !chain::base_assets::is_base_asset(&s.mint) {
                 match s.side {
                     Side::Buy => self.on_leader_buy(tx, s),
                     Side::Sell => self.on_leader_sell(s),
@@ -770,6 +771,10 @@ impl Engine {
         push_bounded(&mut self.stats.detect_lag_slots, lag);
         let decision_ms = ChainTx::now_ns().saturating_sub(tx.observed_at_ns) / 1_000_000;
         push_bounded(&mut self.stats.decision_ms, decision_ms);
+        // RPC feeds: how much of that was spent getting the transaction itself
+        let fetch_ms = (tx.fetched_at_ns > 0)
+            .then(|| tx.fetched_at_ns.saturating_sub(tx.observed_at_ns) / 1_000_000);
+        let fetch_tries = (tx.fetch_tries > 0).then_some(tx.fetch_tries);
         let lcfg = self.leaders[&s.wallet].clone();
         let tinfo = self.tokens.get(&s.mint).cloned();
         let entry = EntryContext {
@@ -851,7 +856,7 @@ impl Engine {
             "leader": s.wallet.to_string(), "label": lcfg.label, "signature": tx.signature, "slot": tx.slot,
             "tx_index": tx.tx_index, "mint": s.mint.to_string(), "venue": s.venue, "side": "buy",
             "leader_sol": s.sol_amount, "leader_price": s.price_sol, "source": format!("{:?}", tx.source).to_lowercase(),
-            "slot_lag": lag, "decision_ms": decision_ms, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
+            "slot_lag": lag, "decision_ms": decision_ms, "fetch_ms": fetch_ms, "fetch_tries": fetch_tries, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
             "pool_sol": s.pool_sol, "exact": s.exact, "token_age_secs": entry.token_age_secs,
             "leader_sol_before": entry.leader_sol_before, "market_cap_sol": entry.market_cap_sol,
         });
@@ -2198,6 +2203,8 @@ mod tests {
             tx_index: Some(1),
             block_time_ms: None,
             observed_at_ns: ChainTx::now_ns(),
+            fetched_at_ns: 0,
+            fetch_tries: 0,
             source: FeedSource::Geyser,
             failed: false,
             fee: 5000,
@@ -2268,6 +2275,43 @@ mod tests {
             }
         }
         out
+    }
+
+    #[tokio::test]
+    async fn a_leader_swapping_into_a_stablecoin_is_not_a_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, coin) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, _r) = engine(d, leader, "ladder_trail");
+        let buy = |slot: u64, mint: Pubkey, sol: u64| {
+            trade_tx(
+                slot,
+                Ev {
+                    mint,
+                    user: leader,
+                    creator,
+                    is_buy: true,
+                    sol,
+                    tokens: 1,
+                    vsol: 30_000_000_000,
+                    vtok: VTOK,
+                    real_sol: 30_000_000_000,
+                },
+                0,
+            )
+        };
+        // 10 SOL into USDC: moving money, not entering a coin
+        e.on_tx(&buy(100, chain::consts::USDC_MINT, 10_000_000_000));
+        assert!(e.positions.is_empty(), "nothing copied");
+        assert_eq!(e.stats.signals, 0, "not even counted as a signal");
+        // the same leader's real coin buy is still copied
+        e.on_tx(&buy(101, coin, 1_000_000_000));
+        assert!(e.positions.contains_key(&coin));
+        assert_eq!(e.stats.signals, 1);
     }
 
     #[tokio::test]

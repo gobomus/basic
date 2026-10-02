@@ -27,18 +27,23 @@ fn fixture() -> Value {
 
 /// Minimal JSON-RPC-over-HTTP server: getTransaction serves the fixture, anything else is empty.
 fn http_server(tx: Value, fetches: Arc<AtomicUsize>) -> String {
+    http_server_slow(tx, fetches, Duration::ZERO)
+}
+
+/// Same, but getTransaction answers only after `delay` (a congested public endpoint).
+fn http_server_slow(tx: Value, fetches: Arc<AtomicUsize>, delay: Duration) -> String {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
             let (tx, fetches) = (tx.clone(), fetches.clone());
-            std::thread::spawn(move || serve_http(s, tx, fetches));
+            std::thread::spawn(move || serve_http(s, tx, fetches, delay));
         }
     });
     url
 }
 
-fn serve_http(mut s: TcpStream, tx: Value, fetches: Arc<AtomicUsize>) {
+fn serve_http(mut s: TcpStream, tx: Value, fetches: Arc<AtomicUsize>, delay: Duration) {
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     loop {
         let mut buf = Vec::new();
@@ -71,6 +76,7 @@ fn serve_http(mut s: TcpStream, tx: Value, fetches: Arc<AtomicUsize>) {
         let result = match req["method"].as_str() {
             Some("getTransaction") => {
                 fetches.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(delay);
                 tx.clone()
             }
             Some("getMultipleAccounts") => json!({"context": {"slot": 5}, "value": [null]}),
@@ -258,6 +264,12 @@ async fn delivers_swaps_slots_and_ignores_noise() {
         txs[0].observed_at_ns > 0,
         "observation time is the notification time"
     );
+    assert!(
+        txs[0].fetched_at_ns >= txs[0].observed_at_ns && txs[0].fetch_tries == 1,
+        "fetch timing is recorded: {} ns after the notification, {} try",
+        txs[0].fetched_at_ns - txs[0].observed_at_ns,
+        txs[0].fetch_tries
+    );
     assert_eq!(
         fetches.load(Ordering::SeqCst),
         1,
@@ -300,4 +312,36 @@ async fn reconnects_and_resubscribes_after_a_dropped_connection() {
         .filter(|e| matches!(e, FeedEvent::Tx(_)))
         .count();
     assert!(n >= 2, "swaps keep flowing after the reconnect ({n})");
+}
+
+#[tokio::test]
+async fn a_request_still_in_flight_at_the_deadline_is_abandoned() {
+    // The server answers after 5.5 s, past the 4 s fetch deadline (the HTTP client's own
+    // timeout is longer). A copy decided that late is not worth making, so the feed must
+    // give up on time instead of delivering it, and keep the rest of the feed flowing.
+    let fx = fixture();
+    let tx = ChainTx::from_rpc_json(&fx).unwrap();
+    let leader = detect::all_swaps(&tx)[0].wallet.to_string();
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let rpc = http_server_slow(fx, fetches.clone(), Duration::from_millis(5500));
+    let ws = ws_server(Arc::new(AtomicUsize::new(0)), false);
+    let (mut rx, handles) = start("WSFEED_MOCK_WS_SLOW", &ws, &rpc, &leader);
+
+    let events = collect(&mut rx, 7).await;
+    handles.iter().for_each(|h| h.abort());
+
+    assert!(
+        fetches.load(Ordering::SeqCst) >= 1,
+        "the fetch was attempted"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, FeedEvent::Tx(_))),
+        "a transaction that arrives after the deadline is not delivered"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, FeedEvent::Slot { slot: 123, .. })),
+        "the rest of the feed keeps flowing"
+    );
 }

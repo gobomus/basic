@@ -541,6 +541,9 @@ fn parse_leaders(v: &[String]) -> HashSet<Pubkey> {
 /// this late is not worth making anyway).
 const FETCH_DEADLINE: Duration = Duration::from_secs(4);
 
+/// Longest we wait for the pool read that accompanies a leader buy.
+const STATE_DEADLINE: Duration = Duration::from_millis(1500);
+
 /// Transactions fetched concurrently.
 const MAX_FETCHES: usize = 8;
 
@@ -569,13 +572,16 @@ async fn fetch_and_emit(
             return;
         }
         attempt += 1;
-        let wait_ms = match rpc.transaction_json_once(&sig).await {
-            Ok(v) if !v.is_null() => {
+        // one slow request must not outlive the deadline (the HTTP timeout is longer)
+        let left = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = match tokio::time::timeout(left, rpc.transaction_json_once(&sig)).await {
+            Err(_) => break, // out of time mid-request
+            Ok(Ok(v)) if !v.is_null() => {
                 found = Some(v);
                 break;
             }
-            Ok(_) => 150, // not served yet
-            Err(e) => {
+            Ok(Ok(_)) => 150, // not served yet
+            Ok(Err(e)) => {
                 tracing::debug!("getTransaction {sig}: {e}");
                 // rate limited: back off harder
                 (300 * u64::from(attempt)).min(1200)
@@ -598,6 +604,8 @@ async fn fetch_and_emit(
         }
     };
     tx.observed_at_ns = observed_ns;
+    tx.fetched_at_ns = ChainTx::now_ns();
+    tx.fetch_tries = attempt;
 
     // Current pool state for the coins leaders are buying.
     let mut want: Vec<(Pubkey, crate::detect::Template, u8, Pubkey)> = Vec::new();
@@ -612,7 +620,12 @@ async fn fetch_and_emit(
     }
     if !want.is_empty() && limiter.acquire(Duration::from_secs(1)).await {
         let items: Vec<_> = want.iter().map(|w| (w.1.clone(), w.2)).collect();
-        match state::read(&rpc, &items).await {
+        // a slow pool read costs more than it is worth: without it the engine
+        // prices the entry from the pool at landing time anyway
+        let read = tokio::time::timeout(STATE_DEADLINE, state::read(&rpc, &items))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")));
+        match read {
             Ok((slot, refreshed)) => {
                 for (w, r) in want.iter().zip(refreshed) {
                     if let Some(r) = r.filter(|r| !r.complete) {

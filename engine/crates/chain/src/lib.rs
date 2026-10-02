@@ -1,5 +1,6 @@
 //! Solana I/O for the copy engine.
 
+pub mod base_assets;
 pub mod borsh;
 pub mod consts;
 pub mod detect;

@@ -34,14 +34,17 @@ max_leader_buy_sol = 200.0
 # The free feed can price Pump.fun curve coins and PumpSwap pools straight from
 # their accounts, so exits work there. Other venues need the paid feed.
 venues = ["pump_fun_curve", "pump_swap"]
-min_pool_sol = 10.0
+# SOL in the pool. A young Pump.fun coin has only 1-5 SOL in its curve, so a higher
+# floor would skip every early entry, which is where most leaders buy. This only
+# screens out dust pools; the sizing cap below scales the copy to the pool.
+min_pool_sol = 1.0
 one_entry_per_token = false
 blacklist_mints = []
 blacklist_devs = []
 max_token_age_secs = 604800
-# The free feed sees a trade 1-3 s after it lands (a slot is 0.4 s). The price
+# The free feed sees a trade 1-5 s after it lands (a slot is 0.4 s). The price
 # drift check below is the real protection against buying after the move.
-max_detection_slot_lag = 12
+max_detection_slot_lag = 20
 max_price_drift_pct = 0.20
 
 [risk]

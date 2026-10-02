@@ -436,7 +436,10 @@ pub async fn leader_report(
                 Ok(v) if !v.is_null() => {
                     if let Ok(t) = ChainTx::from_rpc_json(&v) {
                         for s in detect::swaps_by(&t, &wallet) {
-                            swaps.push((t.block_time_ms.unwrap_or(0), s));
+                            // parking SOL in USDC or staking it says nothing about coin picking
+                            if !chain::base_assets::is_base_asset(&s.mint) {
+                                swaps.push((t.block_time_ms.unwrap_or(0), s));
+                            }
                         }
                     }
                 }
@@ -709,6 +712,8 @@ pub fn bench(iterations: u32) {
         tx_index: Some(1),
         block_time_ms: None,
         observed_at_ns: 0,
+        fetched_at_ns: 0,
+        fetch_tries: 0,
         source: engine_core::types::FeedSource::Geyser,
         failed: false,
         fee: 5000,

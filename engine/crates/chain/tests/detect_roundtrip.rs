@@ -27,6 +27,8 @@ fn base_tx(leader: Pubkey) -> ChainTx {
         tx_index: Some(5),
         block_time_ms: None,
         observed_at_ns: 0,
+        fetched_at_ns: 0,
+        fetch_tries: 0,
         source: FeedSource::Geyser,
         failed: false,
         fee: 5000,

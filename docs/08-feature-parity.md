@@ -34,6 +34,7 @@ Known limits of the free feed: it sees a leader trade about 1-3 s after it lands
 | Size by the share of their balance the leader spent (BasedBot "Buy %") / fixed size | ✅ | `sizing.mode = balance_fraction \| fixed`, `copy_amount_sol` |
 | Market-cap range, max liquidity | ✅ | `filters.min/max_market_cap_sol`, `max_pool_sol` |
 | Token / dev blacklist (live-editable) | ✅ | `filters.blacklist_mints/devs`, `copybot ctl blacklist <address>` |
+| Ignore stablecoin / staked-SOL / wrapped-major swaps (a leader parking SOL in USDC is not a coin entry) | ✅ | built in: `chain::base_assets` (175 mints from Jupiter's verified list, regenerate with `scripts/gen_base_assets.py`); also excluded from `leader-report` numbers. Found when a paper run copied a 10 SOL → USDC swap |
 | One entry per token across leaders (BasedBot "Trade Once Per Token") | ✅ | `filters.one_entry_per_token` |
 | Min/max leader trade size filter (BasedBot) | ✅ | `filters.min/max_leader_buy_sol` |
 | Min / max liquidity filter (BasedBot) | ✅ | `filters.min_pool_sol`, `max_pool_sol` |

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use engine_core::stats::{mean, median, profit_factor};
+use engine_core::stats::{mean, median, profit_factor, quantile};
 use serde_json::Value;
 
 /// Fewer closed trades than this prove nothing either way.
@@ -136,6 +136,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     let mut skips: BTreeMap<String, usize> = BTreeMap::new();
     let mut slot_lags: Vec<f64> = vec![];
     let mut decision_ms: Vec<f64> = vec![];
+    let mut fetch_ms: Vec<f64> = vec![];
     let (mut fills_ok, mut fills_missed) = (0usize, 0usize);
     let (mut slip_bps, mut latency): (Vec<f64>, Vec<f64>) = (vec![], vec![]);
     let mut shadows: BTreeMap<String, Agg> = BTreeMap::new();
@@ -170,6 +171,9 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                 }
                 if let Some(d) = r["decision_ms"].as_f64() {
                     decision_ms.push(d);
+                }
+                if let Some(d) = r["fetch_ms"].as_f64() {
+                    fetch_ms.push(d);
                 }
             }
             "feed" if r["connected"] == false => feed_drops += 1,
@@ -262,12 +266,17 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         )?;
     }
     if let Some(m) = median(&decision_ms) {
-        let mut v = decision_ms.clone();
-        v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-        let p90 = v[((v.len() - 1) as f64 * 0.9).round() as usize];
         writeln!(
             o,
-            "  our pipeline: first sign of the leader's trade to decision, median {m:.0} ms · p90 {p90:.0} ms (the number to cut when optimising latency)"
+            "  our pipeline: first sign of the leader's trade to decision, median {m:.0} ms · p90 {:.0} ms (the number to cut when optimising latency)",
+            quantile(&decision_ms, 0.9).unwrap_or(0.0)
+        )?;
+    }
+    if let Some(m) = median(&fetch_ms) {
+        writeln!(
+            o,
+            "    of which fetching the transaction from the RPC: median {m:.0} ms · p90 {:.0} ms",
+            quantile(&fetch_ms, 0.9).unwrap_or(0.0)
         )?;
     }
     if let Some(m) = median(&slot_lags) {

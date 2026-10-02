@@ -23,6 +23,16 @@ pub fn median(xs: &[f64]) -> Option<f64> {
     })
 }
 
+/// Nearest-rank quantile, `q` in 0..=1 (0.9 = the 90th percentile).
+pub fn quantile(xs: &[f64], q: f64) -> Option<f64> {
+    let mut v: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    Some(v[((v.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize])
+}
+
 /// Gross profit / gross loss. `None` when there are no losses.
 pub fn profit_factor(pnls: &[f64]) -> Option<f64> {
     // fold from +0.0: `Iterator::sum` of nothing is -0.0, which would print as "-0.00"
@@ -45,6 +55,12 @@ mod tests {
         assert_eq!(median(&[4.0, 1.0, 2.0, 3.0]), Some(2.5));
         assert_eq!(median(&[f64::NAN]), None);
         assert_eq!(mean(&[1.0, 3.0]), Some(2.0));
+        assert_eq!(quantile(&[5.0, 1.0, 9.0, 3.0, 7.0], 0.5), Some(5.0));
+        assert_eq!(
+            quantile(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], 0.9),
+            Some(9.0)
+        );
+        assert_eq!(quantile(&[], 0.9), None);
         assert_eq!(profit_factor(&[2.0, -1.0, 1.0]), Some(3.0));
         assert_eq!(profit_factor(&[1.0]), None);
         let all_losers = profit_factor(&[-1.0, -2.0]).unwrap();
