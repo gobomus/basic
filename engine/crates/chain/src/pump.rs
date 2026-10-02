@@ -111,6 +111,17 @@ impl TradeEvent {
         spot_price(self.virtual_sol_reserves, self.virtual_token_reserves)
     }
 
+    /// What the trader actually paid (buy, every fee included) or received (sell, after fees).
+    /// `sol_amount` is the amount the curve's reserves moved by, before fees.
+    pub fn user_flow(&self) -> u64 {
+        let fees = self.fee + self.creator_fee;
+        if self.is_buy {
+            self.sol_amount + fees
+        } else {
+            self.sol_amount.saturating_sub(fees)
+        }
+    }
+
     /// Everything the trader pays on top of the swap amount. `buyback_fee_basis_points`
     /// is the share of the protocol fee routed to buybacks (5000 = half of it),
     /// not an additional fee: verified on live trades (fee + creator fee = 1.25%).

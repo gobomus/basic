@@ -136,14 +136,31 @@ impl Rpc {
         &self,
         pks: &[Pubkey],
     ) -> anyhow::Result<(u64, Vec<Option<AccountData>>)> {
+        self.accounts_at_with(pks, 4).await
+    }
+
+    /// `accounts_at` without rate-limit backoff: for pollers that simply try again next tick.
+    pub async fn accounts_at_fast(
+        &self,
+        pks: &[Pubkey],
+    ) -> anyhow::Result<(u64, Vec<Option<AccountData>>)> {
+        self.accounts_at_with(pks, 0).await
+    }
+
+    async fn accounts_at_with(
+        &self,
+        pks: &[Pubkey],
+        max_retries: u32,
+    ) -> anyhow::Result<(u64, Vec<Option<AccountData>>)> {
         let mut slot = 0;
         let mut out = Vec::with_capacity(pks.len());
         for chunk in pks.chunks(100) {
             let keys: Vec<String> = chunk.iter().map(|p| p.to_string()).collect();
             let v = self
-                .call(
+                .call_with(
                     "getMultipleAccounts",
                     json!([keys, {"encoding": "base64", "commitment": "processed"}]),
+                    max_retries,
                 )
                 .await?;
             slot = slot.max(v["context"]["slot"].as_u64().unwrap_or(0));

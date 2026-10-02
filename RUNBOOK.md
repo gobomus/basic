@@ -29,7 +29,7 @@ Rules of thumb for the free feed:
 
 ## A2. Run it: three ways
 
-**Way 1: GitHub Actions (nothing to install).** The workflow (`.github/workflows/paper-run.yml`) shows up in the Actions tab once it is on the repository's default branch (`master`). Then, in the repository on GitHub: **Actions → paper-run → Run workflow**, paste the wallet addresses, choose hours (max 5.5), Run. When it finishes, open the run: the **summary page shows the report** and the full journal is attached as a download. Repeat on different days; every run is independent. Free for public repositories; private ones use your monthly free minutes. Optional: add a repository secret `RPC_URL` with a free key (below), otherwise the public Solana endpoint is used.
+**Way 1: GitHub Actions (nothing to install).** The workflow (`.github/workflows/paper-run.yml`) shows up in the Actions tab once it is on the repository's default branch (`master`). Then, in the repository on GitHub: **Actions → paper-run → Run workflow**, paste the wallet addresses, choose hours (max 5.5), Run. When it finishes, open the run: the **summary page shows the report** and the full journal is attached as a download. Repeat on different days: every run's report stands alone, and to judge several runs together put each downloaded journal in its own subfolder of one folder and run `copybot report --dir <that folder>`. Free for public repositories; private ones use your monthly free minutes. Optional: add a repository secret `RPC_URL` with a free key (below), otherwise the public Solana endpoint is used.
 
 **Way 2: your own computer** (Linux or macOS; on Windows use WSL / Ubuntu). One-time install of Rust (<https://rustup.rs>), then:
 ```bash
@@ -57,12 +57,12 @@ Everything is also written to `data/journal/*.jsonl` (one JSON per line).
 ## A4. Read the report
 `copybot report` prints, after every modelled cost:
 - the **signal funnel**: what leaders did, what was copied, why trades were skipped, how many entries missed because the price ran past slippage;
-- **results**: trades, win rate, total PnL, expectancy per trade, profit factor;
-- **by leader**: who earns it and who loses it;
+- **results**: trades, win rate, total PnL, expectancy per trade, profit factor, and a **95% confidence interval** for the mean return per trade;
+- **by leader** and **by exit reason**: who earns it, who loses it, which rule closes the winners and the losers;
 - **alternative exits**: the same entries and price paths replayed under every exit policy, so one run compares exit styles;
-- a **verdict**. It refuses to conclude anything below 30 closed trades.
+- a **go / no-go checklist** and a verdict. It refuses to conclude anything below 30 closed trades.
 
-**Go / no-go for Path B:** at least 100 closed trades over several days, positive PnL after costs, profit in more than one leader (not one lucky trade), and the winning exit policy identified. If it is negative: change leaders or exits and run again. That is what Path A is for.
+**Go / no-go for Path B:** all four boxes ticked: 300+ leader buys seen, 100+ closed trades, mean return per trade positive with 95% confidence, and at least 3 leaders individually in profit. Several days of running, not one afternoon. If the verdict is "losing" or "inconclusive": change leaders or exits and run again. That is what Path A is for.
 
 ## RPC options (all free)
 | | Limits | Notes |

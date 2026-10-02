@@ -50,7 +50,7 @@ archive/                    unrelated legacy code (RFO BASIC! Android app)
 ## Develop
 ```sh
 cd engine
-cargo test --workspace                 # 73 tests: IDL conformance, real mainnet txs, end-to-end engine
+cargo test --workspace                 # 94 tests: IDL conformance, real mainnet txs, end-to-end engine
 cargo build --release -p bot           # → target/release/copybot
 ./target/release/copybot bench         # in-process reaction time (~0.17 ms median)
 ```

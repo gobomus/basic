@@ -202,6 +202,29 @@ fn curve_quotes_reproduce_real_trades() {
                 "{f}: protocol 0.95% + creator 0.30%"
             );
             assert_eq!(fees * 10_000 / net, 125, "{f}: fees really are 1.25%");
+            // the swap amount we report is what the trader really paid / received
+            let swap = detect::all_swaps(&tx)
+                .into_iter()
+                .find(|s| s.wallet == e.user)
+                .expect("swap");
+            assert_eq!(
+                swap.sol_amount,
+                if e.is_buy { net + fees } else { net - fees },
+                "{f}"
+            );
+            let i = tx.key_index(&e.user).unwrap();
+            let delta = tx.post_balances[i] as i128 - tx.pre_balances[i] as i128;
+            let real = if e.is_buy {
+                -delta
+            } else {
+                delta + tx.fee as i128
+            };
+            // within rent / tips of the balance change (a new token account costs 0.002 SOL)
+            assert!(
+                (real - swap.sol_amount as i128).abs() < 12_000_000,
+                "{f}: reported {} vs balance change {real}",
+                swap.sol_amount
+            );
             if e.is_buy {
                 let pre = CurveState {
                     virtual_quote_reserves: post.virtual_quote_reserves - net,

@@ -462,7 +462,7 @@ async fn session(
                     Message::Pong(_) => continue,
                     Message::Close { reason, .. } => anyhow::bail!("closed by server: {reason}"),
                 };
-                tracing::trace!("ws rx: {}", &text[..text.len().min(300)]);
+                tracing::trace!("ws rx: {}", text.chars().take(300).collect::<String>());
                 match parse_msg(&text) {
                     WsMsg::Subscribed { id, sub } => {
                         if let Some(k) = subs.pending.remove(&id) {

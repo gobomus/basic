@@ -10,6 +10,8 @@ On a bonding curve the copier always buys after the leader, at a worse price. Pu
 discover → backfill → reconstruct round trips → simulate copies → score + gates → probation (shadow) → active → monitor → retire
 ```
 
+> **Free starting workflow (no backfill vendor, no paid feed).** The pipeline below is the full version. To start for free: take candidates from a public list (GMGN, Axiom, KOLscan; their daily boards are survivorship-biased, so treat them as candidates only), screen them for activity, vet each with `copybot leader-report` (step 3 from the chain's own history, free), then let **paper mode** do step 4 live: it enters 1.2 s after each leader buy at the price the pool really shows then and exits with our policy, and `copybot report` prints the imitation penalty's end result (copier PnL after costs, per leader). See [RUNBOOK](../RUNBOOK.md) Path A.
+
 ### 1. Discover candidates
 - **Our own firehose:** wallets with high realised profit on universe tokens over 30 and 90 days.
 - **Public leaderboards and tags:** GMGN smart money and KOL lists, Axiom pro traders, KOL trackers.

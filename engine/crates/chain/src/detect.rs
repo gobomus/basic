@@ -247,7 +247,7 @@ fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> DetectedSwap {
         mint: e.mint,
         side: if e.is_buy { Side::Buy } else { Side::Sell },
         venue: Venue::PumpFunCurve,
-        sol_amount: e.sol_amount,
+        sol_amount: e.user_flow(),
         token_amount: e.token_amount,
         token_decimals: dec,
         token_program: tp,

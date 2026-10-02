@@ -427,18 +427,27 @@ pub async fn leader_report(
     }
     eprintln!("fetching {} transactions…", sigs.len());
     let mut swaps = vec![];
-    for chunk in sigs.chunks(8) {
+    let mut failed = 0usize;
+    // ~4 transactions per second: what a free RPC tolerates per method
+    for chunk in sigs.chunks(4) {
         let futs = chunk.iter().map(|s| rpc.transaction_json(s));
-        for v in futures::future::join_all(futs).await.into_iter().flatten() {
-            if v.is_null() {
-                continue;
-            }
-            if let Ok(t) = ChainTx::from_rpc_json(&v) {
-                for s in detect::swaps_by(&t, &wallet) {
-                    swaps.push((t.block_time_ms.unwrap_or(0), s));
+        for res in futures::future::join_all(futs).await {
+            match res {
+                Ok(v) if !v.is_null() => {
+                    if let Ok(t) = ChainTx::from_rpc_json(&v) {
+                        for s in detect::swaps_by(&t, &wallet) {
+                            swaps.push((t.block_time_ms.unwrap_or(0), s));
+                        }
+                    }
                 }
+                Ok(_) => {}
+                Err(_) => failed += 1,
             }
         }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+    if failed > 0 {
+        eprintln!("warning: {failed} of {} transactions could not be fetched (RPC rate limit); the numbers below miss them", sigs.len());
     }
     swaps.sort_by_key(|(t, _)| *t);
     // FIFO round trips per mint

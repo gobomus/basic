@@ -54,12 +54,22 @@ impl Agg {
     }
 }
 
+/// Every `*.jsonl` under `dir`, subfolders included (several downloaded runs can sit side by side).
+fn journal_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
+    for e in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
+        let p = e?.path();
+        if p.is_dir() {
+            journal_files(&p, out)?;
+        } else if p.extension().is_some_and(|x| x == "jsonl") {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
 fn read_journal(dir: &str, since_ms: Option<i64>) -> anyhow::Result<Vec<Value>> {
-    let mut files: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| anyhow::anyhow!("{dir}: {e}"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-        .collect();
+    let mut files = Vec::new();
+    journal_files(std::path::Path::new(dir), &mut files)?;
     files.sort();
     let mut out = Vec::new();
     for f in files {
@@ -73,6 +83,8 @@ fn read_journal(dir: &str, since_ms: Option<i64>) -> anyhow::Result<Vec<Value>> 
             out.push(v);
         }
     }
+    // runs from different folders interleave by time
+    out.sort_by_key(|v| v["ts"].as_i64().unwrap_or(0));
     Ok(out)
 }
 

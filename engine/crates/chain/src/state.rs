@@ -136,7 +136,9 @@ pub async fn read(
     if keys.is_empty() {
         return Ok((0, vec![None; items.len()]));
     }
-    let (slot, accs) = rpc.accounts_at(&keys).await?;
+    // no rate-limit backoff: the poller retries on its next tick, and a stalled
+    // read would delay exits more than a skipped one
+    let (slot, accs) = rpc.accounts_at_fast(&keys).await?;
     let out = items
         .iter()
         .zip(spans)
