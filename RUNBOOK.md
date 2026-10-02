@@ -80,7 +80,13 @@ Pick any live Pump.fun token and any wallet address that holds some SOL (it does
 ```bash
 ./copybot simulate --mint <TOKEN_MINT> --sol 0.1 --as <ANY_FUNDED_ADDRESS>
 ```
-`SIMULATION OK` means the live Pump program accepted the exact buy the bot would send. Do this for one coin still on the bonding curve and one that has graduated to PumpSwap.
+`SIMULATION OK` means the live Pump program accepted the exact buy the bot would send. Do this for one coin still on the bonding curve and one that has graduated to PumpSwap. Add `--sell` with an address that holds the token to prove the sell as well.
+
+To check the trade decoder against what is happening on-chain right now:
+```bash
+./copybot audit --program pump --limit 20       # also: pumpswap, dbc, launchlab
+```
+It decodes recent real trades and compares the amounts with each trader's actual balance changes. It exits with an error if any disagree.
 
 ## 7. Shadow mode (1–2 weeks)
 ```bash

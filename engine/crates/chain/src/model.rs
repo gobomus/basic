@@ -293,7 +293,7 @@ impl ChainTx {
         Ok(Self {
             signature: tx["signatures"][0].as_str().unwrap_or_default().to_string(),
             slot: v["slot"].as_u64().unwrap_or(0),
-            tx_index: None,
+            tx_index: v["transactionIndex"].as_u64().map(|i| i as u32),
             block_time_ms: v["blockTime"].as_i64().map(|t| t * 1000),
             observed_at_ns: 0,
             source: FeedSource::Rpc,

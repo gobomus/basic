@@ -4,14 +4,15 @@ An honest status of every feature category those platforms offer, as of this com
 
 **Legend**
 - ✅ built and covered by tests
-- 🔶 built, but needs the live-chain check (`copybot check` / `simulate` / shadow mode)
+- 🟢 verified on Solana mainnet (accepted by the live program, or decoded correctly on real transactions)
+- 🔶 built, but needs the live-chain check on your own infrastructure (`copybot check` / shadow mode)
 - 📦 raw data is recorded; the analytics on top are not built yet
 - ⬜ not built
 
 ## Copy trading (GMGN, BasedBot, Axiom, Padre)
 | Feature | Status | Where |
 |---|---|---|
-| Follow N wallets in real time (gRPC, sub-second) | 🔶 | `chain::geyser`, filters hot-update without reconnect |
+| Follow N wallets in real time (gRPC, sub-second) | 🔶 needs a gRPC provider | `chain::geyser`, filters hot-update without reconnect |
 | Pre-execution (shred/deshred) leader detection | 🔶 | `geyser::run_deshred`, `detect::pre_exec_pump_buys` (if your provider supports deshred) |
 | Copy a % of the leader's size (per-leader override) | ✅ | `sizing.copy_pct`, `[[leaders]] copy_pct` |
 | Min/max leader trade size filter (BasedBot) | ✅ | `filters.min/max_leader_buy_sol` |
@@ -42,11 +43,11 @@ An honest status of every feature category those platforms offer, as of this com
 ## Execution (speed)
 | Feature | Status | Where |
 |---|---|---|
-| Pump.fun curve buy/sell (`buy_exact_quote_in_v2`, `sell_v2`) | 🔶 | `chain::pump`, verified against the official IDL |
-| PumpSwap buy/sell (incl. cashback, pool-v2, buyback accounts) | 🔶 | `chain::pump_amm`, matches the official SDK |
-| Meteora DBC (Bags, Jupiter Studio, Believe…) direct | 🔶 | `chain::meteora_dbc`, verified against the IDL in Meteora's SDK (Sep 2026) |
-| Raydium LaunchLab (LetsBONK) direct | 🔶 | `chain::raydium_launchlab`, IDL + Raydium SDK v2 (Sep 2026) account layout |
-| Other venues (Raydium AMM/CPMM/CLMM, Meteora DAMM/DLMM, Orca) | 🔶 | detected for any venue; executed through the Jupiter fallback |
+| Pump.fun curve buy/sell (`buy_exact_quote_in_v2`, `sell_v2`) | 🟢 | `chain::pump`: official IDL + mainnet `simulateTransaction` accepted (buy 88.8k CU, sell 74.5k CU) |
+| PumpSwap buy/sell (incl. cashback, pool-v2, buyback accounts) | 🟢 | `chain::pump_amm`: official SDK + mainnet simulation accepted (buy 91.3k CU, sell 74.3k CU). Reversed (SOL-base) pools are detected and routed via Jupiter |
+| Meteora DBC (Bags, Jupiter Studio, Believe…) direct | 🟢 detect / 🔶 send | `chain::meteora_dbc`: IDL from Meteora's SDK; real mainnet trades decoded into a direct template |
+| Raydium LaunchLab (LetsBONK) direct | 🟢 detect / 🔶 send | `chain::raydium_launchlab`: IDL + Raydium SDK v2; all 18 accounts match live mainnet instructions |
+| Other venues (Raydium AMM/CPMM/CLMM, Meteora DAMM/DLMM, Orca) | 🟢 | detected for any venue from balance changes; executed through Jupiter (`/swap/v1`, v0 tx simulated on mainnet) |
 | Multi-sender fan-out (Jito, Helius Sender, Nozomi, Astralane, RPC) | 🔶 | `chain::sender` groups services by tip family; one variant per family on a shared durable nonce (`chain::nonce`, byte-checked against `solana-system-interface` / `solana-nonce`), so only one can land; expired orders are cancelled by advancing the nonce. Helius tip accounts taken verbatim from `helius-sdk` 3.2.0 |
 | Priority fee + Jito tip, urgent-exit tip boost, retry escalation | ✅ | `[infra.fees]`, `sell()` |
 | In-process reaction time | ✅ measured | `copybot bench`: **~0.2 ms** median (decode → size → build → sign) |
@@ -84,8 +85,10 @@ An honest status of every feature category those platforms offer, as of this com
 |---|---|---|
 | Operator control: `copybot ctl status / positions / leaders / pause / resume / kill / flatten` | ✅ | `control.rs` (local Unix socket) |
 | Kill switch: daily loss, stale feed, manual | ✅ | engine |
-| Preflight check with latency | 🔶 | `copybot check` |
-| Live-chain dry run without funds | 🔶 | `copybot simulate` |
+| Preflight check with latency | 🟢 | `copybot check` (mainnet RPC 47 ms from the build sandbox; Jito tip accounts fetched live) |
+| Live-chain dry run without funds | 🟢 | `copybot simulate [--sell]` |
+| Decoder audit on live chain | 🟢 | `copybot audit --program pump\|pumpswap\|dbc\|launchlab`: decodes recent real trades and cross-checks amounts against balance changes (Pump 10/10, PumpSwap 20/20 agree) |
+| Version-1 transactions (new mainnet format, compute budget in `transactionConfig`) | 🟢 | `rpc` requests `maxSupportedTransactionVersion: 1`; real v1 tx in the fixtures |
 | Journal (JSONL always; Postgres and ClickHouse optional) | ✅ JSONL / 🔶 DBs | `journal.rs`, `schema/` |
 | systemd service, setup script, CI | ✅ | `deploy/`, `.github/workflows/ci.yml` |
 | Web dashboard / UI | ⬜ | `copybot ctl` + Grafana on the databases for now |
@@ -99,9 +102,10 @@ An honest status of every feature category those platforms offer, as of this com
 - **Helius Sender:** endpoints, tip accounts and minimum tips from the official `helius-sdk` 3.2.0.
 - **Raydium LaunchLab:** `raydium-io/raydium-idl` + `@raydium-io/raydium-sdk-v2` 0.2.73 (`launchpad/instrument.ts`, `pda.ts`, curve math).
 
-## Why some items are 🔶
-The build sandbox's network policy blocks Solana RPC, gRPC and sender hosts. Everything was therefore verified offline:
-- against Pump's **official IDLs and SDK source** (account order, read/write flags, every PDA, every byte layout);
-- by end-to-end engine tests on synthetic transactions.
+## Why some items are still 🔶
+Mainnet verification (Oct 2026) covered everything that needs only RPC: instruction acceptance, decoding real trades, Jupiter routing, preflight. What remains needs your own paid infrastructure:
+- the live gRPC feed (Yellowstone / LaserStream) and deshred stream;
+- landing through the senders (Jito, Helius Sender, …) with real tips;
+- the Postgres and ClickHouse sinks.
 
-The live-chain checks are the first three steps of [RUNBOOK.md](../RUNBOOK.md): `check`, `simulate`, then shadow mode. They take minutes once the server and endpoints exist.
+Those are steps 5–8 of [RUNBOOK.md](../RUNBOOK.md): `check`, then shadow mode, then small live size.

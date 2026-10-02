@@ -47,20 +47,29 @@ impl Rpc {
 
     pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let t = Instant::now();
-        let resp: Value = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-        tracing::trace!(method, ms = t.elapsed().as_millis() as u64, "rpc");
-        if let Some(e) = resp.get("error") {
-            anyhow::bail!("{method}: {e}");
+        let mut attempt = 0u32;
+        loop {
+            let t = Instant::now();
+            let resp: Value = self
+                .http
+                .post(&self.url)
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+            tracing::trace!(method, ms = t.elapsed().as_millis() as u64, "rpc");
+            if let Some(e) = resp.get("error") {
+                // rate limited (public / shared RPCs): back off and retry a few times
+                if e["code"].as_i64() == Some(429) && attempt < 4 {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(400 * 2u64.pow(attempt))).await;
+                    continue;
+                }
+                anyhow::bail!("{method}: {e}");
+            }
+            return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
         }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
     pub async fn get_slot(&self, commitment: &str) -> anyhow::Result<u64> {
@@ -228,7 +237,7 @@ impl Rpc {
     pub async fn transaction_json(&self, sig: &str) -> anyhow::Result<Value> {
         self.call(
             "getTransaction",
-            json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}]),
+            json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}]),
         )
         .await
     }

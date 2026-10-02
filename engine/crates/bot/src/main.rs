@@ -62,6 +62,9 @@ enum Cmd {
         /// Any address holding enough SOL (no keys needed: signature checks are skipped)
         #[arg(long = "as")]
         as_wallet: String,
+        /// Simulate selling the wallet's whole balance of the mint instead
+        #[arg(long)]
+        sell: bool,
     },
     /// Analyse a wallet's on-chain trading history
     LeaderReport {
@@ -80,6 +83,12 @@ enum Cmd {
     },
     /// GMGN token panel: holders, dev, snipers, bundlers, insiders, smart money, socials, gate verdict
     TokenIntel { mint: String },
+    /// Decode recent real transactions of a program (pump | pumpswap | dbc | launchlab | <id>) and cross-check them
+    Audit {
+        program: String,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+    },
     /// Measure in-process reaction time (decode → size → build → sign)
     Bench {
         #[arg(long, default_value_t = 10000)]
@@ -187,9 +196,11 @@ async fn main() -> anyhow::Result<()> {
                     mint,
                     sol,
                     as_wallet,
+                    sell,
                 } => {
                     let ok =
-                        tools::simulate_buy(&cfg, mint.parse()?, sol, as_wallet.parse()?).await?;
+                        tools::simulate_buy(&cfg, mint.parse()?, sol, as_wallet.parse()?, sell)
+                            .await?;
                     std::process::exit(if ok { 0 } else { 1 });
                 }
                 Cmd::LeaderReport { address, limit } => {
@@ -241,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Run => run(cfg).await,
                 Cmd::Discover { limit, top } => tools::discover(&cfg, limit, top).await,
                 Cmd::TokenIntel { mint } => tools::token_intel(&cfg, &mint).await,
+                Cmd::Audit { program, limit } => {
+                    let ok = tools::audit(&cfg, &program, limit).await?;
+                    std::process::exit(if ok { 0 } else { 1 });
+                }
                 Cmd::Ctl { command } => {
                     print!(
                         "{}",

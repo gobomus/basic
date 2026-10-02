@@ -149,8 +149,11 @@ url = "https://YOUR-RPC-URL"         # plain sendTransaction fallback
 accepts_jito_tip = false
 
 [infra.fees]
-cu_limit_buy = 260000
-cu_limit_sell = 220000
+# Measured on mainnet (simulateTransaction, Oct 2026), full tx incl. ATA/WSOL handling:
+# Pump curve buy 88.8k / sell 74.5k CU, PumpSwap buy 91.3k / sell 74.3k CU.
+# A tighter limit raises your priority per CU; these keep ~60% headroom.
+cu_limit_buy = 150000
+cu_limit_sell = 130000
 cu_price_micro_lamports = 300000     # priority fee
 tip_lamports_buy = 1000000           # 0.001 SOL
 tip_lamports_sell = 1000000

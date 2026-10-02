@@ -211,6 +211,7 @@ pub async fn simulate_buy(
     mint: Pubkey,
     sol: f64,
     as_wallet: Pubkey,
+    sell: bool,
 ) -> anyhow::Result<bool> {
     let rpc = Rpc::new(cfg.rpc_url()?);
     let lamports = sol_to_lamports(sol);
@@ -219,23 +220,43 @@ pub async fn simulate_buy(
         .await?
         .ok_or_else(|| anyhow::anyhow!("mint {mint} not found"))?;
     let tp = mint_acc.owner;
+    // sell mode: sell everything the wallet holds of this mint
+    let held: u64 = if sell {
+        rpc.token_accounts(&as_wallet, &tp)
+            .await?
+            .iter()
+            .filter(|(_, m, _)| *m == mint)
+            .map(|(_, _, a)| *a)
+            .sum()
+    } else {
+        0
+    };
+    anyhow::ensure!(!sell || held > 0, "{as_wallet} holds none of {mint}");
     let bc_key = pda::bonding_curve(&mint);
     let (body, route) = match rpc.account(&bc_key).await? {
         Some(a) if !BondingCurve::decode(&a.data)?.complete => {
             let bc = BondingCurve::decode(&a.data)?;
             let coin = CurveCoin::sol_paired(mint, bc.creator, tp, bc.is_mayhem_mode);
-            let expected = pump::buy_tokens_for_quote(&bc.state, lamports, 200);
-            let ixs = vec![
-                chain::ixs::create_ata_idempotent(&as_wallet, &as_wallet, &mint, &tp),
-                pump::buy_exact_quote_in_v2(
-                    &coin,
-                    &as_wallet,
-                    lamports,
-                    pump::apply_slippage_down(expected, 3000),
-                    rand::random(),
-                ),
-            ];
-            (ixs, format!("pump curve · expected {} tokens", expected))
+            if sell {
+                let out = pump::sell_quote_for_tokens(&bc.state, held, 200);
+                (
+                    vec![pump::sell_v2(&coin, &as_wallet, held, 1, rand::random())],
+                    format!("pump curve SELL {held} tokens · expected {out} lamports"),
+                )
+            } else {
+                let expected = pump::buy_tokens_for_quote(&bc.state, lamports, 200);
+                let ixs = vec![
+                    chain::ixs::create_ata_idempotent(&as_wallet, &as_wallet, &mint, &tp),
+                    pump::buy_exact_quote_in_v2(
+                        &coin,
+                        &as_wallet,
+                        lamports,
+                        pump::apply_slippage_down(expected, 3000),
+                        rand::random(),
+                    ),
+                ];
+                (ixs, format!("pump curve · expected {} tokens", expected))
+            }
         }
         _ => {
             let pool_key = pda::canonical_pump_pool(&mint);
@@ -265,16 +286,26 @@ pub async fn simulate_buy(
             let fee = g.lp_fee_basis_points
                 + g.protocol_fee_basis_points
                 + g.coin_creator_fee_basis_points;
-            let expected = pump_amm::buy_base_for_quote(amt(&accs[0]), qr, lamports, fee);
-            (
-                pump_amm::buy_instructions(
-                    &coin,
-                    &as_wallet,
-                    pump::apply_slippage_down(expected, 3000),
-                    lamports,
-                ),
-                format!("PumpSwap pool {pool_key} · expected {expected} tokens"),
-            )
+            if sell {
+                let out = pump_amm::sell_quote_for_base(amt(&accs[0]), qr, held, fee);
+                (
+                    pump_amm::sell_instructions(&coin, &as_wallet, held, 1),
+                    format!(
+                        "PumpSwap pool {pool_key} SELL {held} tokens · expected {out} lamports"
+                    ),
+                )
+            } else {
+                let expected = pump_amm::buy_base_for_quote(amt(&accs[0]), qr, lamports, fee);
+                (
+                    pump_amm::buy_instructions(
+                        &coin,
+                        &as_wallet,
+                        pump::apply_slippage_down(expected, 3000),
+                        lamports,
+                    ),
+                    format!("PumpSwap pool {pool_key} · expected {expected} tokens"),
+                )
+            }
         }
     };
     let (bh, _) = rpc.latest_blockhash("processed").await?;
@@ -286,7 +317,10 @@ pub async fn simulate_buy(
     }
     println!("compute units: {:?}", sim.units_consumed);
     match &sim.err {
-        None => println!("\nSIMULATION OK — the live program accepted our buy instruction"),
+        None => println!(
+            "\nSIMULATION OK — the live program accepted our {} instruction",
+            if sell { "sell" } else { "buy" }
+        ),
         Some(e) => println!("\nSIMULATION FAILED: {e}"),
     }
     Ok(sim.err.is_none())
@@ -1128,6 +1162,93 @@ async fn check_nonces(cfg: &BotConfig, rpc: &Rpc, wallet: &Pubkey) -> bool {
         );
     }
     ok
+}
+
+// ------------------------------------------------------------------ live decoder audit
+
+/// Decode recent real transactions of a program and cross-check every decoded
+/// swap against the trader's actual SOL balance change.
+pub async fn audit(cfg: &BotConfig, program: &str, limit: usize) -> anyhow::Result<bool> {
+    let rpc = Rpc::new(cfg.rpc_url()?);
+    let prog: Pubkey = match program {
+        "pump" => PUMP_PROGRAM,
+        "pumpswap" => PUMP_AMM_PROGRAM,
+        "dbc" => chain::meteora_dbc::DBC_PROGRAM,
+        "launchlab" => chain::raydium_launchlab::LAUNCHLAB_PROGRAM,
+        other => other.parse()?,
+    };
+    let sigs: Vec<String> = rpc
+        .signatures_for_address(&prog, limit, None)
+        .await?
+        .into_iter()
+        .filter(|v| v["err"].is_null())
+        .filter_map(|v| v["signature"].as_str().map(String::from))
+        .collect();
+    let (mut txs, mut swaps, mut templated, mut agree, mut checked) = (0, 0, 0, 0, 0);
+    for s in &sigs {
+        let v = match rpc.transaction_json(s).await {
+            Ok(v) if !v.is_null() => v,
+            _ => continue,
+        };
+        let Ok(tx) = ChainTx::from_rpc_json(&v) else {
+            continue;
+        };
+        txs += 1;
+        for sw in detect::all_swaps(&tx) {
+            swaps += 1;
+            let tpl = match &sw.template {
+                chain::detect::Template::Curve { .. } => "curve",
+                chain::detect::Template::Amm { .. } => "pumpswap",
+                chain::detect::Template::Dbc { .. } => "dbc",
+                chain::detect::Template::LaunchLab { .. } => "launchlab",
+                chain::detect::Template::Generic => "generic",
+            };
+            if tpl != "generic" {
+                templated += 1;
+            } else if sw.venue != engine_core::types::Venue::Other {
+                eprintln!("NO-TEMPLATE {s}");
+            }
+            // cross-check exact (event) amounts with the wallet's balance delta
+            let bal = detect::balance_swaps(&tx, &sw.wallet)
+                .into_iter()
+                .find(|b| b.mint == sw.mint);
+            let verdict = match &bal {
+                Some(b) if sw.exact => {
+                    checked += 1;
+                    let rel = (b.sol_amount as f64 - sw.sol_amount as f64).abs()
+                        / (sw.sol_amount.max(1) as f64);
+                    let side_ok = b.side == sw.side;
+                    // balance delta includes fees, tips and ATA rent: allow 15% or 0.01 SOL
+                    let ok = side_ok
+                        && (rel < 0.15 || b.sol_amount.abs_diff(sw.sol_amount) < 10_000_000);
+                    if ok {
+                        agree += 1;
+                    }
+                    if ok {
+                        "✓".to_string()
+                    } else {
+                        format!("✗ balance says {:?} {} lamports", b.side, b.sol_amount)
+                    }
+                }
+                _ => "-".into(),
+            };
+            println!(
+                "{} {:<4} {:>12.6} SOL {:>18} tok  px {:.3e}  {:<10} {:<16?} wallet {} mint {} {}",
+                &s[..8],
+                format!("{:?}", sw.side),
+                engine_core::types::lamports_to_sol(sw.sol_amount),
+                sw.token_amount,
+                sw.price_sol,
+                tpl,
+                sw.venue,
+                &sw.wallet.to_string()[..6],
+                &sw.mint.to_string()[..6],
+                verdict
+            );
+        }
+    }
+    println!("\n{txs} transactions · {swaps} swaps decoded · {templated} with an execution template · {agree}/{checked} event amounts agree with balance changes");
+    Ok(checked == 0 || agree == checked)
 }
 
 #[cfg(test)]
