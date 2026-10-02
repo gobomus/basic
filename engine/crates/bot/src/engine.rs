@@ -51,6 +51,21 @@ fn market_cap_sol(venue: Venue, price_sol: f64) -> Option<f64> {
         .filter(|m| *m > 0.0)
 }
 
+/// Price impact of selling `size_sol` into the coin's pool, in basis points of a
+/// constant-product pool (`size / (depth + size)`), kept within 1..300. The depth is
+/// the quote reserve the price is built on (a curve's virtual reserve counts).
+fn sale_impact_bps(t: Option<&Template>, entry_pool_sol: Option<f64>, size_sol: f64) -> f64 {
+    let depth = match t {
+        Some(Template::Curve { state, .. }) => lamports_to_sol(state.virtual_quote_reserves),
+        Some(Template::Amm { quote_reserve, .. }) => *quote_reserve as f64 / 1e9,
+        _ => entry_pool_sol.unwrap_or(0.0),
+    };
+    if depth <= 0.0 {
+        return 50.0; // depth unknown: a flat allowance
+    }
+    (size_sol / (depth + size_sol) * 10_000.0).clamp(1.0, 300.0)
+}
+
 /// Tokens received for spending `lamports` against `t` (fees included).
 fn quote_buy(t: &Template, lamports: u64, price: f64, decimals: u8) -> u64 {
     match t {
@@ -1889,17 +1904,21 @@ impl Engine {
             return;
         };
         let size = lamports_to_sol(p.cost_lamports);
-        let fee_bps = match self.tokens.get(&mint).map(|t| &t.template) {
+        let template = self.tokens.get(&mint).map(|t| &t.template);
+        let fee_bps = match template {
             Some(Template::Curve { fee_bps, .. })
             | Some(Template::Amm { fee_bps, .. })
             | Some(Template::Dbc { fee_bps, .. })
             | Some(Template::LaunchLab { fee_bps, .. }) => *fee_bps as f64,
             _ => 100.0,
         };
+        // sales are costed like the paper trader fills them: the venue fee, the price
+        // impact of this size, and the same landing delay after the decision
         let cost = CostModel {
             fee_bps,
-            slippage_bps: 50.0,
+            slippage_bps: sale_impact_bps(template, p.entry_pool_sol, size),
             fixed_sol_per_tx: lamports_to_sol(self.fixed_fee_lamports(true)),
+            exit_latency_ms: self.cfg.infra.paper.latency_ms as i64,
         };
         let mut names = vec![p.policy_name.clone()];
         names.extend(self.cfg.engine.shadow_exits.iter().cloned());
@@ -2275,6 +2294,52 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn sale_impact_follows_pool_depth() {
+        let curve = |vq: u64| Template::Curve {
+            coin: chain::pump::CurveCoin::sol_paired(
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                TOKEN_PROGRAM,
+                false,
+            ),
+            state: chain::pump::CurveState {
+                virtual_token_reserves: 1,
+                virtual_quote_reserves: vq,
+                real_token_reserves: 1,
+                real_quote_reserves: 1,
+            },
+            fee_bps: 125,
+        };
+        // 0.25 SOL into a curve with 33 SOL virtual depth: 0.25 / 33.25 = 75 bps
+        let thin = sale_impact_bps(Some(&curve(33_000_000_000)), Some(3.0), 0.25);
+        assert!((thin - 75.19).abs() < 0.1, "{thin}");
+        // the same size in a 28,000 SOL pool is negligible: floored at 1 bp
+        let deep = Template::Amm {
+            coin: chain::pump_amm::AmmCoin {
+                pool: Pubkey::new_unique(),
+                base_mint: Pubkey::new_unique(),
+                quote_mint: chain::consts::WSOL_MINT,
+                pool_base_token_account: Pubkey::new_unique(),
+                pool_quote_token_account: Pubkey::new_unique(),
+                base_token_program: TOKEN_PROGRAM,
+                quote_token_program: TOKEN_PROGRAM,
+                coin_creator: Pubkey::new_unique(),
+                is_mayhem_mode: false,
+                is_cashback_coin: false,
+                protocol_fee_recipient: Pubkey::new_unique(),
+                buyback_fee_recipient: Pubkey::new_unique(),
+            },
+            base_reserve: 1,
+            quote_reserve: 28_000_000_000_000,
+            fee_bps: 30,
+        };
+        assert_eq!(sale_impact_bps(Some(&deep), None, 0.25), 1.0);
+        // unknown depth: the flat allowance; a tiny pool is capped
+        assert_eq!(sale_impact_bps(None, None, 0.25), 50.0);
+        assert_eq!(sale_impact_bps(None, Some(0.1), 0.25), 300.0);
     }
 
     #[tokio::test]

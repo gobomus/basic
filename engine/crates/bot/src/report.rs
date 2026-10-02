@@ -141,6 +141,8 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     let (mut slip_bps, mut latency): (Vec<f64>, Vec<f64>) = (vec![], vec![]);
     let mut shadows: BTreeMap<String, Agg> = BTreeMap::new();
     let mut shadow_positions = 0usize;
+    // per position: the live policy's replay minus what really happened (return, fraction)
+    let mut replay_gap: Vec<f64> = vec![];
     let mut live_policy_pnl: BTreeMap<String, Agg> = BTreeMap::new();
     let mut feed_drops = 0usize;
     let (mut first, mut last) = (i64::MAX, 0i64);
@@ -218,6 +220,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
             "position_close" => {
                 shadow_positions += 1;
                 let size = r["cost_lamports"].as_f64().unwrap_or(0.0) / 1e9;
+                let real = r["realized_pnl_sol"].as_f64().filter(|_| size > 0.0);
                 for s in r["shadows"].as_array().into_iter().flatten() {
                     if let Some(name) = s["policy"].as_str() {
                         let pnl = s["pnl_sol"].as_f64().unwrap_or(0.0);
@@ -226,6 +229,10 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                                 .as_f64()
                                 .unwrap_or(if size > 0.0 { pnl / size } else { 0.0 });
                         shadows.entry(name.to_string()).or_default().add(pnl, ret);
+                        if let (Some(real), true) = (real, r["exit_policy"].as_str() == Some(name))
+                        {
+                            replay_gap.push(ret - real / size);
+                        }
                     }
                 }
             }
@@ -454,6 +461,18 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
             o,
             "  (scored when positions are finalised: after [infra.paper] afterlife_secs, or at `stop`)"
         )?;
+        if let Some(g) = median(&replay_gap) {
+            writeln!(
+                o,
+                "  replay check: for the policy actually used, the replay differs from the real result by a median of {:+.1} points per trade{}",
+                g * 100.0,
+                if g.abs() > 0.02 {
+                    " (large: trust the ranking, not the absolute numbers)"
+                } else {
+                    ""
+                }
+            )?;
+        }
     }
 
     // ---- verdict
@@ -545,7 +564,7 @@ mod tests {
             json!({"kind":"fill","ts":1_300,"side":"buy","simulated":true,"slippage_bps":120.0,"latency_ms":1000}),
             json!({"kind":"fill","ts":1_310,"side":"buy","simulated":true,"failed":"slippage"}),
             json!({"kind":"position_exit","ts":2_000,"mint":"M1","leader":"LEADERaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pnl_sol":0.02,"ret":0.2,"held_ms":120000,"max_mult":1.5,"exit_reason":"TakeProfit"}),
-            json!({"kind":"position_close","ts":3_000,"mint":"M1","cost_lamports":100_000_000u64,"shadows":[
+            json!({"kind":"position_close","ts":3_000,"mint":"M1","cost_lamports":100_000_000u64,"exit_policy":"fast_scalp","realized_pnl_sol":0.017,"shadows":[
                 {"policy":"fast_scalp","pnl_sol":0.02,"ret":0.2},{"policy":"moonbag","pnl_sol":-0.05,"ret":-0.5}]}),
         ];
         write(dir.path(), &recs);
@@ -568,6 +587,11 @@ mod tests {
         // the better alternative is listed first
         let alt = out.split("ALTERNATIVE EXITS").nth(1).unwrap();
         assert!(alt.find("fast_scalp").unwrap() < alt.find("moonbag").unwrap());
+        // the replay scored 20.0%, reality 17.0%: a gap of +3.0 points, flagged as large
+        assert!(
+            alt.contains("median of +3.0 points per trade (large"),
+            "{alt}"
+        );
 
         // 40 losing trades: not profitable
         recs.clear();

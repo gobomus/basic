@@ -13,22 +13,41 @@ use crate::stats::{mean, median, profit_factor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostModel {
-    /// Venue + platform fee per side, in basis points (e.g. 125 on the Pump curve).
+    /// Venue + platform fee on a sale, in basis points (e.g. 125 on the Pump curve).
     pub fee_bps: f64,
-    /// Assumed slippage per side, in basis points, on top of the observed price.
+    /// Assumed price impact of a sale, in basis points, below the observed price.
     pub slippage_bps: f64,
     /// Priority fee + tip per transaction, in SOL.
     pub fixed_sol_per_tx: f64,
+    /// Time from the exit decision to the sale landing; it executes at the price
+    /// the path shows then. Zero sells at the decision price.
+    pub exit_latency_ms: i64,
 }
 
 impl CostModel {
-    fn haircut(&self) -> f64 {
+    fn sell_haircut(&self) -> f64 {
         1.0 - (self.fee_bps + self.slippage_bps) / 10_000.0
     }
 }
 
+/// Latest price on the path at or before `t_ms`, looking forward from event `from`.
+fn price_at(events: &[MarketEvent], from: usize, t_ms: i64, fallback: f64) -> f64 {
+    let mut px = fallback;
+    for ev in &events[from..] {
+        if ev.t_ms() > t_ms {
+            break;
+        }
+        if let MarketEvent::Price { price, .. } = ev {
+            px = *price;
+        }
+    }
+    px
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathInput<'a> {
+    /// What was actually paid per token: the average fill price, fees and price
+    /// impact included, so the buy needs no further cost here.
     pub entry_price: f64,
     pub entry_t_ms: i64,
     pub entry_pool_sol: Option<f64>,
@@ -55,15 +74,16 @@ pub fn replay(policy: &ExitPolicy, input: &PathInput, cost: &CostModel) -> Repla
         input.entry_t_ms,
         input.entry_pool_sol,
     );
-    let tokens = input.size_sol * cost.haircut() / input.entry_price;
+    let tokens = input.size_sol / input.entry_price;
     let mut cash = -input.size_sol - cost.fixed_sol_per_tx;
     let mut exits = Vec::new();
     let mut last_t = input.entry_t_ms;
 
-    for ev in input.events {
+    for (i, ev) in input.events.iter().enumerate() {
         last_t = ev.t_ms();
         for a in policy.on_event(&mut st, ev) {
-            cash += tokens * a.sell_fraction * a.ref_price * cost.haircut() - cost.fixed_sol_per_tx;
+            let px = price_at(input.events, i, a.t_ms + cost.exit_latency_ms, a.ref_price);
+            cash += tokens * a.sell_fraction * px * cost.sell_haircut() - cost.fixed_sol_per_tx;
             exits.push(a);
         }
         if st.is_closed() {
@@ -73,7 +93,8 @@ pub fn replay(policy: &ExitPolicy, input: &PathInput, cost: &CostModel) -> Repla
 
     let fully_closed = st.is_closed();
     if !fully_closed {
-        cash += tokens * st.remaining * st.last_price * cost.haircut() - cost.fixed_sol_per_tx;
+        // the path ended with tokens held: mark them out at the last price
+        cash += tokens * st.remaining * st.last_price * cost.sell_haircut() - cost.fixed_sol_per_tx;
     }
     let held_ms = exits.last().map_or(last_t, |a| a.t_ms) - input.entry_t_ms;
     ReplayResult {
@@ -129,6 +150,7 @@ mod tests {
         fee_bps: 0.0,
         slippage_bps: 0.0,
         fixed_sol_per_tx: 0.0,
+        exit_latency_ms: 0,
     };
 
     fn path() -> Vec<MarketEvent> {
@@ -189,10 +211,65 @@ mod tests {
             fee_bps: 100.0,
             slippage_bps: 0.0,
             fixed_sol_per_tx: 0.001,
+            exit_latency_ms: 0,
         };
         let r = replay(&hold, &input, &cost);
-        let expected = 0.99 * 0.5 * 0.99 - 1.0 - 0.002;
+        // the entry price already holds the buy's costs: only the sale is charged
+        let expected = 0.5 * 0.99 - 1.0 - 0.002;
         assert!((r.pnl_sol - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_sale_lands_at_the_price_after_the_latency_not_the_trigger_price() {
+        // price: 1.5 @1s, 2.2 @2s, 3.0 @3s, 2.0 @4s, 0.5 @5s (see `path`)
+        let tp = ExitPolicy {
+            take_profit: vec![TpLevel {
+                at_multiple: 2.0,
+                sell_fraction: 1.0,
+            }],
+            ..Default::default()
+        };
+        let ev = path();
+        let input = PathInput {
+            entry_price: 1.0,
+            entry_t_ms: 0,
+            entry_pool_sol: None,
+            size_sol: 1.0,
+            events: &ev,
+        };
+        // triggers at 2.2 (t = 2 s)
+        let instant = replay(&tp, &input, &FREE);
+        assert!((instant.pnl_sol - 1.2).abs() < 1e-9);
+        // lands 1 s later, when the path shows 3.0
+        let later = replay(
+            &tp,
+            &input,
+            &CostModel {
+                exit_latency_ms: 1000,
+                ..FREE
+            },
+        );
+        assert!((later.pnl_sol - 2.0).abs() < 1e-9);
+        // lands 2.5 s later: still the latest price at that moment (2.0 @ 4 s)
+        let slow = replay(
+            &tp,
+            &input,
+            &CostModel {
+                exit_latency_ms: 2500,
+                ..FREE
+            },
+        );
+        assert!((slow.pnl_sol - 1.0).abs() < 1e-9);
+        // after the path ends the last known price is used
+        let beyond = replay(
+            &tp,
+            &input,
+            &CostModel {
+                exit_latency_ms: 60_000,
+                ..FREE
+            },
+        );
+        assert!((beyond.pnl_sol - (0.5 - 1.0)).abs() < 1e-9);
     }
 
     #[test]
