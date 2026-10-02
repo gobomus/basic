@@ -75,7 +75,7 @@ impl Rpc {
             tracing::trace!(method, ms = t.elapsed().as_millis() as u64, "rpc");
             if let Some(e) = resp.get("error") {
                 // rate limited (public / shared RPCs): back off and retry a few times
-                if e["code"].as_i64() == Some(429) && attempt < max_retries {
+                if is_rate_limited(e) && attempt < max_retries {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(400 * 2u64.pow(attempt))).await;
                     continue;
@@ -308,4 +308,35 @@ fn parse_account(v: &Value) -> anyhow::Result<Option<AccountData>> {
         lamports: v["lamports"].as_u64().unwrap_or(0),
         data: base64::engine::general_purpose::STANDARD.decode(data_b64)?,
     }))
+}
+
+/// JSON-RPC error that means "slow down": HTTP-style 429, the -32005 limit code
+/// some providers use, or a message saying so.
+fn is_rate_limited(e: &Value) -> bool {
+    if matches!(e["code"].as_i64(), Some(429) | Some(-32005)) {
+        return true;
+    }
+    let m = e["message"].as_str().unwrap_or_default().to_lowercase();
+    m.contains("rate limit") || m.contains("too many requests")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_rate_limit_errors_from_different_providers() {
+        assert!(is_rate_limited(
+            &json!({"code": 429, "message": "Too many requests for a specific RPC call"})
+        ));
+        assert!(is_rate_limited(
+            &json!({"code": -32005, "message": "Rate limit exceeded. To obtain higher limits..."})
+        ));
+        assert!(is_rate_limited(
+            &json!({"code": -32000, "message": "rate limit reached"})
+        ));
+        assert!(!is_rate_limited(
+            &json!({"code": -32602, "message": "Invalid params"})
+        ));
+    }
 }

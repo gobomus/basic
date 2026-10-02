@@ -235,9 +235,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Cmd::LeaderReport { addresses, limit } => {
                     let mut rows = vec![];
-                    for address in &addresses {
-                        rows.push(tools::leader_report(&cfg, address.parse()?, limit).await?);
-                        tools::gmgn_wallet(&cfg, address).await?;
+                    for (i, address) in addresses.iter().enumerate() {
+                        if i > 0 {
+                            // a free RPC counts calls over a window: give it a breather between wallets
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        }
+                        match tools::leader_report(&cfg, address.parse()?, limit).await {
+                            Ok(row) => rows.push(row),
+                            Err(e) => eprintln!("wallet {address}: could not be vetted: {e}"),
+                        }
+                        let _ = tools::gmgn_wallet(&cfg, address).await;
                     }
                     if rows.len() > 1 {
                         tools::print_wallet_table(&rows);
