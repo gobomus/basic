@@ -1,0 +1,92 @@
+name: paper-run
+# Free, no-server proof of concept: follow your chosen wallets on live Solana
+# for a few hours in PAPER mode (no money, no keys) and report what copying
+# them would have earned after costs.
+#
+# How to use: Actions tab -> "paper-run" -> Run workflow -> paste 3-10 wallet
+# addresses -> Run. When it finishes, open the run: the summary has the report
+# for this run and for all earlier runs added together, and the full journal is
+# attached as a download. Repeat on different days: the evidence builds up.
+#
+# Optional repo secret RPC_URL: a free Helius / Alchemy / dRPC URL (the public
+# Solana endpoint is used if you do not set one).
+on:
+  workflow_dispatch:
+    inputs:
+      leaders:
+        description: "Leader wallet addresses to copy (comma or space separated)"
+        required: true
+      hours:
+        description: "How long to run, in hours (max 5.5)"
+        required: true
+        default: "5"
+      ref:
+        # lets this one file live on the default branch while the engine's code is on
+        # the development branch; once the code is merged, point this at the default branch
+        description: "Branch with the code to run (leave as it is)"
+        required: false
+        default: "claude/solana-copy-trading-bot-xlkuzm"
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      actions: read   # to fetch the journals of earlier runs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build
+        run: cargo build --release -p bot
+        working-directory: engine
+      - name: Write config from the wallets you entered
+        run: python3 scripts/make_poc_config.py config/copybot.toml "$LEADERS"
+        env:
+          LEADERS: ${{ inputs.leaders }}
+      - name: Preflight
+        run: ./engine/target/release/copybot check
+        env:
+          RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+      - name: Follow the wallets (paper)
+        run: |
+          mins=$(python3 -c "import os; print(int(min(float(os.environ['HOURS']), 5.5) * 60))")
+          ./engine/target/release/copybot run --minutes "$mins"
+        env:
+          HOURS: ${{ inputs.hours }}
+          RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+      - name: Add the journals of earlier runs
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/earlier
+          for id in $(gh run list --workflow paper-run.yml --status completed --limit 40 --json databaseId --jq '.[].databaseId'); do
+            [ "$id" = "${{ github.run_id }}" ] && continue
+            gh run download "$id" --name paper-journal --dir "data/earlier/$id" 2>/dev/null || true
+          done
+          echo "earlier runs found: $(ls data/earlier | wc -l)"
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo '## This run'; echo '```'
+            ./engine/target/release/copybot report 2>&1 || true
+            echo '```'
+            echo '## All runs so far (this one plus earlier ones)'; echo '```'
+            ./engine/target/release/copybot report --dir data 2>&1 || true
+            echo '```'
+          } | tee report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-journal
+          path: data/journal
+          retention-days: 90
