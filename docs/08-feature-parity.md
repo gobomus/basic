@@ -64,7 +64,7 @@ Known limits of the free feed: it sees a leader trade about 1-3 s after it lands
 | Feature | Status | Where |
 |---|---|---|
 | Pump.fun curve buy/sell (`buy_exact_quote_in_v2`, `sell_v2`) | 🟢 | `chain::pump`: official IDL + mainnet `simulateTransaction` accepted (buy 88.8k CU, sell 74.5k CU) |
-| PumpSwap buy/sell (incl. cashback, pool-v2, buyback accounts) | 🟢 | `chain::pump_amm`: official SDK + mainnet simulation accepted (buy 91.3k CU, sell 74.3k CU). Reversed (SOL-base) pools are detected and routed via Jupiter |
+| PumpSwap buy/sell (incl. cashback, pool-v2, buyback accounts) | 🟢 | `chain::pump_amm`: official SDK + mainnet simulation accepted. Buys use `buy_exact_quote_in` (spend the whole budget, fail below the slippage floor; 112-124k CU), sells 74k CU. Reversed (SOL-base) pools are detected and routed via Jupiter |
 | Meteora DBC (Bags, Jupiter Studio, Believe…) direct | 🟢 detect / 🔶 send | `chain::meteora_dbc`: IDL from Meteora's SDK; real mainnet trades decoded into a direct template |
 | Raydium LaunchLab (LetsBONK) direct | 🟢 detect / 🔶 send | `chain::raydium_launchlab`: IDL + Raydium SDK v2; all 18 accounts match live mainnet instructions |
 | Other venues (Raydium AMM/CPMM/CLMM, Meteora DAMM/DLMM, Orca) | 🟢 | detected for any venue from balance changes; executed through Jupiter (`/swap/v1`, v0 tx simulated on mainnet) |

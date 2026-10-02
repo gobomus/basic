@@ -1093,7 +1093,9 @@ impl Engine {
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
                 let fresh = fetch_fresh(&rpc, &tpl, decimals).await;
-                let reaction_ms = ChainTx::now_ns().saturating_sub(observed_ns) / 1_000_000;
+                // our own processing time: the simulated landing delay is not part of it
+                let reaction_ms = (ChainTx::now_ns().saturating_sub(observed_ns) / 1_000_000)
+                    .saturating_sub(delay.as_millis() as u64);
                 let _ = results
                     .send(OrderResult::PaperBuy {
                         mint,

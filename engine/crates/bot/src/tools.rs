@@ -337,8 +337,8 @@ pub async fn simulate_buy(
                     pump_amm::buy_instructions(
                         &coin,
                         &as_wallet,
-                        pump::apply_slippage_down(expected, 3000),
                         lamports,
+                        pump::apply_slippage_down(expected, 3000),
                     ),
                     format!("PumpSwap pool {pool_key} · expected {expected} tokens"),
                 )
@@ -365,7 +365,47 @@ pub async fn simulate_buy(
 
 // ------------------------------------------------------------------ leader report
 
-pub async fn leader_report(cfg: &BotConfig, wallet: Pubkey, limit: usize) -> anyhow::Result<()> {
+/// One wallet's headline numbers, for the side-by-side table.
+pub struct WalletSummary {
+    pub wallet: Pubkey,
+    pub swaps: usize,
+    pub round_trips: usize,
+    pub pnl_sol: f64,
+    pub win_rate: f64,
+    pub median_hold_secs: f64,
+    pub candidate: bool,
+}
+
+/// Side-by-side comparison of several vetted wallets.
+pub fn print_wallet_table(rows: &[WalletSummary]) {
+    println!("\nCOMPARISON");
+    println!(
+        "  {:<46} {:>6} {:>6} {:>10} {:>6} {:>9}  verdict",
+        "wallet", "swaps", "trips", "PnL SOL", "win%", "hold s"
+    );
+    for r in rows {
+        println!(
+            "  {:<46} {:>6} {:>6} {:>+10.3} {:>5.0}% {:>9.0}  {}",
+            r.wallet.to_string(),
+            r.swaps,
+            r.round_trips,
+            r.pnl_sol,
+            r.win_rate * 100.0,
+            r.median_hold_secs,
+            if r.candidate {
+                "candidate"
+            } else {
+                "reject / watch"
+            }
+        );
+    }
+}
+
+pub async fn leader_report(
+    cfg: &BotConfig,
+    wallet: Pubkey,
+    limit: usize,
+) -> anyhow::Result<WalletSummary> {
     let rpc = Rpc::new(cfg.rpc_url()?);
     let mut sigs = vec![];
     let mut before: Option<String> = None;
@@ -484,13 +524,21 @@ pub async fn leader_report(cfg: &BotConfig, wallet: Pubkey, limit: usize) -> any
     println!(
         "  verdict              {}",
         if flags.is_empty() {
-            "CANDIDATE → add with enabled=false, run shadow mode to measure copier returns"
+            "CANDIDATE → add it under [[leaders]] and run paper mode to measure what copying it earns"
                 .to_string()
         } else {
             format!("REJECT/WATCH: {}", flags.join("; "))
         }
     );
-    Ok(())
+    Ok(WalletSummary {
+        wallet,
+        swaps: swaps.len(),
+        round_trips: r.n,
+        pnl_sol: pnl,
+        win_rate: r.win_rate,
+        median_hold_secs: r.median_hold_secs,
+        candidate: flags.is_empty(),
+    })
 }
 
 // ------------------------------------------------------------------ wallet ops

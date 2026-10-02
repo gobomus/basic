@@ -245,7 +245,7 @@ fn pump_amm_builders_match_idl_and_sdk_remaining_accounts() {
             .iter()
             .find(|i| i.program_id == PUMP_AMM_PROGRAM)
             .unwrap();
-        check_ix_against_idl(swap, &a, "buy", &PUMP_AMM_PROGRAM, &extra);
+        check_ix_against_idl(swap, &a, "buy_exact_quote_in", &PUMP_AMM_PROGRAM, &extra);
         let rem = &swap.accounts[23..];
         let uva = pda::amm_user_volume_accumulator(&user);
         let mut expect = vec![];

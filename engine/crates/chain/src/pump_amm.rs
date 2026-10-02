@@ -463,16 +463,22 @@ fn swap_accounts(c: &AmmCoin, user: &Pubkey, is_buy: bool) -> Vec<AccountMeta> {
     a
 }
 
-/// Full instruction list for a buy: base ATA, WSOL wrap, `buy`, WSOL close.
+/// Full instruction list for a buy: base ATA, WSOL wrap, `buy_exact_quote_in`, WSOL close.
+///
+/// `buy_exact_quote_in` spends the whole `spendable_quote_in` budget (fees
+/// included) and fails if it would receive less than `min_base_amount_out`:
+/// the same contract as the curve's `buy_exact_quote_in_v2`. The plain `buy`
+/// asks for an exact token amount instead, so protecting a slippage floor with
+/// it would silently under-spend the position size.
 pub fn buy_instructions(
     c: &AmmCoin,
     user: &Pubkey,
-    base_amount_out: u64,
-    max_quote_amount_in: u64,
+    spendable_quote_in: u64,
+    min_base_amount_out: u64,
 ) -> Vec<Instruction> {
-    let mut data = ix_disc("buy").to_vec();
-    data.extend_from_slice(&base_amount_out.to_le_bytes());
-    data.extend_from_slice(&max_quote_amount_in.to_le_bytes());
+    let mut data = ix_disc("buy_exact_quote_in").to_vec();
+    data.extend_from_slice(&spendable_quote_in.to_le_bytes());
+    data.extend_from_slice(&min_base_amount_out.to_le_bytes());
     data.push(1); // OptionBool(track_volume = true), as the SDK passes { 0: true }
     let swap = Instruction {
         program_id: PUMP_AMM_PROGRAM,
@@ -486,7 +492,7 @@ pub fn buy_instructions(
         &c.base_mint,
         &c.base_token_program,
     )];
-    wrap_around(&mut out, c, user, max_quote_amount_in, swap);
+    wrap_around(&mut out, c, user, spendable_quote_in, swap);
     out
 }
 

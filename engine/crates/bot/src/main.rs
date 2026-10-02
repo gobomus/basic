@@ -72,9 +72,11 @@ enum Cmd {
         #[arg(long)]
         sell: bool,
     },
-    /// Analyse a wallet's on-chain trading history
+    /// Analyse one or more wallets' on-chain trading history (free; compares several side by side)
     LeaderReport {
-        address: String,
+        #[arg(required = true, num_args = 1..)]
+        addresses: Vec<String>,
+        /// Transactions to read per wallet (more = steadier verdict, slower on a free RPC)
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
@@ -231,9 +233,16 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                     std::process::exit(if ok { 0 } else { 1 });
                 }
-                Cmd::LeaderReport { address, limit } => {
-                    tools::leader_report(&cfg, address.parse()?, limit).await?;
-                    tools::gmgn_wallet(&cfg, &address).await
+                Cmd::LeaderReport { addresses, limit } => {
+                    let mut rows = vec![];
+                    for address in &addresses {
+                        rows.push(tools::leader_report(&cfg, address.parse()?, limit).await?);
+                        tools::gmgn_wallet(&cfg, address).await?;
+                    }
+                    if rows.len() > 1 {
+                        tools::print_wallet_table(&rows);
+                    }
+                    Ok(())
                 }
                 Cmd::Wallet {
                     cmd: WalletCmd::Balance,

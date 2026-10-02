@@ -165,9 +165,9 @@ accepts_jito_tip = false
 
 [infra.fees]
 # Measured on mainnet (simulateTransaction, Oct 2026), full tx incl. ATA/WSOL handling:
-# Pump curve buy 88.8k / sell 74.5k CU, PumpSwap buy 91.3k / sell 74.3k CU.
-# A tighter limit raises your priority per CU; these keep ~60% headroom.
-cu_limit_buy = 150000
+# Pump curve buy 88.8k / sell 74.5k CU, PumpSwap buy 112-124k / sell 74.3k CU.
+# A tighter limit raises your priority per CU; these keep headroom for pool variation.
+cu_limit_buy = 180000
 cu_limit_sell = 130000
 cu_price_micro_lamports = 300000     # priority fee
 tip_lamports_buy = 1000000           # 0.001 SOL

@@ -8,7 +8,7 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 
 > **Status: the free proof-of-concept path is operational; the paid live path is built and verified against mainnet.**
 > - **Path A, free (start here).** Paper mode on a standard RPC WebSocket feed: it follows your chosen leaders live and simulates every copy **as it would really have landed** (priced from the pool 1.2 s after detection, with the same slippage limit a real transaction has, every fee charged). `copybot report` then shows PnL after costs, by leader and by exit style, with a go / no-go checklist. Runs from GitHub Actions (nothing to install) or any computer: see [RUNBOOK.md](RUNBOOK.md).
-> - **Path B, paid, only after Path A shows an edge.** Yellowstone gRPC feed, multi-sender delivery, live trading, all checked against mainnet (the live programs accepted our Pump and PumpSwap buys and sells).
+> - **Path B, paid, only after Path A shows an edge.** Yellowstone gRPC feed, multi-sender delivery, live trading, all checked against mainnet (the live programs accepted our Pump and PumpSwap buys and sells, using 75-125k compute units).
 > - Regression tests run on real mainnet transactions and reproduce the programs' exact quotes, fees and pool balances. Live validation found and fixed a fee-model error (a buyback share had been added on top of the protocol fee), which is why every number is now checked against chain data.
 > - What is and isn't built: [docs/08-feature-parity.md](docs/08-feature-parity.md).
 

@@ -19,8 +19,9 @@ Paper mode follows your chosen wallets on live Solana and simulates every copy *
 ## A1. Pick leader wallets
 Candidates: GMGN smart-money / KOL lists, Axiom, KOLscan (copy 3-10 addresses). Then vet each one on-chain, free:
 ```bash
-copybot leader-report <WALLET>        # profit, win rate, hold time, bot check
+copybot leader-report <WALLET> [<WALLET> ...]    # profit, win rate, hold time, bot check; several wallets get a comparison table
 ```
+It reads the wallet's last `--limit` transactions (default 1000; use `--limit 150` for a quick look: a free RPC is slow, about 1-2 s per transaction).
 Rules of thumb for the free feed:
 - **1 to 60 swaps per hour is ideal.** A wallet doing hundreds of swaps an hour is a bot: it cannot be copied (you would only be its exit liquidity) and it floods a free RPC.
 - Skip wallets that flip tokens within seconds (the report flags them).
@@ -28,9 +29,9 @@ Rules of thumb for the free feed:
 
 ## A2. Run it: three ways
 
-**Way 1: GitHub Actions (nothing to install).** In the repository on GitHub: **Actions → paper-run → Run workflow**, paste the wallet addresses, choose hours (max 5.5), Run. When it finishes, open the run: the **summary page shows the report** and the full journal is attached as a download. Repeat on different days; every run is independent. Free for public repositories; private ones use your monthly free minutes. Optional: add a repository secret `RPC_URL` with a free key (below), otherwise the public Solana endpoint is used.
+**Way 1: GitHub Actions (nothing to install).** The workflow (`.github/workflows/paper-run.yml`) shows up in the Actions tab once it is on the repository's default branch (`master`). Then, in the repository on GitHub: **Actions → paper-run → Run workflow**, paste the wallet addresses, choose hours (max 5.5), Run. When it finishes, open the run: the **summary page shows the report** and the full journal is attached as a download. Repeat on different days; every run is independent. Free for public repositories; private ones use your monthly free minutes. Optional: add a repository secret `RPC_URL` with a free key (below), otherwise the public Solana endpoint is used.
 
-**Way 2: your own computer.** One-time install of Rust (<https://rustup.rs>), then:
+**Way 2: your own computer** (Linux or macOS; on Windows use WSL / Ubuntu). One-time install of Rust (<https://rustup.rs>), then:
 ```bash
 git clone https://github.com/gobomus/basic.git && cd basic
 git checkout claude/solana-copy-trading-bot-xlkuzm

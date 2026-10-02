@@ -178,12 +178,12 @@ impl Exec {
                 let expected =
                     pump_amm::buy_base_for_quote(*base_reserve, *quote_reserve, sol_in, *fee_bps);
                 anyhow::ensure!(expected > 0, "pool quote is zero");
-                // Ask for fewer tokens than quoted (slippage) and cap spend at sol_in.
-                let base_out = pump::apply_slippage_down(expected, slippage_bps);
+                // Spend exactly sol_in; fail if fewer tokens than the slippage floor come back.
+                let min_out = pump::apply_slippage_down(expected, slippage_bps);
                 Ok((
-                    pump_amm::buy_instructions(coin, &me, base_out, sol_in),
+                    pump_amm::buy_instructions(coin, &me, sol_in, min_out),
                     expected,
-                    base_out,
+                    min_out,
                 ))
             }
             Template::Dbc {

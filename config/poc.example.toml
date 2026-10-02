@@ -127,7 +127,7 @@ url = "https://api.mainnet-beta.solana.com"
 accepts_jito_tip = false
 
 [infra.fees]
-cu_limit_buy = 150000                # measured on mainnet: 75-91k compute units
+cu_limit_buy = 180000                # measured on mainnet: 75-125k compute units
 cu_limit_sell = 130000
 cu_price_micro_lamports = 100000     # priority fee: ~0.00002 SOL per transaction
 tip_lamports_buy = 0                 # no tips in the free POC
