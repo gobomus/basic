@@ -5,7 +5,8 @@ name: paper-run
 #
 # How to use: Actions tab -> "paper-run" -> Run workflow -> paste 3-10 wallet
 # addresses -> Run. When it finishes, open the run: the summary has the report
-# and the full journal is attached as a download. Repeat on different days.
+# for this run and for all earlier runs added together, and the full journal is
+# attached as a download. Repeat on different days: the evidence builds up.
 #
 # Optional repo secret RPC_URL: a free Helius / Alchemy / dRPC URL (the public
 # Solana endpoint is used if you do not set one).
@@ -24,6 +25,9 @@ jobs:
   paper:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    permissions:
+      contents: read
+      actions: read   # to fetch the journals of earlier runs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,11 +52,29 @@ jobs:
         env:
           HOURS: ${{ inputs.hours }}
           RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+      - name: Add the journals of earlier runs
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/earlier
+          for id in $(gh run list --workflow paper-run.yml --status completed --limit 40 --json databaseId --jq '.[].databaseId'); do
+            [ "$id" = "${{ github.run_id }}" ] && continue
+            gh run download "$id" --name paper-journal --dir "data/earlier/$id" 2>/dev/null || true
+          done
+          echo "earlier runs found: $(ls data/earlier | wc -l)"
       - name: Report
         if: always()
         run: |
-          ./engine/target/release/copybot report | tee report.txt
-          { echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '## This run'; echo '```'
+            ./engine/target/release/copybot report 2>&1 || true
+            echo '```'
+            echo '## All runs so far (this one plus earlier ones)'; echo '```'
+            ./engine/target/release/copybot report --dir data 2>&1 || true
+            echo '```'
+          } | tee report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Keep the journal
         if: always()
         uses: actions/upload-artifact@v4
