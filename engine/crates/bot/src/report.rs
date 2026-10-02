@@ -135,6 +135,7 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     let (mut signals, mut copies) = (0usize, 0usize);
     let mut skips: BTreeMap<String, usize> = BTreeMap::new();
     let mut slot_lags: Vec<f64> = vec![];
+    let mut decision_ms: Vec<f64> = vec![];
     let (mut fills_ok, mut fills_missed) = (0usize, 0usize);
     let (mut slip_bps, mut latency): (Vec<f64>, Vec<f64>) = (vec![], vec![]);
     let mut shadows: BTreeMap<String, Agg> = BTreeMap::new();
@@ -166,6 +167,9 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                 }
                 if let Some(l) = r["slot_lag"].as_f64() {
                     slot_lags.push(l);
+                }
+                if let Some(d) = r["decision_ms"].as_f64() {
+                    decision_ms.push(d);
                 }
             }
             "feed" if r["connected"] == false => feed_drops += 1,
@@ -255,6 +259,15 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         writeln!(
             o,
             "  data feed dropped {feed_drops} time(s): leader trades during those gaps were missed"
+        )?;
+    }
+    if let Some(m) = median(&decision_ms) {
+        let mut v = decision_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        let p90 = v[((v.len() - 1) as f64 * 0.9).round() as usize];
+        writeln!(
+            o,
+            "  our pipeline: first sign of the leader's trade to decision, median {m:.0} ms · p90 {p90:.0} ms (the number to cut when optimising latency)"
         )?;
     }
     if let Some(m) = median(&slot_lags) {

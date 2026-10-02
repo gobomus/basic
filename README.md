@@ -12,6 +12,16 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 > - Regression tests run on real mainnet transactions and reproduce the programs' exact quotes, fees and pool balances. Live validation found and fixed a fee-model error (a buyback share had been added on top of the protocol fee), which is why every number is now checked against chain data.
 > - What is and isn't built: [docs/08-feature-parity.md](docs/08-feature-parity.md).
 
+### Quick start (free, paper mode)
+```bash
+cd engine && cargo build --release -p bot && cd ..
+export RPC_URL=https://api.mainnet-beta.solana.com          # public and free
+cp config/poc.example.toml config/copybot.toml              # then add wallets under [[leaders]]
+./engine/target/release/copybot leader-report <WALLET> ...  # vet them on-chain first
+./engine/target/release/copybot check && ./engine/target/release/copybot run
+./engine/target/release/copybot report                      # PnL after costs + go / no-go checklist
+```
+
 ## Read first
 | Doc | What's in it |
 |---|---|

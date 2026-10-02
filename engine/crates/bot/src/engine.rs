@@ -244,6 +244,8 @@ struct Stats {
     failed: u64,
     reaction_ms: VecDeque<u64>,
     detect_lag_slots: VecDeque<u64>,
+    /// First sign of a leader trade (notification / stream arrival) to our decision, in ms.
+    decision_ms: VecDeque<u64>,
     skip_reasons: HashMap<String, u64>,
 }
 
@@ -766,6 +768,8 @@ impl Engine {
         self.stats.signals += 1;
         let lag = self.last_slot.saturating_sub(tx.slot);
         push_bounded(&mut self.stats.detect_lag_slots, lag);
+        let decision_ms = ChainTx::now_ns().saturating_sub(tx.observed_at_ns) / 1_000_000;
+        push_bounded(&mut self.stats.decision_ms, decision_ms);
         let lcfg = self.leaders[&s.wallet].clone();
         let tinfo = self.tokens.get(&s.mint).cloned();
         let entry = EntryContext {
@@ -847,7 +851,7 @@ impl Engine {
             "leader": s.wallet.to_string(), "label": lcfg.label, "signature": tx.signature, "slot": tx.slot,
             "tx_index": tx.tx_index, "mint": s.mint.to_string(), "venue": s.venue, "side": "buy",
             "leader_sol": s.sol_amount, "leader_price": s.price_sol, "source": format!("{:?}", tx.source).to_lowercase(),
-            "slot_lag": lag, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
+            "slot_lag": lag, "decision_ms": decision_ms, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
             "pool_sol": s.pool_sol, "exact": s.exact, "token_age_secs": entry.token_age_secs,
             "leader_sol_before": entry.leader_sol_before, "market_cap_sol": entry.market_cap_sol,
         });
@@ -2105,12 +2109,13 @@ impl Engine {
             Command::Status => {
                 let s = &self.stats;
                 format!(
-                    "mode {:?} · up {}m · {}\nsignals {} · copies {} · skips {} · sends {} · landed {} · failed {}\nreaction p50 {} ms / p90 {} ms · detect lag p50 {} / p90 {} slots\nopen {} · exposure {:.3} SOL · today {:+.4} SOL · balance {:.3} SOL\ntop skips: {}",
+                    "mode {:?} · up {}m · {}\nsignals {} · copies {} · skips {} · sends {} · landed {} · failed {}\nreaction p50 {} ms / p90 {} ms · to decision p50 {} / p90 {} ms · detect lag p50 {} / p90 {} slots\nopen {} · exposure {:.3} SOL · today {:+.4} SOL · balance {:.3} SOL\ntop skips: {}",
                     self.mode,
                     self.started.elapsed().as_secs() / 60,
                     if self.killed { "KILLED" } else if self.paused { "PAUSED" } else if self.feed_stale { "FEED STALE" } else { "running" },
                     s.signals, s.copies, s.skips, s.sends, s.landed, s.failed,
                     pctl(&s.reaction_ms, 0.5), pctl(&s.reaction_ms, 0.9),
+                    pctl(&s.decision_ms, 0.5), pctl(&s.decision_ms, 0.9),
                     pctl(&s.detect_lag_slots, 0.5), pctl(&s.detect_lag_slots, 0.9),
                     self.positions.len(),
                     lamports_to_sol(self.positions.values().map(|p| p.cost_lamports).sum()),

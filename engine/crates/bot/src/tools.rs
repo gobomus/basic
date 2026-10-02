@@ -518,10 +518,16 @@ pub async fn leader_report(
     if r.n < sc.min_trades {
         flags.push("too few round trips for a verdict".to_string());
     }
-    if r.median_hold_secs < sc.min_median_hold_secs {
+    let mut notes = vec![];
+    if r.median_hold_secs < 20.0 {
         flags.push(format!(
-            "median hold {:.0}s < {}s: likely uncopyable (you'd be exit liquidity)",
-            r.median_hold_secs, sc.min_median_hold_secs
+            "median hold {:.0}s: cannot be copied at any feed speed (you'd be exit liquidity)",
+            r.median_hold_secs
+        ));
+    } else if r.median_hold_secs < sc.min_median_hold_secs {
+        notes.push(format!(
+            "fast flipper (median hold {:.0}s): only a fast feed copies it well; paper mode measures what survives",
+            r.median_hold_secs
         ));
     }
     if r.active_hours_per_day > sc.max_active_hours_per_day {
@@ -533,8 +539,12 @@ pub async fn leader_report(
     println!(
         "  verdict              {}",
         if flags.is_empty() {
-            "CANDIDATE → add it under [[leaders]] and run paper mode to measure what copying it earns"
-                .to_string()
+            let mut v = "CANDIDATE → add it under [[leaders]] and run paper mode to measure what copying it earns"
+                .to_string();
+            for n in &notes {
+                v.push_str(&format!("; note: {n}"));
+            }
+            v
         } else {
             format!("REJECT/WATCH: {}", flags.join("; "))
         }

@@ -19,3 +19,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: paper-run config generator
+        working-directory: .
+        run: |
+          python3 scripts/make_poc_config.py /tmp/poc.toml "11111111111111111111111111111111 TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+          test "$(grep -c '^\[\[leaders\]\]' /tmp/poc.toml)" = "2"
+          ! python3 scripts/make_poc_config.py /tmp/bad.toml "not-an-address"

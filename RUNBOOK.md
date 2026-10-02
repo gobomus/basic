@@ -24,7 +24,7 @@ copybot leader-report <WALLET> [<WALLET> ...]    # profit, win rate, hold time, 
 It reads the wallet's last `--limit` transactions (default 1000; use `--limit 150` for a quick look: a free RPC is slow, about 1-2 s per transaction).
 Rules of thumb for the free feed:
 - **1 to 60 swaps per hour is ideal.** A wallet doing hundreds of swaps an hour is a bot: it cannot be copied (you would only be its exit liquidity) and it floods a free RPC.
-- Skip wallets that flip tokens within seconds (the report flags them).
+- Skip wallets whose median hold is under 20 s (the report rejects them: nothing can copy that). Holds of 20-120 s are "fast flippers": the report notes them as candidates, and paper mode measures what survives your feed's delay.
 - Prefer wallets that trade Pump.fun / PumpSwap coins; those are the venues the free feed can price.
 
 ## A2. Run it: three ways

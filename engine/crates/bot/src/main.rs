@@ -307,6 +307,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cfg: cfg::BotConfig, minutes: Option<u64>) -> anyhow::Result<()> {
+    let valid_leaders = cfg
+        .engine
+        .leaders
+        .iter()
+        .filter(|l| l.enabled && l.address.parse::<Pubkey>().is_ok())
+        .count();
+    anyhow::ensure!(
+        valid_leaders > 0,
+        "no leader wallets to follow: put real Solana addresses under [[leaders]] in the config \
+         (find them on GMGN / Axiom / KOLscan, vet them with `copybot leader-report <WALLET>`)"
+    );
     let live = cfg.engine.mode == RunMode::Live;
     let kp = match keystore::load(&cfg.infra.wallet.keystore, &cfg.infra.wallet.passphrase_env) {
         Ok(k) => Arc::new(k),
