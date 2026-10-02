@@ -46,6 +46,20 @@ impl Rpc {
     }
 
     pub async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.call_with(method, params, 4).await
+    }
+
+    /// One attempt, no rate-limit backoff: for callers that run their own retry schedule.
+    pub async fn call_once(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.call_with(method, params, 0).await
+    }
+
+    async fn call_with(
+        &self,
+        method: &str,
+        params: Value,
+        max_retries: u32,
+    ) -> anyhow::Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut attempt = 0u32;
         loop {
@@ -61,7 +75,7 @@ impl Rpc {
             tracing::trace!(method, ms = t.elapsed().as_millis() as u64, "rpc");
             if let Some(e) = resp.get("error") {
                 // rate limited (public / shared RPCs): back off and retry a few times
-                if e["code"].as_i64() == Some(429) && attempt < 4 {
+                if e["code"].as_i64() == Some(429) && attempt < max_retries {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(400 * 2u64.pow(attempt))).await;
                     continue;
@@ -113,19 +127,34 @@ impl Rpc {
     }
 
     pub async fn accounts(&self, pks: &[Pubkey]) -> anyhow::Result<Vec<Option<AccountData>>> {
-        let keys: Vec<String> = pks.iter().map(|p| p.to_string()).collect();
-        let v = self
-            .call(
-                "getMultipleAccounts",
-                json!([keys, {"encoding": "base64", "commitment": "processed"}]),
-            )
-            .await?;
-        v["value"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("bad getMultipleAccounts"))?
-            .iter()
-            .map(parse_account)
-            .collect()
+        Ok(self.accounts_at(pks).await?.1)
+    }
+
+    /// Like `accounts`, plus the slot the read was made at. Chunks of 100
+    /// (the RPC maximum) are fetched sequentially.
+    pub async fn accounts_at(
+        &self,
+        pks: &[Pubkey],
+    ) -> anyhow::Result<(u64, Vec<Option<AccountData>>)> {
+        let mut slot = 0;
+        let mut out = Vec::with_capacity(pks.len());
+        for chunk in pks.chunks(100) {
+            let keys: Vec<String> = chunk.iter().map(|p| p.to_string()).collect();
+            let v = self
+                .call(
+                    "getMultipleAccounts",
+                    json!([keys, {"encoding": "base64", "commitment": "processed"}]),
+                )
+                .await?;
+            slot = slot.max(v["context"]["slot"].as_u64().unwrap_or(0));
+            for a in v["value"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("bad getMultipleAccounts"))?
+            {
+                out.push(parse_account(a)?);
+            }
+        }
+        Ok((slot, out))
     }
 
     pub async fn send(&self, wire_b64: &str) -> anyhow::Result<String> {
@@ -236,6 +265,15 @@ impl Rpc {
 
     pub async fn transaction_json(&self, sig: &str) -> anyhow::Result<Value> {
         self.call(
+            "getTransaction",
+            json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}]),
+        )
+        .await
+    }
+
+    /// `transaction_json` without rate-limit backoff (the feed retries on its own schedule).
+    pub async fn transaction_json_once(&self, sig: &str) -> anyhow::Result<Value> {
+        self.call_once(
             "getTransaction",
             json!([sig, {"encoding": "json", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}]),
         )

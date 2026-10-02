@@ -44,25 +44,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Filters {
-    pub leaders: Vec<String>,
-    pub mints: Vec<String>,
-}
-
-#[derive(Debug)]
-pub enum FeedEvent {
-    Tx(Box<ChainTx>),
-    Slot {
-        slot: u64,
-        status: i32,
-    },
-    Status {
-        source: &'static str,
-        connected: bool,
-        detail: String,
-    },
-}
+pub use crate::feed::{FeedEvent, Filters};
 
 fn token(cfg: &GeyserConfig) -> Option<String> {
     cfg.x_token_env

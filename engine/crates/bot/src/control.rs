@@ -17,6 +17,8 @@ pub enum Command {
     Kill,
     Flatten,
     Leaders,
+    /// Stop gracefully: paper positions are marked out, alternative exits scored, journal flushed.
+    Stop,
     /// List the blacklist, or add / remove a token mint or dev wallet.
     Blacklist(Option<Pubkey>),
     Unblacklist(Pubkey),
@@ -46,12 +48,13 @@ impl Command {
             "kill" => Command::Kill,
             "flatten" => Command::Flatten,
             "leaders" => Command::Leaders,
+            "stop" => Command::Stop,
             _ => return None,
         })
     }
 }
 
-pub const HELP: &str = "commands: status | positions | leaders | pause | resume | kill | flatten | blacklist [<mint|dev>] | unblacklist <mint|dev>";
+pub const HELP: &str = "commands: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<mint|dev>] | unblacklist <mint|dev>";
 
 pub type Request = (Command, oneshot::Sender<String>);
 

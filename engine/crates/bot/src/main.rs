@@ -2,6 +2,7 @@
 //!
 //!   copybot check            preflight: RPC, wallet, senders, gRPC feed, latency
 //!   copybot run              start the engine (mode from config: shadow | paper | live)
+//!   copybot report           profit proof from the journal: PnL, leaders, exits, execution cost
 //!   copybot simulate         dry-run our real buy against mainnet (no keys, no funds)
 //!   copybot leader-report    score a wallet from its on-chain history
 //!   copybot discover         leader candidates from GMGN smart-money / KOL feeds
@@ -15,6 +16,7 @@ mod exec;
 mod gmgn;
 mod journal;
 mod keystore;
+mod report;
 mod tools;
 
 use std::sync::Arc;
@@ -52,7 +54,11 @@ enum Cmd {
     /// Preflight: verify every dependency and measure latency
     Check,
     /// Run the engine
-    Run,
+    Run {
+        /// Stop gracefully after this many minutes (scripted runs); Ctrl-C also stops gracefully
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
     /// Simulate our buy for a token against mainnet on behalf of any funded address
     Simulate {
         #[arg(long)]
@@ -72,8 +78,11 @@ enum Cmd {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
-    /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten
-    Ctl { command: String },
+    /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<address>] | unblacklist <address>
+    Ctl {
+        #[arg(trailing_var_arg = true, num_args = 1.., required = true)]
+        command: Vec<String>,
+    },
     /// Find leader candidates from GMGN's live smart-money / KOL feeds (needs GMGN_API_KEY)
     Discover {
         #[arg(long, default_value_t = 200)]
@@ -93,6 +102,15 @@ enum Cmd {
     Bench {
         #[arg(long, default_value_t = 10000)]
         iterations: u32,
+    },
+    /// Profit proof: results, leaders, exits and execution costs from the journal
+    Report {
+        /// Journal directory (default: [infra.storage] journal_dir from the config)
+        #[arg(long)]
+        dir: Option<String>,
+        /// Only the last N hours
+        #[arg(long)]
+        hours: Option<f64>,
     },
     /// Hot-wallet management
     Wallet {
@@ -185,6 +203,14 @@ async fn main() -> anyhow::Result<()> {
             tools::bench(iterations);
             Ok(())
         }
+        Cmd::Report { dir, hours } => {
+            let dir = match dir {
+                Some(d) => d,
+                None => cfg::BotConfig::load(&cli.config)?.infra.storage.journal_dir,
+            };
+            print!("{}", report::run(&dir, hours)?);
+            Ok(())
+        }
         cmd => {
             let cfg = cfg::BotConfig::load(&cli.config)?;
             match cmd {
@@ -249,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     tools::close_empty(&cfg, &kp).await
                 }
-                Cmd::Run => run(cfg).await,
+                Cmd::Run { minutes } => run(cfg, minutes).await,
                 Cmd::Discover { limit, top } => tools::discover(&cfg, limit, top).await,
                 Cmd::TokenIntel { mint } => tools::token_intel(&cfg, &mint).await,
                 Cmd::Audit { program, limit } => {
@@ -259,17 +285,17 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Ctl { command } => {
                     print!(
                         "{}",
-                        control::send(&cfg.infra.control_socket, &command).await?
+                        control::send(&cfg.infra.control_socket, &command.join(" ")).await?
                     );
                     Ok(())
                 }
-                Cmd::Wallet { .. } | Cmd::Bench { .. } => unreachable!(),
+                Cmd::Wallet { .. } | Cmd::Bench { .. } | Cmd::Report { .. } => unreachable!(),
             }
         }
     }
 }
 
-async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
+async fn run(cfg: cfg::BotConfig, minutes: Option<u64>) -> anyhow::Result<()> {
     let live = cfg.engine.mode == RunMode::Live;
     let kp = match keystore::load(&cfg.infra.wallet.keystore, &cfg.infra.wallet.passphrase_env) {
         Ok(k) => Arc::new(k),
@@ -334,7 +360,7 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
     .await?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    control::serve(&cfg.infra.control_socket, cmd_tx)?;
+    control::serve(&cfg.infra.control_socket, cmd_tx.clone())?;
     tracing::info!(
         "control socket: {} (use `copybot ctl status`)",
         cfg.infra.control_socket
@@ -352,7 +378,8 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
     });
 
     let (feed_tx, feed_rx) = mpsc::channel(200_000);
-    let (filters_tx, filters_rx) = watch::channel(chain::geyser::Filters::default());
+    let (filters_tx, filters_rx) = watch::channel(chain::feed::Filters::default());
+    let (watch_tx, watch_rx) = watch::channel(Vec::new());
     let (res_tx, res_rx) = mpsc::channel(10_000);
     let mut engine = engine::Engine::new(
         cfg.clone(),
@@ -380,25 +407,87 @@ async fn run(cfg: cfg::BotConfig) -> anyhow::Result<()> {
         }
     }
 
-    tokio::spawn(chain::geyser::run(
-        cfg.infra.geyser.clone(),
-        filters_rx.clone(),
-        feed_tx.clone(),
-    ));
-    if cfg.infra.geyser.deshred {
-        tokio::spawn(chain::geyser::run_deshred(
-            cfg.infra.geyser.clone(),
-            filters_rx,
-            feed_tx.clone(),
-        ));
+    if !live {
+        engine.set_rpc(rpc.clone());
+    }
+    match (&cfg.infra.geyser, &cfg.infra.ws) {
+        (Some(g), _) => {
+            tracing::info!("feed: Yellowstone gRPC {}", g.endpoint);
+            tokio::spawn(chain::geyser::run(
+                g.clone(),
+                filters_rx.clone(),
+                feed_tx.clone(),
+            ));
+            if g.deshred {
+                tokio::spawn(chain::geyser::run_deshred(
+                    g.clone(),
+                    filters_rx,
+                    feed_tx.clone(),
+                ));
+            }
+        }
+        (None, Some(w)) => {
+            tracing::info!("feed: free WebSocket + RPC (no paid streaming plan)");
+            engine.set_free_feed(watch_tx);
+            chain::wsfeed::spawn(
+                w.clone(),
+                rpc.clone(),
+                filters_rx,
+                watch_rx,
+                feed_tx.clone(),
+            );
+        }
+        (None, None) => anyhow::bail!("no data feed configured"),
     }
     drop(feed_tx);
 
+    if let Some(m) = minutes {
+        let tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(m * 60)).await;
+            let (r, _rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send((control::Command::Stop, r)).await;
+        });
+    }
+
+    let run = engine.run(feed_rx, res_rx, cmd_rx);
+    tokio::pin!(run);
     tokio::select! {
-        _ = engine.run(feed_rx, res_rx, cmd_rx) => {}
-        _ = tokio::signal::ctrl_c() => {
-            tracing::warn!("ctrl-c: stopping. Open positions are NOT sold automatically: run `copybot ctl flatten` first, or they are re-adopted on the next start.");
+        _ = &mut run => {}
+        _ = shutdown_signal() => {
+            tracing::warn!("stopping gracefully (signal again to force)");
+            let (r, _rx) = tokio::sync::oneshot::channel();
+            let _ = cmd_tx.send((control::Command::Stop, r)).await;
+            tokio::select! {
+                _ = &mut run => {}
+                _ = shutdown_signal() => {}
+            }
         }
     }
+    // let the journal writer drain
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from systemd / a container runtime.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

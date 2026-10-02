@@ -239,7 +239,8 @@ fn pumpswap_buy_rebuilds_identical_template() {
         let s = &detect::swaps_by(&tx, &leader)[0];
         assert_eq!(
             (s.venue, s.side, s.mint, s.sol_amount),
-            (Venue::PumpSwap, Side::Buy, coin.base_mint, 1_012_000_000)
+            // a buy's flow is `quote_amount_in`: everything the trader paid
+            (Venue::PumpSwap, Side::Buy, coin.base_mint, 1_000_000_000)
         );
         match &s.template {
             Template::Amm {
@@ -249,7 +250,8 @@ fn pumpswap_buy_rebuilds_identical_template() {
                 ..
             } => {
                 assert_eq!(c, &coin, "cashback={cashback}");
-                assert_eq!(*base_reserve, 900_000_000_000_000);
+                // the event carries pre-trade reserves; the template is post-trade
+                assert_eq!(*base_reserve, 900_000_000_000_000 - 5_000_000_000);
                 assert_eq!(*fee_bps, 20 + 93 + 30);
             }
             t => panic!("{t:?}"),

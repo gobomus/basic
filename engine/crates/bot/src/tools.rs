@@ -104,6 +104,10 @@ pub async fn check(cfg: &BotConfig) -> anyhow::Result<bool> {
                 Err(e) => line(false, "hot wallet balance", e),
             }
         }
+        Err(e) if cfg.engine.mode != engine_core::config::RunMode::Live => {
+            let _ = e;
+            line(true, "keystore", "not needed in paper / shadow mode");
+        }
         Err(e) => {
             line(false, "keystore", e);
             all_ok = false;
@@ -138,58 +142,7 @@ pub async fn check(cfg: &BotConfig) -> anyhow::Result<bool> {
         all_ok &= reachable;
     }
 
-    // Geyser: connect, then measure how many leader/firehose txs arrive in 10 s.
-    let (ftx, frx) = watch::channel(Filters {
-        leaders: cfg
-            .engine
-            .leaders
-            .iter()
-            .map(|l| l.address.clone())
-            .collect(),
-        mints: vec![],
-    });
-    let (tx, mut rx) = mpsc::channel(10_000);
-    let g = cfg.infra.geyser.clone();
-    let h = tokio::spawn(geyser::run(g, frx, tx));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let (mut txs, mut slots, mut connected, mut swaps) = (0u64, 0u64, false, 0u64);
-    let mut slot_seen_first: Option<Instant> = None;
-    let mut geyser_err: Option<String> = None;
-    while Instant::now() < deadline {
-        match tokio::time::timeout(deadline - Instant::now(), rx.recv()).await {
-            Ok(Some(FeedEvent::Status {
-                connected: c,
-                detail,
-                ..
-            })) => {
-                if !c && !connected && geyser_err.is_none() {
-                    geyser_err = Some(detail);
-                }
-                connected |= c;
-            }
-            Ok(Some(FeedEvent::Slot { .. })) => {
-                slots += 1;
-                slot_seen_first.get_or_insert_with(Instant::now);
-            }
-            Ok(Some(FeedEvent::Tx(t))) => {
-                txs += 1;
-                swaps += detect::all_swaps(&t).len() as u64;
-            }
-            _ => break,
-        }
-    }
-    h.abort();
-    drop(ftx);
-    let ok = connected && slots > 0;
-    if let (false, Some(e)) = (connected, &geyser_err) {
-        line(false, "geyser connect", e);
-    }
-    line(
-        ok,
-        "geyser stream",
-        format!("{slots} slot updates · {txs} txs · {swaps} decoded swaps in 10 s"),
-    );
-    all_ok &= ok;
+    all_ok &= check_feed(cfg).await;
 
     println!(
         "\n{}",
@@ -200,6 +153,90 @@ pub async fn check(cfg: &BotConfig) -> anyhow::Result<bool> {
         }
     );
     Ok(all_ok)
+}
+
+/// Connect the configured feed (paid gRPC, else the free WebSocket one) and
+/// count what arrives in 10 s.
+async fn check_feed(cfg: &BotConfig) -> bool {
+    let leaders: Vec<String> = cfg
+        .engine
+        .leaders
+        .iter()
+        .filter(|l| l.enabled)
+        .map(|l| l.address.clone())
+        .collect();
+    let (ftx, frx) = watch::channel(Filters {
+        leaders: leaders.clone(),
+        mints: vec![],
+    });
+    let (tx, mut rx) = mpsc::channel(10_000);
+    let (name, handles) = match (&cfg.infra.geyser, &cfg.infra.ws) {
+        (Some(g), _) => (
+            "geyser",
+            vec![tokio::spawn(geyser::run(g.clone(), frx, tx))],
+        ),
+        (None, Some(w)) => {
+            let rpc = match cfg.rpc_url() {
+                Ok(u) => Rpc::new(u),
+                Err(e) => {
+                    line(false, "free feed", e);
+                    return false;
+                }
+            };
+            let (_wtx, wrx) = watch::channel(Vec::new());
+            ("ws", chain::wsfeed::spawn(w.clone(), rpc, frx, wrx, tx))
+        }
+        _ => return false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut txs, mut slots, mut connected, mut swaps, mut subs) =
+        (0u64, 0u64, false, 0u64, 0usize);
+    let mut err: Option<String> = None;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(deadline - Instant::now(), rx.recv()).await {
+            Ok(Some(FeedEvent::Status {
+                connected: c,
+                detail,
+                ..
+            })) => {
+                if !c && !connected && err.is_none() {
+                    err = Some(detail.clone());
+                }
+                if c && detail.starts_with("subscribed") {
+                    subs += 1;
+                }
+                connected |= c;
+            }
+            Ok(Some(FeedEvent::Slot { .. })) => slots += 1,
+            Ok(Some(FeedEvent::Tx(t))) => {
+                txs += 1;
+                swaps += detect::all_swaps(&t).len() as u64;
+            }
+            Ok(Some(FeedEvent::State(_))) => {}
+            _ => break,
+        }
+    }
+    handles.iter().for_each(|h| h.abort());
+    drop(ftx);
+    let mut ok = connected && slots > 0;
+    if let (false, Some(e)) = (connected, &err) {
+        line(false, &format!("{name} connect"), e);
+    }
+    line(
+        ok,
+        &format!("{name} stream"),
+        format!("{slots} slot updates · {txs} txs · {swaps} decoded swaps in 10 s"),
+    );
+    if name == "ws" {
+        let sub_ok = subs >= leaders.len();
+        line(
+            sub_ok,
+            "leader subscriptions",
+            format!("{subs}/{} accepted by the RPC", leaders.len()),
+        );
+        ok &= sub_ok;
+    }
+    ok
 }
 
 // ------------------------------------------------------------------ simulate

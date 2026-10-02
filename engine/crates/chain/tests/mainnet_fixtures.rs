@@ -170,3 +170,140 @@ fn real_jupiter_v0_transaction_deserializes() {
         "round-trips byte for byte"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Quotes must reproduce what the live programs really did. These tests would
+// have caught a fee model that silently overstated costs (the buyback share
+// of the protocol fee had been added on top of it).
+
+use chain::pump::{self, CurveState, PumpEvent};
+use chain::pump_amm;
+
+fn amm_events(tx: &ChainTx) -> Vec<pump_amm::SwapEventData> {
+    tx.all_ixs()
+        .filter(|ix| ix.program == chain::consts::PUMP_AMM_PROGRAM)
+        .filter_map(|ix| pump_amm::decode_event_ix(&ix.data))
+        .collect()
+}
+
+#[test]
+fn curve_quotes_reproduce_real_trades() {
+    for f in ["pump_curve_0.json", "pump_curve_1.json"] {
+        let tx = load(f);
+        let mut checked = 0;
+        for ev in detect::pump_events(&tx) {
+            let PumpEvent::Trade(e) = ev else { continue };
+            let post = e.curve_state();
+            let net = e.sol_amount; // lamports the curve's reserves moved by
+            let fees = e.fee + e.creator_fee;
+            assert_eq!(
+                e.total_fee_bps(),
+                125,
+                "{f}: protocol 0.95% + creator 0.30%"
+            );
+            assert_eq!(fees * 10_000 / net, 125, "{f}: fees really are 1.25%");
+            if e.is_buy {
+                let pre = CurveState {
+                    virtual_quote_reserves: post.virtual_quote_reserves - net,
+                    virtual_token_reserves: post.virtual_token_reserves + e.token_amount,
+                    real_quote_reserves: post.real_quote_reserves - net,
+                    real_token_reserves: post.real_token_reserves + e.token_amount,
+                };
+                let got = pump::buy_tokens_for_quote(&pre, net + fees, e.total_fee_bps());
+                assert!(
+                    got.abs_diff(e.token_amount) <= e.token_amount / 1_000_000 + 2,
+                    "{f}: buy quote {got} vs real {}",
+                    e.token_amount
+                );
+            } else {
+                let pre = CurveState {
+                    virtual_quote_reserves: post.virtual_quote_reserves + net,
+                    virtual_token_reserves: post.virtual_token_reserves - e.token_amount,
+                    real_quote_reserves: post.real_quote_reserves + net,
+                    real_token_reserves: post.real_token_reserves - e.token_amount,
+                };
+                let got = pump::sell_quote_for_tokens(&pre, e.token_amount, e.total_fee_bps());
+                assert!(
+                    got.abs_diff(net - fees) <= 2,
+                    "{f}: sell quote {got} vs real {}",
+                    net - fees
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "{f}");
+    }
+}
+
+#[test]
+fn pumpswap_quotes_and_reserves_reproduce_real_trades() {
+    // a buy on a canonical pool, with buyback_fee_basis_points = 5000 in the event
+    let tx = load("pumpswap_0.json");
+    let e = amm_events(&tx)
+        .into_iter()
+        .find(|e| e.is_buy)
+        .expect("a BuyEvent");
+    assert_eq!(e.buyback_fee_basis_points, 5000);
+    assert_eq!(
+        e.total_fee_bps(),
+        20 + 5 + 95,
+        "lp + protocol + creator; buyback is inside protocol"
+    );
+    let got = pump_amm::buy_base_for_quote(
+        e.pool_base_token_reserves,
+        e.effective_quote_reserves(),
+        e.quote_amount,
+        e.total_fee_bps(),
+    );
+    assert!(
+        got.abs_diff(e.base_amount) <= e.base_amount / 1_000_000 + 2,
+        "buy quote {got} vs real {}",
+        e.base_amount
+    );
+    // the user's real SOL outflow is quote_amount_in (every fee included)
+    let i = tx.key_index(&tx.fee_payer().copied().unwrap()).unwrap();
+    let outflow = tx.pre_balances[i] - tx.post_balances[i] - tx.fee;
+    assert!(
+        outflow.abs_diff(e.user_flow()) < 10_000,
+        "outflow {outflow} vs event {}",
+        e.user_flow()
+    );
+    // reserves after the swap equal the pool vaults after the transaction
+    let (base_after, quote_after) = e.post_reserves();
+    let vault = |mint: &chain::solana_sdk::pubkey::Pubkey| {
+        tx.post_tokens
+            .iter()
+            .find(|b| b.owner == e.pool && b.mint == *mint)
+            .map(|b| b.amount)
+            .expect("pool vault")
+    };
+    let swaps = detect::all_swaps(&tx);
+    let mint = swaps
+        .iter()
+        .find(|s| s.venue == Venue::PumpSwap)
+        .unwrap()
+        .mint;
+    assert_eq!(base_after, vault(&mint));
+    assert_eq!(
+        quote_after as i128 - e.virtual_quote_reserves,
+        vault(&chain::consts::WSOL_MINT) as i128
+    );
+
+    // a sell (non-canonical pool, protocol fee split 50/50 with buyback)
+    let tx = load("pumpswap_reversed_pool.json");
+    let e = amm_events(&tx)
+        .into_iter()
+        .find(|e| !e.is_buy)
+        .expect("a SellEvent");
+    let got = pump_amm::sell_quote_for_base(
+        e.pool_base_token_reserves,
+        e.effective_quote_reserves(),
+        e.base_amount,
+        e.total_fee_bps(),
+    );
+    assert!(
+        got.abs_diff(e.user_quote_amount) <= 2,
+        "sell quote {got} vs real {}",
+        e.user_quote_amount
+    );
+}

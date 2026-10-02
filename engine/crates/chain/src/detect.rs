@@ -47,6 +47,29 @@ pub const DEX_PROGRAMS: [Pubkey; 11] = [
     JUPITER_V6,
 ];
 
+/// Every program whose swaps we recognise (base58), for cheap log pre-filtering.
+pub fn venue_program_ids() -> &'static [String] {
+    static IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        [
+            PUMP_PROGRAM,
+            PUMP_AMM_PROGRAM,
+            RAYDIUM_LAUNCHLAB,
+            METEORA_DBC,
+            METEORA_DAMM_V2,
+            METEORA_DLMM,
+            RAYDIUM_CPMM,
+            RAYDIUM_CLMM,
+            RAYDIUM_AMM_V4,
+            ORCA_WHIRLPOOL,
+            JUPITER_V6,
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect()
+    })
+}
+
 pub fn venue_of(tx: &ChainTx) -> Venue {
     let order = [
         (PUMP_PROGRAM, Venue::PumpFunCurve),
@@ -301,12 +324,12 @@ fn amm_swap(tx: &ChainTx, e: &SwapEventData) -> Option<DetectedSwap> {
         mint,
         side: if e.is_buy { Side::Buy } else { Side::Sell },
         venue: Venue::PumpSwap,
-        sol_amount: e.user_quote_amount,
+        sol_amount: e.user_flow(),
         token_amount: e.base_amount,
         token_decimals: dec,
         token_program: tp,
-        price_sol: e.price(dec, 9),
-        pool_sol: Some(e.effective_quote_reserves() as u64),
+        price_sol: e.post_price(dec, 9),
+        pool_sol: Some(e.post_reserves().1 as u64),
         fraction_sold: if e.is_buy {
             None
         } else {
@@ -314,8 +337,8 @@ fn amm_swap(tx: &ChainTx, e: &SwapEventData) -> Option<DetectedSwap> {
         },
         exact: true,
         template: Template::Amm {
-            base_reserve: e.pool_base_token_reserves,
-            quote_reserve: e.effective_quote_reserves(),
+            base_reserve: e.post_reserves().0,
+            quote_reserve: e.post_reserves().1,
             fee_bps: e.total_fee_bps(),
             coin,
         },

@@ -11,11 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chain::detect::{self, DetectedSwap, Template};
-use chain::geyser::{FeedEvent, Filters};
+use chain::feed::{FeedEvent, Filters, StateUpdate};
 use chain::model::ChainTx;
 use chain::pump::{self, PumpEvent};
 use chain::pump_amm;
+use chain::rpc::Rpc;
 use chain::solana_sdk::pubkey::Pubkey;
+use chain::state::{self, Watch};
 use engine_core::config::{LeaderConfig, RunMode, SizingConfig};
 use engine_core::exit::{ExitAction, ExitPolicy, ExitReason, MarketEvent, PositionState};
 use engine_core::replay::{self, CostModel, PathInput};
@@ -48,7 +50,65 @@ fn market_cap_sol(venue: Venue, price_sol: f64) -> Option<f64> {
         .then_some(price_sol * PUMP_SUPPLY)
         .filter(|m| *m > 0.0)
 }
-const AFTERLIFE_MS: i64 = 2 * 3600 * 1000;
+
+/// Tokens received for spending `lamports` against `t` (fees included).
+fn quote_buy(t: &Template, lamports: u64, price: f64, decimals: u8) -> u64 {
+    match t {
+        Template::Curve { state, fee_bps, .. } => {
+            pump::buy_tokens_for_quote(state, lamports, *fee_bps)
+        }
+        Template::Amm {
+            base_reserve,
+            quote_reserve,
+            fee_bps,
+            ..
+        } => pump_amm::buy_base_for_quote(*base_reserve, *quote_reserve, lamports, *fee_bps),
+        Template::Dbc {
+            price_raw, fee_bps, ..
+        }
+        | Template::LaunchLab {
+            price_raw, fee_bps, ..
+        } => chain::meteora_dbc::estimate_buy(*price_raw, lamports, *fee_bps),
+        Template::Generic => {
+            if price > 0.0 {
+                ((lamports_to_sol(lamports) / price) * 10f64.powi(decimals as i32)) as u64
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// Lamports received for selling `tokens` into `t` (fees included).
+fn quote_sell(t: &Template, tokens: u64, price: f64, decimals: u8) -> u64 {
+    match t {
+        Template::Curve { state, fee_bps, .. } => {
+            pump::sell_quote_for_tokens(state, tokens, *fee_bps)
+        }
+        Template::Amm {
+            base_reserve,
+            quote_reserve,
+            fee_bps,
+            ..
+        } => pump_amm::sell_quote_for_base(*base_reserve, *quote_reserve, tokens, *fee_bps),
+        Template::Dbc {
+            price_raw, fee_bps, ..
+        }
+        | Template::LaunchLab {
+            price_raw, fee_bps, ..
+        } => chain::meteora_dbc::estimate_sell(*price_raw, tokens, *fee_bps),
+        Template::Generic => sol_to_lamports(price * tokens as f64 / 10f64.powi(decimals as i32)),
+    }
+}
+
+/// The coin's pool as it is right now (None if unreadable or already migrated).
+async fn fetch_fresh(rpc: &Rpc, t: &Template, decimals: u8) -> Option<Template> {
+    let (_, mut v) = state::read(rpc, &[(t.clone(), decimals)]).await.ok()?;
+    v.pop()
+        .flatten()
+        .filter(|r| !r.complete)
+        .map(|r| r.template)
+}
 
 #[derive(Debug, Clone)]
 struct TokenInfo {
@@ -60,6 +120,8 @@ struct TokenInfo {
     decimals: u8,
     created_ms: Option<i64>,
     migrated: bool,
+    /// Slot of the freshest pool state applied (older transactions never overwrite newer state).
+    state_slot: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +203,24 @@ pub enum OrderResult {
         mint: Pubkey,
         amount: u64,
     },
+    /// Simulated buy reaching its landing time (`[infra.paper] latency_ms`).
+    PaperBuy {
+        mint: Pubkey,
+        lamports: u64,
+        /// Tokens quoted when the order was built.
+        expected: u64,
+        /// Slippage floor: below this the transaction would have failed.
+        min_out: u64,
+        fresh: Option<Box<Template>>,
+        reaction_ms: u64,
+    },
+    /// Simulated sell reaching its landing time.
+    PaperSell {
+        mint: Pubkey,
+        tokens: u64,
+        reason: String,
+        fresh: Option<Box<Template>>,
+    },
 }
 
 /// A copy entry waiting for GMGN token intelligence (intel gate).
@@ -194,6 +274,11 @@ pub struct Engine {
     positions: HashMap<Pubkey, Position>,
     afterlife: HashMap<Pubkey, Position>,
     filters: watch::Sender<Filters>,
+    /// Coins to price (free feed's poller). None with the gRPC feed.
+    watch_tx: Option<watch::Sender<Vec<Watch>>>,
+    /// RPC for simulated fills (paper / shadow).
+    rpc: Option<Rpc>,
+    stopping: bool,
     results_tx: mpsc::Sender<OrderResult>,
     paused: bool,
     killed: bool,
@@ -271,6 +356,9 @@ impl Engine {
             positions: HashMap::new(),
             afterlife: HashMap::new(),
             filters,
+            watch_tx: None,
+            rpc: None,
+            stopping: false,
             results_tx,
             paused: false,
             killed: false,
@@ -316,9 +404,54 @@ impl Engine {
         self.salt >> 16
     }
 
+    /// Feed the free poller (coins to price) and RPC for simulated fills.
+    pub fn set_free_feed(&mut self, watch_tx: watch::Sender<Vec<Watch>>) {
+        self.watch_tx = Some(watch_tx);
+        self.push_watch();
+    }
+
+    /// RPC used to price simulated fills at their landing time.
+    pub fn set_rpc(&mut self, rpc: Rpc) {
+        self.rpc = Some(rpc);
+    }
+
+    fn afterlife_ms(&self) -> i64 {
+        (self.cfg.infra.paper.afterlife_secs as i64) * 1000
+    }
+
+    /// Simulated landing delay, when fills should be priced at landing time.
+    fn paper_delay(&self) -> Option<Duration> {
+        (self.mode != RunMode::Live && self.rpc.is_some() && self.cfg.infra.paper.latency_ms > 0)
+            .then(|| Duration::from_millis(self.cfg.infra.paper.latency_ms))
+    }
+
+    fn push_watch(&self) {
+        let Some(tx) = &self.watch_tx else { return };
+        let list: Vec<Watch> = self
+            .positions
+            .keys()
+            .map(|m| (m, true))
+            .chain(self.afterlife.keys().map(|m| (m, false)))
+            .filter_map(|(m, held)| {
+                let t = self.tokens.get(m)?;
+                state::supported(&t.template).then(|| Watch {
+                    mint: *m,
+                    template: t.template.clone(),
+                    decimals: t.decimals,
+                    token_program: t.token_program,
+                    held,
+                })
+            })
+            .collect();
+        tx.send_replace(list);
+    }
+
     fn push_filters(&self) {
+        self.push_watch();
         let mut leaders: Vec<String> = self.leaders.keys().map(|k| k.to_string()).collect();
-        leaders.push(self.me.to_string());
+        if self.mode == RunMode::Live {
+            leaders.push(self.me.to_string()); // our own fills
+        }
         let mints = self
             .positions
             .keys()
@@ -361,6 +494,7 @@ impl Engine {
             tokio::select! {
                 ev = feed.recv() => match ev {
                     Some(FeedEvent::Tx(tx)) => self.on_tx(&tx),
+                    Some(FeedEvent::State(u)) => self.on_state(*u),
                     Some(FeedEvent::Slot { slot, .. }) => {
                         if slot > self.last_slot { self.last_slot = slot; self.last_slot_at = Instant::now(); }
                     }
@@ -374,7 +508,32 @@ impl Engine {
                 c = commands.recv() => if let Some((c, reply)) = c { let r = self.on_command(c); let _ = reply.send(r); },
                 _ = clock.tick() => self.on_clock(),
             }
+            if self.stopping {
+                self.shutdown();
+                return;
+            }
         }
+    }
+
+    /// Graceful stop. Paper / shadow positions are marked out at the last known
+    /// pool so they count in the results; every closed position's alternative
+    /// exits are scored now. Live positions are left alone (re-adopted on start).
+    fn shutdown(&mut self) {
+        if self.mode != RunMode::Live {
+            let held: Vec<(Pubkey, u64)> = self
+                .positions
+                .iter()
+                .map(|(m, p)| (*m, p.held_tokens))
+                .collect();
+            for (m, t) in held {
+                self.sell_with(m, t, "Shutdown", false, true);
+            }
+        }
+        let mints: Vec<Pubkey> = self.afterlife.keys().copied().collect();
+        for m in mints {
+            self.finalize(m);
+        }
+        self.alert("copybot stopped");
     }
 
     // ================================================================ transactions
@@ -400,6 +559,7 @@ impl Engine {
                         decimals: 6,
                         created_ms: None,
                         migrated: false,
+                        state_slot: 0,
                     });
                     t.created_ms = Some(c.timestamp * 1000);
                     t.creator = Some(c.creator);
@@ -410,7 +570,7 @@ impl Engine {
         }
         let swaps = detect::all_swaps(tx);
         for s in &swaps {
-            self.update_token(s);
+            self.update_token(s, tx.slot);
             let is_leader = self.leaders.contains_key(&s.wallet);
             self.journal
                 .market_swap(crate::journal::swap_row(tx, s, is_leader));
@@ -430,7 +590,7 @@ impl Engine {
         }
     }
 
-    fn update_token(&mut self, s: &DetectedSwap) {
+    fn update_token(&mut self, s: &DetectedSwap, slot: u64) {
         let t = self.tokens.entry(s.mint).or_insert_with(|| TokenInfo {
             template: Template::Generic,
             price: 0.0,
@@ -440,20 +600,25 @@ impl Engine {
             decimals: s.token_decimals,
             created_ms: None,
             migrated: false,
+            state_slot: 0,
         });
+        // A transaction older than state we already hold must not roll it back.
+        let stale = slot < t.state_slot;
+        t.state_slot = t.state_slot.max(slot);
         // Prefer exact templates; once migrated, ignore stale curve templates.
-        let keep = match (&t.template, &s.template) {
-            (_, Template::Generic) => !matches!(t.template, Template::Generic) && !s.exact,
-            (_, Template::Curve { .. }) if t.migrated => true,
-            _ => false,
-        };
+        let keep = stale
+            || match (&t.template, &s.template) {
+                (_, Template::Generic) => !matches!(t.template, Template::Generic) && !s.exact,
+                (_, Template::Curve { .. }) if t.migrated => true,
+                _ => false,
+            };
         if !keep {
             t.template = s.template.clone();
         }
-        if s.exact || t.price == 0.0 {
+        if !stale && (s.exact || t.price == 0.0) {
             t.price = s.price_sol;
         }
-        if s.pool_sol.is_some() {
+        if !stale && s.pool_sol.is_some() {
             t.pool_sol = s.pool_sol;
         }
         if s.creator.is_some() {
@@ -462,6 +627,54 @@ impl Engine {
         t.token_program = s.token_program;
         t.decimals = s.token_decimals;
         t.migrated |= s.migrated;
+    }
+
+    /// Fresh pool state from the feed (free feed: leader-buy pre-read or poller).
+    fn on_state(&mut self, u: StateUpdate) {
+        if u.slot > self.last_slot {
+            self.last_slot = u.slot;
+        }
+        self.last_slot_at = Instant::now();
+        let held = self.positions.contains_key(&u.mint);
+        let t = self.tokens.entry(u.mint).or_insert_with(|| TokenInfo {
+            template: u.template.clone(),
+            price: 0.0,
+            pool_sol: None,
+            creator: None,
+            token_program: u.token_program,
+            decimals: u.decimals,
+            created_ms: None,
+            migrated: false,
+            state_slot: 0,
+        });
+        if u.slot < t.state_slot {
+            return; // an older read arriving late
+        }
+        let kind_changed =
+            std::mem::discriminant(&t.template) != std::mem::discriminant(&u.template);
+        let unchanged = t.price == u.price_sol && t.pool_sol == Some(u.pool_sol) && !kind_changed;
+        let newly_migrated = u.migrated && !t.migrated;
+        t.template = u.template;
+        t.price = u.price_sol;
+        t.pool_sol = Some(u.pool_sol);
+        t.decimals = u.decimals;
+        t.token_program = u.token_program;
+        t.state_slot = u.slot;
+        t.migrated |= u.migrated;
+        if newly_migrated && held {
+            self.journal
+                .record("migrated", json!({"mint": u.mint.to_string()}));
+            self.alert(format!(
+                "🎓 {} graduated to PumpSwap — switching exit route",
+                short(&u.mint)
+            ));
+        }
+        if kind_changed {
+            self.push_filters(); // the poller must watch the new pool's accounts
+        }
+        if !unchanged {
+            self.on_price(u.mint, u.price_sol, Some(u.pool_sol));
+        }
     }
 
     fn mark_seen(&mut self, key: String) -> bool {
@@ -781,32 +994,9 @@ impl Engine {
         let salt = self.next_salt();
         let fixed_fee = self.fixed_fee_lamports(false);
 
-        // Simulated fill (shadow / paper), or the live plan's expected amount.
-        let expected_tokens = match &template {
-            Template::Curve { state, fee_bps, .. } => {
-                pump::buy_tokens_for_quote(state, lamports, *fee_bps)
-            }
-            Template::Amm {
-                base_reserve,
-                quote_reserve,
-                fee_bps,
-                ..
-            } => pump_amm::buy_base_for_quote(*base_reserve, *quote_reserve, lamports, *fee_bps),
-            Template::Dbc {
-                price_raw, fee_bps, ..
-            }
-            | Template::LaunchLab {
-                price_raw, fee_bps, ..
-            } => chain::meteora_dbc::estimate_buy(*price_raw, lamports, *fee_bps),
-            Template::Generic => {
-                if s.price_sol > 0.0 {
-                    ((lamports_to_sol(lamports) / s.price_sol)
-                        * 10f64.powi(s.token_decimals as i32)) as u64
-                } else {
-                    0
-                }
-            }
-        };
+        // Quote against the pool as we know it now (the live plan's expected amount,
+        // or the instant simulated fill).
+        let expected_tokens = quote_buy(&template, lamports, s.price_sol, s.token_decimals);
         if expected_tokens == 0 {
             self.journal.record(
                 "entry_error",
@@ -867,6 +1057,38 @@ impl Engine {
             } else {
                 self.open_position(s, lcfg, lamports, 0, PosStatus::Opening, &template);
             }
+        } else if let (Some(delay), Some(rpc)) = (self.paper_delay(), self.rpc.clone()) {
+            // paper: the order lands `latency_ms` from now, at the pool as it is then.
+            // Registered like a live order (Opening) and filled when the delay is up.
+            let min_out = pump::apply_slippage_down(expected_tokens, slip);
+            self.stats.sends += 1;
+            if is_add {
+                if let Some(p) = self.positions.get_mut(&s.mint) {
+                    p.adds += 1;
+                    p.pending_cost += lamports;
+                    p.pending_buy = Some("paper".into());
+                }
+            } else {
+                self.open_position(s, lcfg, lamports, 0, PosStatus::Opening, &template);
+            }
+            let (mint, decimals) = (s.mint, s.token_decimals);
+            let results = self.results_tx.clone();
+            let tpl = template.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let fresh = fetch_fresh(&rpc, &tpl, decimals).await;
+                let reaction_ms = ChainTx::now_ns().saturating_sub(observed_ns) / 1_000_000;
+                let _ = results
+                    .send(OrderResult::PaperBuy {
+                        mint,
+                        lamports,
+                        expected: expected_tokens,
+                        min_out,
+                        fresh: fresh.map(Box::new),
+                        reaction_ms,
+                    })
+                    .await;
+            });
         } else {
             // shadow / paper: instant fill at the post-leader quote (= landing right behind the leader)
             if is_add {
@@ -1045,19 +1267,33 @@ impl Engine {
 
     fn on_market(&mut self, s: &DetectedSwap, _tx: &ChainTx) {
         let creator = self.tokens.get(&s.mint).and_then(|t| t.creator);
-        for map in [true, false] {
-            let pos = if map {
-                self.positions.get_mut(&s.mint)
+        self.on_price(s.mint, s.price_sol, s.pool_sol);
+        if self.positions.contains_key(&s.mint) && s.side == Side::Sell && creator == Some(s.wallet)
+        {
+            self.journal.record(
+                "dev_sell",
+                json!({"mint": s.mint.to_string(), "sol": s.sol_amount}),
+            );
+            self.apply_event(s.mint, MarketEvent::DevSell { t_ms: now_ms() });
+        }
+    }
+
+    /// A new price / liquidity observation for `mint`: recorded on the path of
+    /// open and recently closed positions, and fed to the open position's exit policy.
+    fn on_price(&mut self, mint: Pubkey, price: f64, pool_sol: Option<u64>) {
+        for open in [true, false] {
+            let pos = if open {
+                self.positions.get_mut(&mint)
             } else {
-                self.afterlife.get_mut(&s.mint)
+                self.afterlife.get_mut(&mint)
             };
             let Some(p) = pos else { continue };
-            if s.price_sol > 0.0 && p.path.len() < PATH_CAP {
+            if price > 0.0 && p.path.len() < PATH_CAP {
                 p.path.push(MarketEvent::Price {
                     t_ms: now_ms(),
-                    price: s.price_sol,
+                    price,
                 });
-                if let Some(ps) = s.pool_sol {
+                if let Some(ps) = pool_sol {
                     p.path.push(MarketEvent::Liquidity {
                         t_ms: now_ms(),
                         pool_sol: lamports_to_sol(ps),
@@ -1065,34 +1301,21 @@ impl Engine {
                 }
             }
         }
-        if !self.positions.contains_key(&s.mint) {
+        if !self.positions.contains_key(&mint) {
             return;
         }
         let t = now_ms();
-        if s.price_sol > 0.0 {
-            self.apply_event(
-                s.mint,
-                MarketEvent::Price {
-                    t_ms: t,
-                    price: s.price_sol,
-                },
-            );
+        if price > 0.0 {
+            self.apply_event(mint, MarketEvent::Price { t_ms: t, price });
         }
-        if let Some(ps) = s.pool_sol {
+        if let Some(ps) = pool_sol {
             self.apply_event(
-                s.mint,
+                mint,
                 MarketEvent::Liquidity {
                     t_ms: t,
                     pool_sol: lamports_to_sol(ps),
                 },
             );
-        }
-        if s.side == Side::Sell && creator == Some(s.wallet) {
-            self.journal.record(
-                "dev_sell",
-                json!({"mint": s.mint.to_string(), "sol": s.sol_amount}),
-            );
-            self.apply_event(s.mint, MarketEvent::DevSell { t_ms: t });
         }
     }
 
@@ -1161,6 +1384,14 @@ impl Engine {
     }
 
     fn sell(&mut self, mint: Pubkey, tokens: u64, reason: &str, urgent: bool) {
+        self.sell_with(mint, tokens, reason, urgent, false);
+    }
+
+    /// `instant`: fill simulated sells at the last known pool without the landing delay.
+    fn sell_with(&mut self, mint: Pubkey, tokens: u64, reason: &str, urgent: bool, instant: bool) {
+        let paper_delay = if instant { None } else { self.paper_delay() };
+        let rpc = self.rpc.clone();
+        let results = self.results_tx.clone();
         let slip = self.cfg.engine.risk.max_sell_slippage_bps;
         let salt = self.next_salt();
         let fixed_fee = self.fixed_fee_lamports(true);
@@ -1179,26 +1410,32 @@ impl Engine {
             return;
         }
         if mode != RunMode::Live {
-            let out = match &template {
-                Template::Curve { state, fee_bps, .. } => {
-                    pump::sell_quote_for_tokens(state, tokens, *fee_bps)
+            if let (Some(delay), Some(rpc)) = (paper_delay, rpc) {
+                // paper: lands `latency_ms` from now at the pool as it is then
+                if p.pending_sell.is_some() {
+                    p.queued_sell = (p.queued_sell + tokens).min(p.held_tokens);
+                    return;
                 }
-                Template::Amm {
-                    base_reserve,
-                    quote_reserve,
-                    fee_bps,
-                    ..
-                } => pump_amm::sell_quote_for_base(*base_reserve, *quote_reserve, tokens, *fee_bps),
-                Template::Dbc {
-                    price_raw, fee_bps, ..
-                }
-                | Template::LaunchLab {
-                    price_raw, fee_bps, ..
-                } => chain::meteora_dbc::estimate_sell(*price_raw, tokens, *fee_bps),
-                Template::Generic => {
-                    sol_to_lamports(price_now * tokens as f64 / 10f64.powi(p.decimals as i32))
-                }
-            };
+                p.pending_sell = Some(PendingSell {
+                    signature: "paper".into(),
+                });
+                let (decimals, reason) = (p.decimals, reason.to_string());
+                self.stats.sends += 1;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let fresh = fetch_fresh(&rpc, &template, decimals).await;
+                    let _ = results
+                        .send(OrderResult::PaperSell {
+                            mint,
+                            tokens,
+                            reason,
+                            fresh: fresh.map(Box::new),
+                        })
+                        .await;
+                });
+                return;
+            }
+            let out = quote_sell(&template, tokens, price_now, p.decimals);
             p.held_tokens -= tokens;
             p.proceeds_lamports += out;
             p.fees_lamports += fixed_fee;
@@ -1230,7 +1467,6 @@ impl Engine {
         tip = tip.saturating_mul(1 << (attempt.saturating_sub(1).min(3))); // escalate on retries
         let cu = f.cu_limit_sell;
         let reason = reason.to_string();
-        let results = self.results_tx.clone();
         self.stats.sends += 1;
         tokio::spawn(async move {
             let outcome = match &template {
@@ -1447,6 +1683,20 @@ impl Engine {
             },
             OrderResult::Balance(b) => self.balance = b,
             OrderResult::Intel { mint, intel, error } => self.on_intel(mint, intel, error),
+            OrderResult::PaperBuy {
+                mint,
+                lamports,
+                expected,
+                min_out,
+                fresh,
+                reaction_ms,
+            } => self.on_paper_buy(mint, lamports, expected, min_out, fresh, reaction_ms),
+            OrderResult::PaperSell {
+                mint,
+                tokens,
+                reason,
+                fresh,
+            } => self.on_paper_sell(mint, tokens, reason, fresh),
             OrderResult::TokenBalance { mint, amount } => {
                 if let Some(p) = self.positions.get_mut(&mint) {
                     if p.status == PosStatus::Opening && amount > 0 {
@@ -1459,6 +1709,113 @@ impl Engine {
                     }
                 }
             }
+        }
+    }
+
+    // ================================================================ simulated fills (paper)
+
+    /// Latest pool for `mint`, replaced by `fresh` when the landing-time read succeeded.
+    fn landing_pool(&mut self, mint: Pubkey, fresh: Option<Box<Template>>) -> (Template, f64, u8) {
+        let t = self.tokens.get_mut(&mint);
+        match t {
+            Some(t) => {
+                if let Some(f) = fresh {
+                    t.template = *f;
+                }
+                (t.template.clone(), t.price, t.decimals)
+            }
+            None => (fresh.map(|b| *b).unwrap_or(Template::Generic), 0.0, 6),
+        }
+    }
+
+    fn on_paper_buy(
+        &mut self,
+        mint: Pubkey,
+        lamports: u64,
+        expected: u64,
+        min_out: u64,
+        fresh: Option<Box<Template>>,
+        reaction_ms: u64,
+    ) {
+        push_bounded(&mut self.stats.reaction_ms, reaction_ms);
+        let got_fresh = fresh.is_some();
+        let (template, price, decimals) = self.landing_pool(mint, fresh);
+        let tokens = quote_buy(&template, lamports, price, decimals);
+        let fee = self.fixed_fee_lamports(false);
+        let latency = self.cfg.infra.paper.latency_ms;
+        if tokens == 0 || tokens < min_out {
+            self.stats.failed += 1;
+            self.journal.record("fill", json!({"mint": mint.to_string(), "side": "buy", "mode": self.mode, "simulated": true, "failed": "slippage", "sol": lamports, "expected_tokens": expected, "tokens_at_landing": tokens, "min_out": min_out, "latency_ms": latency, "fresh": got_fresh}));
+            if let Some(p) = self.positions.get_mut(&mint) {
+                p.pending_buy = None;
+                p.pending_cost = p.pending_cost.saturating_sub(lamports);
+                p.fees_lamports += fee; // a failed transaction still pays its fee
+                if p.initial_tokens == 0 {
+                    self.positions.remove(&mint);
+                    self.push_filters();
+                }
+            }
+            self.alert(format!(
+                "⚪ [sim] buy {} missed: price ran past slippage by landing",
+                short(&mint)
+            ));
+            return;
+        }
+        let Some(p) = self.positions.get_mut(&mint) else {
+            return;
+        };
+        p.cost_lamports += lamports;
+        p.pending_cost = p.pending_cost.saturating_sub(lamports);
+        p.fees_lamports += fee;
+        p.initial_tokens += tokens;
+        p.held_tokens += tokens;
+        p.pending_buy = None;
+        p.state.entry_price = lamports_to_sol(p.cost_lamports)
+            / (p.initial_tokens as f64 / 10f64.powi(p.decimals as i32));
+        p.state.last_price = p.state.entry_price;
+        p.state.peak_price = p.state.peak_price.max(p.state.entry_price);
+        p.status = PosStatus::Open;
+        self.stats.landed += 1;
+        let slip_bps = if expected > 0 {
+            (expected as f64 - tokens as f64) / expected as f64 * 10_000.0
+        } else {
+            0.0
+        };
+        self.journal.record("fill", json!({"mint": mint.to_string(), "side": "buy", "mode": self.mode, "simulated": true, "sol": lamports, "tokens": tokens, "expected_tokens": expected, "slippage_bps": slip_bps, "latency_ms": latency, "fresh": got_fresh}));
+    }
+
+    fn on_paper_sell(
+        &mut self,
+        mint: Pubkey,
+        tokens: u64,
+        reason: String,
+        fresh: Option<Box<Template>>,
+    ) {
+        let got_fresh = fresh.is_some();
+        let (template, price, _) = self.landing_pool(mint, fresh);
+        let fee = self.fixed_fee_lamports(true);
+        let mode = self.mode;
+        let latency = self.cfg.infra.paper.latency_ms;
+        let Some(p) = self.positions.get_mut(&mint) else {
+            return;
+        };
+        p.pending_sell = None;
+        let tokens = tokens.min(p.held_tokens);
+        if tokens == 0 {
+            return;
+        }
+        let out = quote_sell(&template, tokens, price, p.decimals);
+        p.held_tokens -= tokens;
+        p.proceeds_lamports += out;
+        p.fees_lamports += fee;
+        let queued = std::mem::take(&mut p.queued_sell);
+        let done = p.held_tokens == 0;
+        self.stats.landed += 1;
+        self.journal.record("fill", json!({"mint": mint.to_string(), "side": "sell", "mode": mode, "simulated": true, "sol": out, "tokens": tokens, "reason": reason, "latency_ms": latency, "fresh": got_fresh}));
+        if done {
+            self.on_exited(mint);
+        } else if queued > 0 {
+            self.sell(mint, queued, &reason, false);
         }
     }
 
@@ -1571,10 +1928,11 @@ impl Engine {
         for m in mints {
             self.apply_event(m, MarketEvent::Clock { t_ms: t });
         }
+        let afterlife = self.afterlife_ms();
         let done: Vec<Pubkey> = self
             .afterlife
             .iter()
-            .filter(|(_, p)| p.exited_ms.is_some_and(|e| t - e > AFTERLIFE_MS))
+            .filter(|(_, p)| p.exited_ms.is_some_and(|e| t - e > afterlife))
             .map(|(m, _)| *m)
             .collect();
         for m in done {
@@ -1672,6 +2030,15 @@ impl Engine {
                     format!("removed {pk} (entries in the config file stay until edited there)")
                 } else {
                     format!("{pk} was not blacklisted")
+                }
+            }
+            Command::Stop => {
+                self.stopping = true;
+                if self.mode == RunMode::Live {
+                    "stopping: open live positions are not sold; they are re-adopted on the next start".to_string()
+                } else {
+                    "stopping: open simulated positions are marked out and results are scored"
+                        .to_string()
                 }
             }
             Command::Leaders => {
@@ -2145,6 +2512,291 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------- paper fills at landing time
+
+    fn scaled(t: &Template, factor: f64) -> Template {
+        match t {
+            Template::Curve {
+                coin,
+                state,
+                fee_bps,
+            } => {
+                let mut st = *state;
+                st.virtual_quote_reserves = (st.virtual_quote_reserves as f64 * factor) as u64;
+                Template::Curve {
+                    coin: coin.clone(),
+                    state: st,
+                    fee_bps: *fee_bps,
+                }
+            }
+            _ => panic!("curve expected"),
+        }
+    }
+
+    fn state_after(e: &Engine, mint: Pubkey, factor: f64, slot: u64) -> StateUpdate {
+        let t = &e.tokens[&mint];
+        StateUpdate {
+            mint,
+            template: scaled(&t.template, factor),
+            price_sol: t.price * factor,
+            pool_sol: t.pool_sol.unwrap_or(0),
+            decimals: t.decimals,
+            token_program: t.token_program,
+            slot,
+            migrated: false,
+        }
+    }
+
+    fn leader_buy(slot: u64, mint: Pubkey, leader: Pubkey, creator: Pubkey) -> ChainTx {
+        trade_tx(
+            slot,
+            Ev {
+                mint,
+                user: leader,
+                creator,
+                is_buy: true,
+                sol: 1_000_000_000,
+                tokens: 1,
+                vsol: 30_000_000_000,
+                vtok: VTOK,
+                real_sol: 30_000_000_000,
+            },
+            0,
+        )
+    }
+
+    /// Engine in delayed-paper mode; the landing-time RPC read is unreachable, so
+    /// tests hand the engine the "fresh" pool themselves.
+    fn delayed_engine(dir: &str, leader: Pubkey) -> (Engine, mpsc::Receiver<OrderResult>) {
+        let (mut e, rx) = engine(dir, leader, "mirror_leader");
+        e.rpc = Some(Rpc::new("http://127.0.0.1:9"));
+        e.cfg.infra.paper.latency_ms = 20;
+        (e, rx)
+    }
+
+    async fn next_paper_buy(rx: &mut mpsc::Receiver<OrderResult>) -> OrderResult {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(r @ OrderResult::PaperBuy { .. })) => return r,
+                Ok(Some(_)) => continue,
+                other => panic!("no paper buy result: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_buy_fills_at_the_pool_as_it_is_at_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, mut rx) = delayed_engine(d, leader);
+        e.on_tx(&leader_buy(300, mint, leader, creator));
+        // registered like a live order: Opening, nothing held yet
+        assert_eq!(e.positions[&mint].status, PosStatus::Opening);
+        assert_eq!(e.positions[&mint].held_tokens, 0);
+        assert_eq!(e.positions[&mint].pending_cost, 100_000_000);
+
+        let OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            reaction_ms,
+            ..
+        } = next_paper_buy(&mut rx).await
+        else {
+            unreachable!()
+        };
+        // by landing the pool is 3% dearer: still inside the 15% slippage limit
+        let fresh = scaled(&e.tokens[&mint].template, 1.03);
+        e.on_result(OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            fresh: Some(Box::new(fresh)),
+            reaction_ms,
+        });
+
+        let p = &e.positions[&mint];
+        assert_eq!(p.status, PosStatus::Open);
+        assert!(
+            p.held_tokens > 0 && p.held_tokens < expected,
+            "worse fill than the leader's quote"
+        );
+        assert!(p.held_tokens >= min_out);
+        assert_eq!(p.cost_lamports, 100_000_000);
+        assert_eq!(p.pending_cost, 0);
+        let entry = p.state.entry_price;
+        assert!(entry > e.tokens[&mint].price * 0.99 && entry < e.tokens[&mint].price * 1.05);
+    }
+
+    #[tokio::test]
+    async fn paper_buy_misses_when_price_ran_past_slippage() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, mut rx) = delayed_engine(d, leader);
+        e.on_tx(&leader_buy(310, mint, leader, creator));
+        let OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            reaction_ms,
+            ..
+        } = next_paper_buy(&mut rx).await
+        else {
+            unreachable!()
+        };
+        let fresh = scaled(&e.tokens[&mint].template, 1.6); // +60% by landing
+        e.on_result(OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            fresh: Some(Box::new(fresh)),
+            reaction_ms,
+        });
+        assert!(
+            e.positions.is_empty(),
+            "the transaction would have failed on-chain"
+        );
+        assert_eq!(e.stats.failed, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let fills: Vec<_> = records(d)
+            .into_iter()
+            .filter(|r| r["kind"] == "fill")
+            .collect();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0]["failed"], "slippage");
+    }
+
+    #[tokio::test]
+    async fn state_updates_trigger_exits_that_land_after_the_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, mut rx) = delayed_engine(d, leader);
+        e.on_tx(&leader_buy(320, mint, leader, creator));
+        let OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            reaction_ms,
+            ..
+        } = next_paper_buy(&mut rx).await
+        else {
+            unreachable!()
+        };
+        e.on_result(OrderResult::PaperBuy {
+            mint: m,
+            lamports,
+            expected,
+            min_out,
+            fresh: None,
+            reaction_ms,
+        });
+        assert_eq!(e.positions[&mint].status, PosStatus::Open);
+
+        // price collapses: mirror_leader stops out at -50%
+        e.on_state(state_after(&e, mint, 0.3, 400));
+        assert!(
+            e.positions[&mint].pending_sell.is_some(),
+            "sell is in flight, not instant"
+        );
+        assert_eq!(
+            e.positions[&mint].held_tokens,
+            e.positions[&mint].initial_tokens
+        );
+        // a second trigger while it is in flight does not double-sell
+        e.on_state(state_after(&e, mint, 0.2, 401));
+
+        let sell = loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(r @ OrderResult::PaperSell { .. })) => break r,
+                Ok(Some(_)) => continue,
+                other => panic!("no paper sell: {other:?}"),
+            }
+        };
+        e.on_result(sell);
+        assert!(e.positions.is_empty(), "closed");
+        let p = &e.afterlife[&mint];
+        assert!(p.proceeds_lamports > 0 && p.proceeds_lamports < p.cost_lamports);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let exits: Vec<_> = records(d)
+            .into_iter()
+            .filter(|r| r["kind"] == "position_exit")
+            .collect();
+        assert_eq!(exits.len(), 1);
+        assert!(exits[0]["pnl_sol"].as_f64().unwrap() < 0.0);
+    }
+
+    #[tokio::test]
+    async fn older_transactions_never_roll_back_fresh_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, _rx) = engine(d, leader, "mirror_leader");
+        e.on_tx(&leader_buy(500, mint, leader, creator)); // learns the coin
+        let fresh = state_after(&e, mint, 1.07, 520);
+        let price = fresh.price_sol;
+        e.on_state(fresh);
+        // a leader transaction from slot 510 (older than the read at 520) arrives afterwards
+        e.on_tx(&leader_buy(510, mint, leader, creator));
+        assert_eq!(
+            e.tokens[&mint].price, price,
+            "stale tx must not overwrite the fresher read"
+        );
+        assert_eq!(e.tokens[&mint].state_slot, 520);
+    }
+
+    #[tokio::test]
+    async fn stop_marks_out_paper_positions_and_scores_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, creator, mint) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, _rx) = engine(d, leader, "ladder_trail");
+        e.on_tx(&leader_buy(600, mint, leader, creator));
+        assert!(e.positions.contains_key(&mint));
+        let reply = e.on_command(Command::Stop);
+        assert!(reply.starts_with("stopping"));
+        assert!(e.stopping);
+        e.shutdown();
+        assert!(e.positions.is_empty() && e.afterlife.is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let kinds: Vec<String> = records(d)
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(kinds.contains(&"position_exit".to_string()));
+        assert!(
+            kinds.contains(&"position_close".to_string()),
+            "shadow exits scored at stop"
+        );
+    }
+
     #[tokio::test]
     async fn blacklist_and_one_entry_per_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -2394,6 +3046,7 @@ mod intel_gate_tests {
                 decimals: 6,
                 created_ms: None,
                 migrated: false,
+                state_slot: 0,
             },
         );
         e.pending.insert(

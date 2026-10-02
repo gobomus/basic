@@ -111,8 +111,11 @@ impl TradeEvent {
         spot_price(self.virtual_sol_reserves, self.virtual_token_reserves)
     }
 
+    /// Everything the trader pays on top of the swap amount. `buyback_fee_basis_points`
+    /// is the share of the protocol fee routed to buybacks (5000 = half of it),
+    /// not an additional fee: verified on live trades (fee + creator fee = 1.25%).
     pub fn total_fee_bps(&self) -> u64 {
-        self.fee_basis_points + self.creator_fee_basis_points + self.buyback_fee_basis_points
+        self.fee_basis_points + self.creator_fee_basis_points
     }
 
     pub fn curve_state(&self) -> CurveState {

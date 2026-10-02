@@ -27,8 +27,15 @@ pub struct SwapEventData {
     pub timestamp: i64,
     /// base_amount_out (buy) / base_amount_in (sell)
     pub base_amount: u64,
-    /// What the user actually paid (buy) / received (sell), in quote units.
+    /// `user_quote_amount_in` (buy: the amount net of protocol and creator fees)
+    /// / `user_quote_amount_out` (sell: what the user received).
     pub user_quote_amount: u64,
+    /// `quote_amount_in` (buy: everything the user paid, every fee included)
+    /// / `quote_amount_out` (sell: the gross amount before fees).
+    pub quote_amount: u64,
+    /// `quote_amount_in_with_lp_fee` (buy: what the pool's quote reserve grew by)
+    /// / `quote_amount_out_without_lp_fee` (sell: what it shrank by).
+    pub pool_quote_delta: u64,
     pub pool_base_token_reserves: u64,
     pub pool_quote_token_reserves: u64,
     pub lp_fee_basis_points: u64,
@@ -51,12 +58,12 @@ impl SwapEventData {
         r.skip(16)?; // user base/quote reserves
         let pool_base_token_reserves = r.u64()?;
         let pool_quote_token_reserves = r.u64()?;
-        r.skip(8)?; // quote_amount_in / quote_amount_out
+        let quote_amount = r.u64()?; // quote_amount_in / quote_amount_out
         let lp_fee_basis_points = r.u64()?;
         r.skip(8)?; // lp_fee
         let protocol_fee_basis_points = r.u64()?;
         r.skip(8)?; // protocol_fee
-        r.skip(8)?; // quote_amount_in_with_lp_fee / quote_amount_out_without_lp_fee
+        let pool_quote_delta = r.u64()?; // quote_amount_in_with_lp_fee / quote_amount_out_without_lp_fee
         let user_quote_amount = r.u64()?;
         let pool = r.pubkey()?;
         let user = r.pubkey()?;
@@ -83,6 +90,8 @@ impl SwapEventData {
             timestamp,
             base_amount,
             user_quote_amount,
+            quote_amount,
+            pool_quote_delta,
             pool_base_token_reserves,
             pool_quote_token_reserves,
             lp_fee_basis_points,
@@ -97,8 +106,47 @@ impl SwapEventData {
         })
     }
 
+    /// Pool quote reserves before the swap, virtual reserves included.
     pub fn effective_quote_reserves(&self) -> u128 {
         (self.pool_quote_token_reserves as i128 + self.virtual_quote_reserves).max(0) as u128
+    }
+
+    /// Quote units the trader actually paid (buy, all fees included) or received (sell).
+    pub fn user_flow(&self) -> u64 {
+        if self.is_buy {
+            self.quote_amount
+        } else {
+            self.user_quote_amount
+        }
+    }
+
+    /// Pool reserves *after* this swap: (base, effective quote). The event
+    /// carries the reserves from before it.
+    pub fn post_reserves(&self) -> (u64, u128) {
+        let q = self.effective_quote_reserves();
+        if self.is_buy {
+            (
+                self.pool_base_token_reserves
+                    .saturating_sub(self.base_amount),
+                q + self.pool_quote_delta as u128,
+            )
+        } else {
+            (
+                self.pool_base_token_reserves
+                    .saturating_add(self.base_amount),
+                q.saturating_sub(self.pool_quote_delta as u128),
+            )
+        }
+    }
+
+    /// Spot price after the swap, quote per whole base token.
+    pub fn post_price(&self, base_decimals: u8, quote_decimals: u8) -> f64 {
+        let (b, q) = self.post_reserves();
+        if b == 0 {
+            return 0.0;
+        }
+        (q as f64 / 10f64.powi(quote_decimals as i32))
+            / (b as f64 / 10f64.powi(base_decimals as i32))
     }
 
     /// Spot price after the swap (quote per whole base token), assuming 6 base decimals.
@@ -117,10 +165,9 @@ impl SwapEventData {
         } else {
             self.coin_creator_fee_basis_points
         };
-        self.lp_fee_basis_points
-            + self.protocol_fee_basis_points
-            + creator
-            + self.buyback_fee_basis_points
+        // `buyback_fee_basis_points` is the share of the protocol fee routed to
+        // buybacks (5000 = half of it), not an additional fee.
+        self.lp_fee_basis_points + self.protocol_fee_basis_points + creator
     }
 }
 

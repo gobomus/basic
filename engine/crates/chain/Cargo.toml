@@ -23,6 +23,7 @@ sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
+reqwest-websocket = "0.5"
 
 [dev-dependencies]
 solana-system-interface = { version = "3.3", features = ["bincode"] }
