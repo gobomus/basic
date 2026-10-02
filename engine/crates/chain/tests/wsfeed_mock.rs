@@ -187,24 +187,26 @@ async fn collect(rx: &mut mpsc::Receiver<FeedEvent>, secs: u64) -> Vec<FeedEvent
     out
 }
 
+/// `env_var` must be unique per test: tests run in parallel and share the process environment.
 fn start(
+    env_var: &str,
     ws_url: &str,
     rpc_url: &str,
     leader: &str,
 ) -> (mpsc::Receiver<FeedEvent>, Vec<tokio::task::JoinHandle<()>>) {
-    std::env::set_var("WSFEED_MOCK_WS", ws_url);
+    std::env::set_var(env_var, ws_url);
     let cfg = WsConfig {
-        url_env: Some("WSFEED_MOCK_WS".into()),
+        url_env: Some(env_var.into()),
         ..Default::default()
     };
-    let (_ftx, frx) = watch::channel(Filters {
+    let (ftx, frx) = watch::channel(Filters {
         leaders: vec![leader.to_string()],
         mints: vec![],
     });
-    // keep the sender alive for the test's duration
-    Box::leak(Box::new(_ftx));
-    let (_wtx, wrx) = watch::channel(Vec::new());
-    Box::leak(Box::new(_wtx));
+    // keep the senders alive for the test's duration
+    Box::leak(Box::new(ftx));
+    let (wtx, wrx) = watch::channel(Vec::new());
+    Box::leak(Box::new(wtx));
     let (tx, rx) = mpsc::channel(1000);
     (rx, wsfeed::spawn(cfg, Rpc::new(rpc_url), frx, wrx, tx))
 }
@@ -218,7 +220,7 @@ async fn delivers_swaps_slots_and_ignores_noise() {
     let rpc = http_server(fx, fetches.clone());
     let sessions = Arc::new(AtomicUsize::new(0));
     let ws = ws_server(sessions.clone(), false);
-    let (mut rx, handles) = start(&ws, &rpc, &leader);
+    let (mut rx, handles) = start("WSFEED_MOCK_WS_STEADY", &ws, &rpc, &leader);
 
     let events = collect(&mut rx, 3).await;
     handles.iter().for_each(|h| h.abort());
@@ -271,7 +273,7 @@ async fn reconnects_and_resubscribes_after_a_dropped_connection() {
     let rpc = http_server(fx, Arc::new(AtomicUsize::new(0)));
     let sessions = Arc::new(AtomicUsize::new(0));
     let ws = ws_server(sessions.clone(), true);
-    let (mut rx, handles) = start(&ws, &rpc, &leader);
+    let (mut rx, handles) = start("WSFEED_MOCK_WS_DROPPY", &ws, &rpc, &leader);
 
     let events = collect(&mut rx, 5).await;
     handles.iter().for_each(|h| h.abort());
