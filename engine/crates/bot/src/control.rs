@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use chain::solana_sdk::pubkey::Pubkey;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
@@ -16,11 +17,28 @@ pub enum Command {
     Kill,
     Flatten,
     Leaders,
+    /// List the blacklist, or add / remove a token mint or dev wallet.
+    Blacklist(Option<Pubkey>),
+    Unblacklist(Pubkey),
 }
 
 impl Command {
     pub fn parse(text: &str) -> Option<Self> {
-        Some(match text.trim().to_lowercase().as_str() {
+        let mut words = text.split_whitespace();
+        let verb = words.next()?.to_lowercase();
+        // addresses are case-sensitive base58: only the verb is lowercased
+        let arg = words.next().map(|a| a.parse::<Pubkey>());
+        if words.next().is_some() {
+            return None;
+        }
+        match (verb.as_str(), arg) {
+            ("blacklist", None) => return Some(Command::Blacklist(None)),
+            ("blacklist", Some(Ok(pk))) => return Some(Command::Blacklist(Some(pk))),
+            ("unblacklist", Some(Ok(pk))) => return Some(Command::Unblacklist(pk)),
+            (_, Some(_)) => return None,
+            _ => {}
+        }
+        Some(match verb.as_str() {
             "status" => Command::Status,
             "positions" | "pos" => Command::Positions,
             "pause" => Command::Pause,
@@ -33,7 +51,7 @@ impl Command {
     }
 }
 
-pub const HELP: &str = "commands: status | positions | leaders | pause | resume | kill | flatten";
+pub const HELP: &str = "commands: status | positions | leaders | pause | resume | kill | flatten | blacklist [<mint|dev>] | unblacklist <mint|dev>";
 
 pub type Request = (Command, oneshot::Sender<String>);
 

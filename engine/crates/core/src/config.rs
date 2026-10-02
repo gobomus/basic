@@ -19,11 +19,30 @@ pub enum RunMode {
     Live,
 }
 
+/// How the raw copy size is derived, before the caps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingMode {
+    /// `copy_pct` × the leader's SOL amount.
+    #[default]
+    LeaderPct,
+    /// `copy_amount_sol` × the share of their own SOL balance the leader spent
+    /// (BasedBot "Buy %"): a leader going 10% of their stack → 10% of ours.
+    BalanceFraction,
+    /// `copy_amount_sol` on every copy, whatever the leader spent.
+    Fixed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SizingConfig {
+    #[serde(default)]
+    pub mode: SizingMode,
     /// Fraction of the leader's SOL amount to copy, e.g. 0.10 = 10%.
     pub copy_pct: f64,
+    /// Base amount for `balance_fraction` and `fixed` modes.
+    #[serde(default)]
+    pub copy_amount_sol: Option<f64>,
     /// Skip buys smaller than this: fixed fees and tips dominate below it.
     pub min_buy_sol: f64,
     pub max_buy_sol: f64,
@@ -43,6 +62,25 @@ pub struct FilterConfig {
     #[serde(default)]
     pub venues: Vec<Venue>,
     pub min_pool_sol: Option<f64>,
+    /// Skip pools deeper than this (less upside left).
+    #[serde(default)]
+    pub max_pool_sol: Option<f64>,
+    /// Market-cap range in SOL. Applied where supply is fixed and known
+    /// (Pump.fun / PumpSwap: 1B tokens); otherwise not applied.
+    #[serde(default)]
+    pub min_market_cap_sol: Option<f64>,
+    #[serde(default)]
+    pub max_market_cap_sol: Option<f64>,
+    /// Enter each token at most once per run, across all leaders (adds by the
+    /// same leader still follow `sizing.follow_adds`).
+    #[serde(default)]
+    pub one_entry_per_token: bool,
+    /// Never buy these mints, or tokens created by these wallets. More can be
+    /// added live with `copybot ctl blacklist <address>`.
+    #[serde(default)]
+    pub blacklist_mints: Vec<String>,
+    #[serde(default)]
+    pub blacklist_devs: Vec<String>,
     pub min_token_age_secs: Option<u64>,
     pub max_token_age_secs: Option<u64>,
     pub max_detection_slot_lag: u64,
@@ -110,6 +148,22 @@ impl EngineConfig {
         let s = &self.sizing;
         if !(0.0 < s.copy_pct && s.copy_pct <= 10.0) {
             return Err("sizing.copy_pct must be in (0, 10]".into());
+        }
+        if s.mode != SizingMode::LeaderPct && !s.copy_amount_sol.is_some_and(|a| a > 0.0) {
+            return Err("sizing.copy_amount_sol (> 0) is required for this sizing.mode".into());
+        }
+        if let (Some(a), Some(b)) = (
+            self.filters.min_market_cap_sol,
+            self.filters.max_market_cap_sol,
+        ) {
+            if a > b {
+                return Err("filters.min_market_cap_sol > filters.max_market_cap_sol".into());
+            }
+        }
+        if let (Some(a), Some(b)) = (self.filters.min_pool_sol, self.filters.max_pool_sol) {
+            if a > b {
+                return Err("filters.min_pool_sol > filters.max_pool_sol".into());
+            }
         }
         if s.min_buy_sol > s.max_buy_sol {
             return Err("sizing.min_buy_sol > sizing.max_buy_sol".into());

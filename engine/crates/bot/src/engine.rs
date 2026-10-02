@@ -6,6 +6,7 @@
 //!          log events, and feed filter updates (leaders + held mints).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,23 @@ use crate::gmgn::{Gmgn, TokenIntel};
 use crate::journal::{now_ms, Journal};
 
 const PATH_CAP: usize = 200_000;
+/// Every Pump.fun mint has a fixed supply of 1B tokens.
+const PUMP_SUPPLY: f64 = 1e9;
+
+/// Latest known price for the token, else the leader's fill.
+fn entry_price(t: &Option<TokenInfo>, s: &DetectedSwap) -> f64 {
+    t.as_ref()
+        .map(|t| t.price)
+        .filter(|p| *p > 0.0)
+        .unwrap_or(s.price_sol)
+}
+
+/// Market cap in SOL where the supply is fixed and known.
+fn market_cap_sol(venue: Venue, price_sol: f64) -> Option<f64> {
+    matches!(venue, Venue::PumpFunCurve | Venue::PumpSwap)
+        .then_some(price_sol * PUMP_SUPPLY)
+        .filter(|m| *m > 0.0)
+}
 const AFTERLIFE_MS: i64 = 2 * 3600 * 1000;
 
 #[derive(Debug, Clone)]
@@ -186,6 +204,11 @@ pub struct Engine {
     day_realized_sol: f64,
     balance: u64,
     seen: (HashSet<String>, VecDeque<String>),
+    /// Token mints and dev wallets we never buy (config + `ctl blacklist`).
+    blacklist: HashSet<Pubkey>,
+    blacklist_path: std::path::PathBuf,
+    /// Mints entered this run (for `filters.one_entry_per_token`).
+    traded: HashSet<Pubkey>,
     salt: u64,
     stats: Stats,
     started: Instant,
@@ -214,6 +237,24 @@ impl Engine {
                 ),
             }
         }
+        let blacklist_path = Path::new(&cfg.infra.storage.journal_dir).join("blacklist.txt");
+        let mut blacklist = HashSet::new();
+        let f = &cfg.engine.filters;
+        let saved = std::fs::read_to_string(&blacklist_path).unwrap_or_default();
+        for a in f
+            .blacklist_mints
+            .iter()
+            .chain(&f.blacklist_devs)
+            .map(String::as_str)
+            .chain(saved.lines().map(str::trim).filter(|l| !l.is_empty()))
+        {
+            match a.parse::<Pubkey>() {
+                Ok(pk) => {
+                    blacklist.insert(pk);
+                }
+                Err(_) => tracing::warn!("blacklist entry '{a}' is not an address — ignored"),
+            }
+        }
         let virtual_balance = sol_to_lamports(
             cfg.engine.risk.max_total_exposure_sol + cfg.engine.risk.min_sol_reserve,
         );
@@ -240,12 +281,24 @@ impl Engine {
             day_realized_sol: 0.0,
             balance: virtual_balance,
             seen: (HashSet::new(), VecDeque::new()),
+            blacklist,
+            blacklist_path,
+            traded: HashSet::new(),
             salt: rand::random(),
             stats: Stats::default(),
             started: Instant::now(),
         };
         e.push_filters();
         e
+    }
+
+    /// Persist runtime blacklist edits so they survive a restart.
+    fn save_blacklist(&self) {
+        let mut v: Vec<String> = self.blacklist.iter().map(|k| k.to_string()).collect();
+        v.sort();
+        if let Err(e) = std::fs::write(&self.blacklist_path, v.join("\n") + "\n") {
+            tracing::warn!("saving {}: {e}", self.blacklist_path.display());
+        }
     }
 
     /// Operator-visible event: logged and written to the journal.
@@ -490,19 +543,27 @@ impl Engine {
             venue: s.venue,
             leader_buy: s.sol_amount,
             leader_price: s.price_sol,
-            current_price: tinfo
-                .as_ref()
-                .map(|t| t.price)
-                .filter(|p| *p > 0.0)
-                .unwrap_or(s.price_sol),
+            current_price: entry_price(&tinfo, s),
             pool_sol: s.pool_sol,
             token_age_secs: tinfo
                 .as_ref()
                 .and_then(|t| t.created_ms)
                 .map(|c| ((now_ms() - c).max(0) / 1000) as u64),
             detection_slot_lag: lag,
+            leader_sol_before: tx
+                .keys
+                .iter()
+                .position(|k| *k == s.wallet)
+                .and_then(|i| tx.pre_balances.get(i).copied()),
+            market_cap_sol: market_cap_sol(s.venue, entry_price(&tinfo, s)),
         };
         let existing = self.positions.get(&s.mint);
+        let creator = s.creator.or(tinfo.as_ref().and_then(|t| t.creator));
+        let blacklisted = self.blacklist.contains(&s.mint)
+            || creator.is_some_and(|c| self.blacklist.contains(&c));
+        let already_traded = self.cfg.engine.filters.one_entry_per_token
+            && existing.is_none()
+            && self.traded.contains(&s.mint);
         let book = BookContext {
             position_cost: existing
                 .map(|p| p.cost_lamports + p.pending_cost)
@@ -519,7 +580,15 @@ impl Engine {
         };
         let sizing = self.sizing_for(&lcfg);
         let routable = !matches!(s.template, Template::Generic) || self.cfg.infra.jupiter.is_some();
-        let decision = if existing.is_some_and(|p| p.leader != s.wallet) {
+        let decision = if blacklisted {
+            SizeDecision::Skip {
+                reason: SkipReason::Blacklisted,
+            }
+        } else if already_traded {
+            SizeDecision::Skip {
+                reason: SkipReason::AlreadyTraded,
+            }
+        } else if existing.is_some_and(|p| p.leader != s.wallet) {
             SizeDecision::Skip {
                 reason: SkipReason::PositionCapReached,
             }
@@ -551,6 +620,7 @@ impl Engine {
             "leader_sol": s.sol_amount, "leader_price": s.price_sol, "source": format!("{:?}", tx.source).to_lowercase(),
             "slot_lag": lag, "decision": decision_s, "skip_reason": skip, "size_lamports": size, "capped_by": capped,
             "pool_sol": s.pool_sol, "exact": s.exact, "token_age_secs": entry.token_age_secs,
+            "leader_sol_before": entry.leader_sol_before, "market_cap_sol": entry.market_cap_sol,
         });
         let Some(lamports) = size else {
             self.journal.record("signal", signal);
@@ -701,6 +771,7 @@ impl Engine {
     }
 
     fn enter(&mut self, observed_ns: u64, s: &DetectedSwap, lcfg: &LeaderConfig, lamports: u64) {
+        self.traded.insert(s.mint);
         let template = self
             .tokens
             .get(&s.mint)
@@ -1574,6 +1645,35 @@ impl Engine {
                 }
                 format!("flattening {} positions; entries paused", mints.len())
             }
+            Command::Blacklist(None) => {
+                let mut v: Vec<String> = self.blacklist.iter().map(|k| k.to_string()).collect();
+                v.sort();
+                if v.is_empty() {
+                    "blacklist is empty".to_string()
+                } else {
+                    format!("blacklist ({}):\n{}", v.len(), v.join("\n"))
+                }
+            }
+            Command::Blacklist(Some(pk)) => {
+                self.blacklist.insert(pk);
+                self.save_blacklist();
+                self.journal
+                    .record("blacklist", json!({"add": pk.to_string()}));
+                format!(
+                    "blacklisted {pk}: no buys of this mint or of tokens created by this wallet"
+                )
+            }
+            Command::Unblacklist(pk) => {
+                let was = self.blacklist.remove(&pk);
+                self.save_blacklist();
+                self.journal
+                    .record("blacklist", json!({"remove": pk.to_string()}));
+                if was {
+                    format!("removed {pk} (entries in the config file stay until edited there)")
+                } else {
+                    format!("{pk} was not blacklisted")
+                }
+            }
             Command::Leaders => {
                 let s: Vec<String> = self
                     .leaders
@@ -1766,7 +1866,11 @@ mod tests {
     fn records(dir: &str) -> Vec<serde_json::Value> {
         let mut out = vec![];
         for f in std::fs::read_dir(dir).unwrap() {
-            for l in std::fs::read_to_string(f.unwrap().path()).unwrap().lines() {
+            let path = f.unwrap().path();
+            if path.extension().is_none_or(|x| x != "jsonl") {
+                continue;
+            }
+            for l in std::fs::read_to_string(path).unwrap().lines() {
                 out.push(serde_json::from_str(l).unwrap());
             }
         }
@@ -2039,6 +2143,84 @@ mod tests {
             reasons,
             vec!["LeaderBuyTooSmall", "LiquidityTooLow", "KillSwitch"]
         );
+    }
+
+    #[tokio::test]
+    async fn blacklist_and_one_entry_per_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let (leader, bad_dev, good_dev) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let (mut e, _r) = engine(d, leader, "ladder_trail");
+        e.cfg.engine.filters.one_entry_per_token = true;
+        let buy = |slot, mint, creator| {
+            trade_tx(
+                slot,
+                Ev {
+                    mint,
+                    user: leader,
+                    creator,
+                    is_buy: true,
+                    sol: 1_000_000_000,
+                    tokens: 1,
+                    vsol: 30_000_000_000,
+                    vtok: VTOK,
+                    real_sol: 30_000_000_000,
+                },
+                0,
+            )
+        };
+        let reply = e.on_command(Command::parse(&format!("blacklist {bad_dev}")).unwrap());
+        assert!(reply.starts_with("blacklisted"), "{reply}");
+        e.on_tx(&buy(200, Pubkey::new_unique(), bad_dev));
+        assert!(
+            e.positions.is_empty(),
+            "token by a blacklisted dev must not be bought"
+        );
+
+        let mint = Pubkey::new_unique();
+        e.on_tx(&buy(201, mint, good_dev));
+        assert!(e.positions.contains_key(&mint));
+        e.positions.clear(); // as if fully exited
+        e.on_tx(&buy(202, mint, good_dev));
+        assert!(
+            e.positions.is_empty(),
+            "second entry in the same token is skipped"
+        );
+
+        // runtime blacklist survives a restart
+        let saved = std::fs::read_to_string(dir.path().join("blacklist.txt")).unwrap();
+        assert_eq!(saved.trim(), bad_dev.to_string());
+        let (e2, _r2) = engine(d, leader, "ladder_trail");
+        assert!(e2.blacklist.contains(&bad_dev));
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reasons: Vec<String> = records(d)
+            .iter()
+            .filter(|r| r["kind"] == "signal")
+            .map(|r| r["skip_reason"].as_str().unwrap_or("-").to_string())
+            .collect();
+        assert_eq!(reasons, vec!["Blacklisted", "-", "AlreadyTraded"]);
+    }
+
+    #[test]
+    fn ctl_parses_case_sensitive_addresses() {
+        let pk = Pubkey::new_unique();
+        assert_eq!(
+            Command::parse(&format!("BlackList {pk}\n")),
+            Some(Command::Blacklist(Some(pk)))
+        );
+        assert_eq!(
+            Command::parse(&format!("unblacklist {pk}")),
+            Some(Command::Unblacklist(pk))
+        );
+        assert_eq!(Command::parse("blacklist"), Some(Command::Blacklist(None)));
+        assert_eq!(Command::parse("blacklist notanaddress"), None);
+        assert_eq!(Command::parse("status extra"), None);
+        assert_eq!(Command::parse("STATUS"), Some(Command::Status));
     }
 
     #[test]

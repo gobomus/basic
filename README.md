@@ -7,7 +7,7 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 3. **Record everything** that terminals like GMGN, Axiom and Padre show (volume, transactions per second, holders, snipers, bundlers, dev history, socials, …) plus our own execution data. The resulting trade log tunes exits and sizing first, and later a **leader-free, self-adjusting engine**.
 
 > **Status: engine built and verified against Solana mainnet (Oct 2026).**
-> - 68 tests, including regression tests on real mainnet transactions (Pump curve, PumpSwap, Meteora DBC, Raydium LaunchLab, version-1 transactions, Jupiter v0).
+> - 73 tests, including regression tests on real mainnet transactions (Pump curve, PumpSwap, Meteora DBC, Raydium LaunchLab, version-1 transactions, Jupiter v0).
 > - The live programs accepted our exact Pump curve buy and sell and PumpSwap buy and sell (`simulateTransaction`), using 74k–91k compute units each.
 > - The decoder's amounts agree with real on-chain balance changes on every sampled Pump and PumpSwap trade (`copybot audit`).
 > - Still needed before trading: a paid gRPC feed, leader wallets, and a server near the validators. **Start with [RUNBOOK.md](RUNBOOK.md)**; [docs/08-feature-parity.md](docs/08-feature-parity.md) lists what is and isn't built.
@@ -23,6 +23,7 @@ A high-frequency copy-trading engine for Solana memecoins, built in three steps:
 | [06 — Wallets & risk](docs/06-wallets-and-risk.md) | Treasury/hot-wallet fleet, custody, kill switches, MEV |
 | [07 — Roadmap](docs/07-roadmap.md) | Phases, go/no-go gates, unit economics, decisions needed |
 | [08 — Feature parity](docs/08-feature-parity.md) | What GMGN / Axiom / BasedBot / Proxima do vs what copybot has today |
+| [09 — Proxima & BasedBot deep dive](docs/09-proxima-basedbot-deep-dive.md) | Their full documented feature sets, mapped to copybot; what we won't build and why |
 | [RUNBOOK](RUNBOOK.md) | Step-by-step: server, providers, install, check, simulate, shadow, live |
 
 ## Layout
@@ -46,7 +47,7 @@ archive/                    unrelated legacy code (RFO BASIC! Android app)
 ## Develop
 ```sh
 cd engine
-cargo test --workspace                 # 68 tests: IDL conformance, real mainnet txs, end-to-end engine
+cargo test --workspace                 # 73 tests: IDL conformance, real mainnet txs, end-to-end engine
 cargo build --release -p bot           # → target/release/copybot
 ./target/release/copybot bench         # in-process reaction time (~0.17 ms median)
 ```

@@ -114,6 +114,7 @@ Compare live results with the shadow results. Raise sizes only when they match.
 | Stop new buys (exits keep running) | `copybot ctl pause`, later `copybot ctl resume` |
 | Emergency: sell everything | `copybot ctl flatten` |
 | Hard stop for the day | `copybot ctl kill` |
+| Never buy a token or a dev's tokens again | `copybot ctl blacklist <mint or dev wallet>` (`unblacklist` to undo; survives restarts) |
 | Take profits out | `./copybot wallet sweep --to <YOUR_SAFE_WALLET> --keep 1.0` |
 | Reclaim rent from empty token accounts (~0.002 SOL each) | `./copybot wallet close-empty` |
 | Wallet contents | `./copybot wallet balance` |

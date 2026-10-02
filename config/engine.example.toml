@@ -13,7 +13,10 @@ default_exit = "ladder_trail"
 shadow_exits = ["mirror_leader", "fast_scalp", "moonbag"]
 
 [sizing]
-copy_pct = 0.10            # copy 10% of the leader's SOL size
+mode = "leader_pct"        # leader_pct | balance_fraction | fixed
+copy_pct = 0.10            # leader_pct: copy 10% of the leader's SOL size
+# copy_amount_sol = 1.0    # balance_fraction: leader spends 5% of their SOL → we buy 5% of 1.0
+                           # fixed: buy exactly this much on every copy
 min_buy_sol = 0.05         # below this, fees + tips eat the edge
 max_buy_sol = 1.0
 max_pool_impact_pct = 0.01 # never be more than 1% of pool SOL reserves
@@ -25,6 +28,12 @@ min_leader_buy_sol = 0.5   # ignore dust / test buys
 max_leader_buy_sol = 200.0
 venues = []                # empty = all decoded venues
 min_pool_sol = 15.0
+# max_pool_sol = 400.0       # skip deep pools (less upside left)
+# min_market_cap_sol = 30.0  # market-cap range (Pump.fun / PumpSwap, fixed 1B supply)
+# max_market_cap_sol = 3000.0
+one_entry_per_token = false  # true: enter each token once per run, across all leaders
+blacklist_mints = []         # never buy these tokens; add live: copybot ctl blacklist <address>
+blacklist_devs = []          # never buy tokens created by these wallets
 max_token_age_secs = 604800
 max_detection_slot_lag = 2 # we are >2 slots behind → skip
 max_price_drift_pct = 0.20 # price already +20% over leader fill → skip

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{FilterConfig, RiskConfig, SizingConfig};
+use crate::config::{FilterConfig, RiskConfig, SizingConfig, SizingMode};
 use crate::types::{sol_to_lamports, Lamports, Venue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +16,12 @@ pub enum SkipReason {
     LeaderBuyTooLarge,
     VenueNotAllowed,
     LiquidityTooLow,
+    LiquidityTooHigh,
+    MarketCapTooLow,
+    MarketCapTooHigh,
+    Blacklisted,
+    AlreadyTraded,
+    LeaderBalanceUnknown,
     TokenTooYoung,
     TokenTooOld,
     DetectionTooLate,
@@ -67,6 +73,10 @@ pub struct EntryContext {
     pub token_age_secs: Option<u64>,
     /// Slots between the leader's transaction and our detection of it.
     pub detection_slot_lag: u64,
+    /// Leader's SOL balance just before the trade (for `balance_fraction`).
+    pub leader_sol_before: Option<Lamports>,
+    /// Current market cap in SOL, when the supply is known.
+    pub market_cap_sol: Option<f64>,
 }
 
 /// Our own book at the moment we decide.
@@ -96,6 +106,19 @@ pub fn pre_trade_filters(f: &FilterConfig, e: &EntryContext) -> Result<(), SkipR
     if let (Some(min), Some(pool)) = (f.min_pool_sol, e.pool_sol) {
         if pool < sol_to_lamports(min) {
             return Err(SkipReason::LiquidityTooLow);
+        }
+    }
+    if let (Some(max), Some(pool)) = (f.max_pool_sol, e.pool_sol) {
+        if pool > sol_to_lamports(max) {
+            return Err(SkipReason::LiquidityTooHigh);
+        }
+    }
+    if let Some(mc) = e.market_cap_sol {
+        if f.min_market_cap_sol.is_some_and(|m| mc < m) {
+            return Err(SkipReason::MarketCapTooLow);
+        }
+        if f.max_market_cap_sol.is_some_and(|m| mc > m) {
+            return Err(SkipReason::MarketCapTooHigh);
         }
     }
     if let Some(age) = e.token_age_secs {
@@ -138,7 +161,15 @@ pub fn size_buy(
         return skip(SkipReason::MaxOpenPositions);
     }
 
-    let raw = (e.leader_buy as f64 * s.copy_pct).round() as Lamports;
+    let base = s.copy_amount_sol.map(sol_to_lamports).unwrap_or(0) as f64;
+    let raw = match s.mode {
+        SizingMode::LeaderPct => (e.leader_buy as f64 * s.copy_pct).round() as Lamports,
+        SizingMode::Fixed => base as Lamports,
+        SizingMode::BalanceFraction => match e.leader_sol_before.filter(|b| *b > 0) {
+            Some(bal) => (base * (e.leader_buy as f64 / bal as f64).min(1.0)).round() as Lamports,
+            None => return skip(SkipReason::LeaderBalanceUnknown),
+        },
+    };
     let mut size = raw;
     let mut capped_by = None;
     let mut cap = |limit: Lamports, which: Cap, size: &mut Lamports| {
@@ -188,6 +219,8 @@ mod tests {
     fn cfgs() -> (SizingConfig, RiskConfig, FilterConfig) {
         (
             SizingConfig {
+                mode: SizingMode::LeaderPct,
+                copy_amount_sol: None,
                 copy_pct: 0.10,
                 min_buy_sol: 0.05,
                 max_buy_sol: 1.0,
@@ -209,6 +242,12 @@ mod tests {
                 max_leader_buy_sol: Some(100.0),
                 venues: vec![],
                 min_pool_sol: Some(20.0),
+                max_pool_sol: None,
+                min_market_cap_sol: None,
+                max_market_cap_sol: None,
+                one_entry_per_token: false,
+                blacklist_mints: vec![],
+                blacklist_devs: vec![],
                 min_token_age_secs: None,
                 max_token_age_secs: Some(86_400),
                 max_detection_slot_lag: 2,
@@ -226,6 +265,8 @@ mod tests {
             pool_sol: Some(500 * SOL),
             token_age_secs: Some(600),
             detection_slot_lag: 1,
+            leader_sol_before: Some(100 * SOL),
+            market_cap_sol: Some(400.0),
         }
     }
 
@@ -320,5 +361,72 @@ mod tests {
                 reason: SkipReason::InsufficientBalance
             }
         );
+    }
+
+    #[test]
+    fn balance_fraction_mode() {
+        let (mut s, r, _) = cfgs();
+        s.mode = SizingMode::BalanceFraction;
+        s.copy_amount_sol = Some(2.0);
+        // leader spends 10 of 100 SOL → 10% of our 2 SOL base
+        let d = size_buy(&s, &r, &entry(10), &book());
+        assert_eq!(
+            d,
+            SizeDecision::Buy {
+                lamports: 200_000_000,
+                capped_by: None
+            }
+        );
+        let mut e = entry(10);
+        e.leader_sol_before = None;
+        assert_eq!(
+            size_buy(&s, &r, &e, &book()),
+            SizeDecision::Skip {
+                reason: SkipReason::LeaderBalanceUnknown
+            }
+        );
+    }
+
+    #[test]
+    fn fixed_mode_ignores_leader_size() {
+        let (mut s, r, _) = cfgs();
+        s.mode = SizingMode::Fixed;
+        s.copy_amount_sol = Some(0.25);
+        for l in [1, 7] {
+            assert_eq!(
+                size_buy(&s, &r, &entry(l), &book()),
+                SizeDecision::Buy {
+                    lamports: 250_000_000,
+                    capped_by: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn market_cap_and_max_liquidity_filters() {
+        let (_, _, mut f) = cfgs();
+        f.min_market_cap_sol = Some(500.0);
+        assert_eq!(
+            pre_trade_filters(&f, &entry(3)),
+            Err(SkipReason::MarketCapTooLow)
+        );
+        f.min_market_cap_sol = None;
+        f.max_market_cap_sol = Some(300.0);
+        assert_eq!(
+            pre_trade_filters(&f, &entry(3)),
+            Err(SkipReason::MarketCapTooHigh)
+        );
+        f.max_market_cap_sol = None;
+        f.max_pool_sol = Some(100.0);
+        assert_eq!(
+            pre_trade_filters(&f, &entry(3)),
+            Err(SkipReason::LiquidityTooHigh)
+        );
+        let mut e = entry(3);
+        e.market_cap_sol = None; // unknown supply: filter not applied
+        f.max_pool_sol = None;
+        f.min_market_cap_sol = Some(500.0);
+        assert_eq!(pre_trade_filters(&f, &e), Ok(()));
     }
 }

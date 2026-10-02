@@ -15,8 +15,12 @@ An honest status of every feature category those platforms offer, as of this com
 | Follow N wallets in real time (gRPC, sub-second) | 🔶 needs a gRPC provider | `chain::geyser`, filters hot-update without reconnect |
 | Pre-execution (shred/deshred) leader detection | 🔶 | `geyser::run_deshred`, `detect::pre_exec_pump_buys` (if your provider supports deshred) |
 | Copy a % of the leader's size (per-leader override) | ✅ | `sizing.copy_pct`, `[[leaders]] copy_pct` |
+| Size by the share of their balance the leader spent (BasedBot "Buy %") / fixed size | ✅ | `sizing.mode = balance_fraction \| fixed`, `copy_amount_sol` |
+| Market-cap range, max liquidity | ✅ | `filters.min/max_market_cap_sol`, `max_pool_sol` |
+| Token / dev blacklist (live-editable) | ✅ | `filters.blacklist_mints/devs`, `copybot ctl blacklist <address>` |
+| One entry per token across leaders (BasedBot "Trade Once Per Token") | ✅ | `filters.one_entry_per_token` |
 | Min/max leader trade size filter (BasedBot) | ✅ | `filters.min/max_leader_buy_sol` |
-| Min liquidity filter (BasedBot) | ✅ | `filters.min_pool_sol` |
+| Min / max liquidity filter (BasedBot) | ✅ | `filters.min_pool_sol`, `max_pool_sol` |
 | Max buy cap (BasedBot "Max Buy") | ✅ | `sizing.max_buy_sol` |
 | Token age filter (GMGN) | ✅ | `filters.min/max_token_age_secs` (age known for coins created while running) |
 | Platform/venue filter (GMGN) | ✅ | `filters.venues` |
@@ -61,7 +65,7 @@ An honest status of every feature category those platforms offer, as of this com
 | Sweep profits to a safe wallet | 🔶 | `copybot wallet sweep` |
 | Reclaim rent (close empty token accounts) | 🔶 | `copybot wallet close-empty`; also auto-close on full exit |
 | Recover open positions after restart | ✅ | engine `adopt` at startup |
-| Multi-wallet fleet, rotation, CEX funding, bulk funding | ⬜ | planned ([06](06-wallets-and-risk.md)) |
+| Multi-wallet fleet, folders, funders, bulk funding with delays (Proxima) | ⬜ | next item; see [09](09-proxima-basedbot-deep-dive.md) |
 | Action timeline | 📦 | the JSONL journal is the timeline; no UI yet |
 
 ## Token intelligence (GMGN, Axiom Pulse)
@@ -83,7 +87,7 @@ An honest status of every feature category those platforms offer, as of this com
 ## Operations
 | Feature | Status | Where |
 |---|---|---|
-| Operator control: `copybot ctl status / positions / leaders / pause / resume / kill / flatten` | ✅ | `control.rs` (local Unix socket) |
+| Operator control: `copybot ctl status / positions / leaders / pause / resume / kill / flatten / blacklist` | ✅ | `control.rs` (local Unix socket) |
 | Kill switch: daily loss, stale feed, manual | ✅ | engine |
 | Preflight check with latency | 🟢 | `copybot check` (mainnet RPC 47 ms from the build sandbox; Jito tip accounts fetched live) |
 | Live-chain dry run without funds | 🟢 | `copybot simulate [--sell]` |
@@ -95,8 +99,8 @@ An honest status of every feature category those platforms offer, as of this com
 
 ## Sources of truth
 - **GMGN:** official `gmgn-cli` (npm 1.6.6) and the `GMGNAI/gmgn-skills` repo define the OpenAPI routes, auth and fields the client uses.
-- **BasedBot:** no public repo or SDK exists.
-- **Proxima:** closed beta; GitHub org `proximacorp` with nothing public to build on.
+- **BasedBot:** no public repo or SDK. Its full GitBook docs (`docs.basedbot.app/llms-full.txt`) define the copy-trading controls; see [09](09-proxima-basedbot-deep-dive.md).
+- **Proxima:** no public code. Its complete docs (`docs.proxima.tools/llms-full.txt`) define its wallet and execution features; see [09](09-proxima-basedbot-deep-dive.md).
 - **Pump.fun / PumpSwap:** official IDLs + `@pump-fun/pump-sdk` / `pump-swap-sdk` source.
 - **Meteora DBC:** IDL embedded in `@meteora-ag/dynamic-bonding-curve-sdk` 1.5.13 + its `swap()` builder.
 - **Helius Sender:** endpoints, tip accounts and minimum tips from the official `helius-sdk` 3.2.0.

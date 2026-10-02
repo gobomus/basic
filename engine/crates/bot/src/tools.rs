@@ -651,6 +651,8 @@ pub fn bench(iterations: u32) {
             pool_sol: s.pool_sol,
             token_age_secs: None,
             detection_slot_lag: 0,
+            leader_sol_before: None,
+            market_cap_sol: None,
         };
         pre_trade_filters(&cfg.engine.filters, &entry).expect("filters");
         let engine_core::sizing::SizeDecision::Buy { lamports, .. } = size_buy(
