@@ -145,6 +145,8 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     let mut replay_gap: Vec<f64> = vec![];
     let mut live_policy_pnl: BTreeMap<String, Agg> = BTreeMap::new();
     let mut feed_drops = 0usize;
+    let mut feed_down_ms = 0i64;
+    let mut down_since: Option<i64> = None;
     let (mut first, mut last) = (i64::MAX, 0i64);
     let mut modes: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -178,7 +180,17 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
                     fetch_ms.push(d);
                 }
             }
-            "feed" if r["connected"] == false => feed_drops += 1,
+            "feed" => {
+                if r["connected"] == false {
+                    feed_drops += 1;
+                    down_since.get_or_insert(ts);
+                } else if r["detail"].as_str().is_some_and(str::is_empty) {
+                    // the connection itself is back (not just one more subscription)
+                    if let Some(t0) = down_since.take() {
+                        feed_down_ms += (ts - t0).max(0);
+                    }
+                }
+            }
             "position_open" => {
                 if let (Some(m), Some(p)) = (r["mint"].as_str(), r["exit_policy"].as_str()) {
                     policy_of.insert(m.to_string(), p.to_string());
@@ -240,6 +252,9 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         }
     }
 
+    if let Some(t0) = down_since {
+        feed_down_ms += (last - t0).max(0);
+    }
     let mut o = String::new();
     let span_h = (last - first).max(0) as f64 / 3_600_000.0;
     let modes_s = modes
@@ -269,7 +284,8 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
     if feed_drops > 0 {
         writeln!(
             o,
-            "  data feed dropped {feed_drops} time(s): leader trades during those gaps were missed"
+            "  data feed dropped {feed_drops} time(s), {:.0} s in total: leader trades during those gaps were missed",
+            feed_down_ms as f64 / 1000.0
         )?;
     }
     if let Some(m) = median(&decision_ms) {
@@ -347,6 +363,15 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         let best = trades.iter().map(|t| t.ret).fold(f64::MIN, f64::max);
         let worst = trades.iter().map(|t| t.ret).fold(f64::MAX, f64::min);
         writeln!(o, "  best {} · worst {}", pct(best), pct(worst))?;
+        let stopped: Vec<&Trade> = trades.iter().filter(|t| t.reason == "Shutdown").collect();
+        if !stopped.is_empty() {
+            writeln!(
+                o,
+                "  note: {} of these were still open when a run stopped and are valued at what a sale would have fetched at that moment ({} SOL), not closed by an exit rule",
+                stopped.len(),
+                sol(stopped.iter().map(|t| t.pnl).sum())
+            )?;
+        }
     }
 
     // ---- by leader
@@ -500,14 +525,22 @@ pub fn run(dir: &str, hours: Option<f64>) -> anyhow::Result<String> {
         "  {} {GATE_TRADES}+ closed trades ({n})",
         mark(n >= GATE_TRADES)
     )?;
+    // a confidence interval over a handful of trades is not evidence: it needs the
+    // same minimum the verdict asks for
+    let ci_counts = n >= MIN_TRADES;
     writeln!(
         o,
         "  {} mean return per trade is positive with 95% confidence{}",
-        mark(ci.is_some_and(|(lo, _)| lo > 0.0)),
+        mark(ci_counts && ci.is_some_and(|(lo, _)| lo > 0.0)),
         ci.map_or(String::new(), |(lo, hi)| format!(
-            " ({} to {})",
+            " ({} to {}{})",
             pct(lo),
-            pct(hi)
+            pct(hi),
+            if ci_counts {
+                String::new()
+            } else {
+                format!("; only {n} trades, meaningless below {MIN_TRADES}")
+            }
         ))
     )?;
     writeln!(
@@ -624,6 +657,55 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("[ ] 100+ closed trades (60)"), "{out}");
+    }
+
+    #[test]
+    fn positions_marked_out_when_a_run_stopped_are_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let recs = vec![
+            json!({"kind":"position_exit","ts":10,"mint":"A","leader":"L","pnl_sol":0.2,"ret":1.4,"held_ms":1000,"max_mult":3.0,"exit_reason":"Shutdown"}),
+            json!({"kind":"position_exit","ts":11,"mint":"B","leader":"L","pnl_sol":0.01,"ret":0.1,"held_ms":1000,"max_mult":1.1,"exit_reason":"Trailing"}),
+        ];
+        write(dir.path(), &recs);
+        let out = run(dir.path().to_str().unwrap(), None).unwrap();
+        assert!(
+            out.contains("1 of these were still open when a run stopped"),
+            "{out}"
+        );
+        assert!(out.contains("(+0.2000 SOL)"), "{out}");
+    }
+
+    #[test]
+    fn a_confidence_interval_over_two_trades_does_not_tick_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let recs = vec![
+            json!({"kind":"position_exit","ts":10,"mint":"A","leader":"L","pnl_sol":0.1,"ret":1.0,"held_ms":1000,"max_mult":2.0}),
+            json!({"kind":"position_exit","ts":11,"mint":"B","leader":"L","pnl_sol":0.01,"ret":0.1,"held_ms":1000,"max_mult":1.1}),
+        ];
+        write(dir.path(), &recs);
+        let out = run(dir.path().to_str().unwrap(), None).unwrap();
+        assert!(
+            out.contains("[ ] mean return per trade is positive with 95% confidence"),
+            "{out}"
+        );
+        assert!(out.contains("only 2 trades, meaningless below 30"), "{out}");
+    }
+
+    #[test]
+    fn feed_drops_report_how_long_the_feed_was_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let recs = vec![
+            json!({"kind":"feed","ts":1_000,"connected":true,"detail":"","source":"ws"}),
+            json!({"kind":"feed","ts":5_000,"connected":false,"detail":"closed","source":"ws"}),
+            json!({"kind":"feed","ts":6_500,"connected":true,"detail":"","source":"ws"}),
+            json!({"kind":"feed","ts":6_600,"connected":true,"detail":"subscribed X","source":"ws"}),
+            json!({"kind":"feed","ts":9_000,"connected":false,"detail":"closed","source":"ws"}),
+            json!({"kind":"feed","ts":9_800,"connected":true,"detail":"","source":"ws"}),
+        ];
+        write(dir.path(), &recs);
+        let out = run(dir.path().to_str().unwrap(), None).unwrap();
+        // 1.5 s + 0.8 s = 2.3 s
+        assert!(out.contains("dropped 2 time(s), 2 s in total"), "{out}");
     }
 
     #[test]
