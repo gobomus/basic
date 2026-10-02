@@ -20,6 +20,12 @@ on:
         description: "How long to run, in hours (max 5.5)"
         required: true
         default: "5"
+      ref:
+        # lets this one file live on the default branch while the engine's code is on
+        # the development branch; once the code is merged, point this at the default branch
+        description: "Branch with the code to run (leave as it is)"
+        required: false
+        default: "claude/solana-copy-trading-bot-xlkuzm"
 
 jobs:
   paper:
@@ -30,6 +36,8 @@ jobs:
       actions: read   # to fetch the journals of earlier runs
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
