@@ -19,7 +19,7 @@ on:
       limit:
         description: "Own transactions to read per wallet"
         required: false
-        default: "300"
+        default: "1000"
       ref:
         # lets this file live on the default branch while the code is on the development branch
         description: "Branch with the code to run (leave as it is)"
@@ -59,7 +59,7 @@ jobs:
         run: |
           mkdir -p audit
           ./engine/target/release/copybot wallet-audit --file wallets.txt \
-            --limit "${{ inputs.limit || '300' }}" --out audit \
+            --limit "${{ inputs.limit || '1000' }}" --out audit \
             --leaders-out audit/leaders.local.toml | tee audit/summary.txt
       - name: Summary
         if: always()

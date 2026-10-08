@@ -468,7 +468,10 @@ pub fn assess(a: &Activity, h: &History, t: &Trading, now_secs: i64) -> Assessme
             foreign * 100.0
         ));
     }
-    let class = if a.sigs == 0 || idle_days > INACTIVE_DAYS {
+    let class = if a.sigs == 0 {
+        reasons.push("the RPC returned no transactions for it".into());
+        Class::Unclear
+    } else if idle_days > INACTIVE_DAYS {
         reasons.push(format!("no transaction for {idle_days:.0} days"));
         Class::Inactive
     } else if a.looks_like_bot() {
@@ -618,12 +621,13 @@ pub fn table(rows: &[Row]) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "{:<18} {:<8} {:<8} {:>6} {:>10} {:>9} {:>5} {:>7} {:>8} {:>6}  why",
+        "{:<18} {:<8} {:<8} {:>6} {:>10} {:>6} {:>9} {:>5} {:>7} {:>8} {:>6}  why",
         "wallet",
         "verdict",
         "class",
         "trips",
         "PnL SOL",
+        "hours",
         "SOL/day",
         "win%",
         "hold s",
@@ -641,12 +645,13 @@ pub fn table(rows: &[Row]) -> String {
         }
         let _ = writeln!(
             o,
-            "{:<18} {:<8} {:<8} {:>6} {:>+10.2} {:>9} {:>4.0}% {:>7.0} {:>8.3} {:>5.0}%  {}",
+            "{:<18} {:<8} {:<8} {:>6} {:>+10.2} {:>6.1} {:>9} {:>4.0}% {:>7.0} {:>8.3} {:>5.0}%  {}",
             r.name.chars().take(18).collect::<String>(),
             verdict_word(r.assessment.verdict),
             format!("{:?}", r.assessment.class).to_lowercase(),
             t.round_trips,
             t.pnl_sol,
+            t.window_secs / 3600.0,
             t.pnl_per_day()
                 .map(|x| format!("{x:+.1}"))
                 .unwrap_or_else(|| "-".into()),
@@ -863,6 +868,9 @@ decu again 4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9
         };
         let v = assess(&active(now), &ok, &holder, now);
         assert_eq!((v.class, v.verdict), (Class::Holder, Verdict::Reject));
+        // the RPC returned nothing: unclear, not "inactive since 1970"
+        let v = assess(&Activity::default(), &ok, &Trading::default(), now);
+        assert_eq!((v.class, v.verdict), (Class::Unclear, Verdict::Watch));
         // nothing for weeks
         let mut idle = active(now);
         idle.last_ts = now - 30 * 86_400;

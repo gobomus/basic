@@ -90,8 +90,9 @@ enum Cmd {
         /// File with one wallet per line: `name: address`, `name address` or `address`
         #[arg(long)]
         file: Option<String>,
-        /// Own transactions to read per wallet (more = steadier verdict, slower on a free RPC)
-        #[arg(long, default_value_t = 300)]
+        /// Own transactions to read per wallet (more = a longer window and a steadier
+        /// verdict; ~5 min per active wallet on a free RPC)
+        #[arg(long, default_value_t = 1000)]
         limit: usize,
         /// Folder for the full results (JSON + table)
         #[arg(long, default_value = "data/wallet-audit")]

@@ -333,14 +333,18 @@ fn pumpswap_quotes_and_reserves_reproduce_real_trades() {
 
 /// Curves priced in another token (pump.fun's `buy_v2` with a non-SOL quote mint).
 /// The trade event's amounts are in the quote token: reading them as SOL turned a
-/// 1.54 SOL buy into a 188 "SOL" one in wallet audits. The SOL leg must come from the
-/// buyer's real balance change, and the swap must not claim a SOL-paired curve
-/// template we could execute. (Real transactions from 2026-10-08.)
+/// 1.5 SOL buy into a 188 "SOL" one in wallet audits. The SOL value comes from the
+/// routing leg in the same transaction, that leg is not counted again, and the swap
+/// must not claim a SOL-paired curve template we could execute.
+/// (Real transactions from 2026-10-08.)
 #[test]
 fn curve_priced_in_another_token_uses_the_real_sol_leg() {
+    // the SOL value is the routing leg: a PumpSwap buy of the quote token (1.485 SOL),
+    // a SOL-curve buy of the quote coin (2.97 SOL); the wallet's balance moved a little
+    // more (ATA rent, tips)
     for (f, sol_paid) in [
-        ("pump_curve_nonsol_buy.json", 1.541_495_72),
-        ("pump_curve_nonsol_buy2.json", 3.020_088_039),
+        ("pump_curve_nonsol_buy.json", 1.485),
+        ("pump_curve_nonsol_buy2.json", 2.97),
     ] {
         let tx = load(f);
         let buyer: chain::solana_sdk::pubkey::Pubkey =
@@ -372,11 +376,47 @@ fn curve_priced_in_another_token_uses_the_real_sol_leg() {
             assert_eq!(kind(&s.template), "generic", "{f}: not a SOL-paired curve");
             assert!(!s.exact, "{f}: amounts come from balances, not the event");
             let paid = s.sol_amount as f64 / 1e9;
-            // the balance leg excludes the network fee; ATA rent stays in (it is real cost)
             assert!(
-                (paid - sol_paid).abs() < 0.01,
+                (paid - sol_paid).abs() < 0.001,
                 "{f}: recorded {paid} SOL, the wallet paid {sol_paid}"
             );
         }
     }
+}
+
+/// Without the routing leg (the trader paid with quote tokens it already held) a
+/// coin-priced curve trade has no SOL value we can state, and it is left out rather
+/// than guessed from the SOL balance (which turned sniper buys into 400x "wins").
+#[test]
+fn coin_priced_curve_trade_without_a_sol_leg_is_left_out() {
+    let mut tx = load("pump_curve_nonsol_buy2.json");
+    let buyer: chain::solana_sdk::pubkey::Pubkey = "AXgzGEvbgaFeb1xhdXkQc5D5CehZUa89ci2F9ugQPLaA"
+        .parse()
+        .unwrap();
+    // the quote coin bought with SOL on the way (the routing leg)
+    let quote: chain::solana_sdk::pubkey::Pubkey = "5uLNRjHJzpm6Kyiv51WmUXCaKo1v4eZ1PGFkbgw9DGUU"
+        .parse()
+        .unwrap();
+    assert!(detect::swaps_by(&tx, &buyer)
+        .iter()
+        .any(|s| s.sol_amount > 2_000_000_000));
+    // drop the routing leg's trade event (event tag + discriminator, then its mint)
+    for (_, ixs) in tx.inner.iter_mut() {
+        ixs.retain(|ix| ix.data.get(16..48) != Some(&quote.to_bytes()[..]));
+    }
+    let left = detect::swaps_by(&tx, &buyer);
+    assert!(
+        left.iter().all(|s| s.mint != quote),
+        "the routing leg is gone: {:?}",
+        left.iter()
+            .map(|s| (s.mint, s.venue, s.exact, s.sol_amount))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        left.is_empty(),
+        "no SOL value can be stated, so nothing is recorded: {:?}",
+        left.iter()
+            .map(|s| (s.mint, s.sol_amount))
+            .collect::<Vec<_>>()
+    );
 }
