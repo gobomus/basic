@@ -157,6 +157,14 @@ pub fn coins_of_day(dir: &Path, day: &str) -> Vec<Coin> {
             c.cps.insert(cp, r);
         }
     }
+    // and, whatever the flags say, a coin with thousands of holders in its first minute
+    // existed before its "launch"
+    for c in coins.values_mut() {
+        c.not_new |= c
+            .cps
+            .range(..=60)
+            .any(|(_, r)| r["holders"].as_u64().unwrap_or(0) >= MAX_HOLDERS_FIRST_MINUTE);
+    }
     for m in read_kind(dir, "migrations") {
         if let Some(c) = m["mint"].as_str().and_then(|x| coins.get_mut(x)) {
             c.migrated = true;
@@ -166,6 +174,9 @@ pub fn coins_of_day(dir: &Path, day: &str) -> Vec<Coin> {
     v.sort_by_key(|c| c.created_ms);
     v
 }
+
+/// More holders than this in a coin's first minute means it is not a new coin.
+const MAX_HOLDERS_FIRST_MINUTE: u64 = 2_000;
 
 /// Holders a coin must reach to count as a real launch in the top-10 table.
 const MIN_HOLDERS_FOR_TOP: u64 = 20;
@@ -858,6 +869,9 @@ mod tests {
         }
         // a stablecoin in a trending list is not a memecoin
         t.row("trending", t0, &json!({"ts": t0, "list": "jup_trending_1h", "rank": 3, "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "launchpad": "-"})).unwrap();
+        // an existing token without the flag (recorded before it existed): caught by its holders
+        t.row("launches", t0, &json!({"ts": t0, "source": "pumpportal", "mint": "pumpOLD2", "launchpad": "pump.fun", "symbol": "OLDTWO"})).unwrap();
+        cp("pumpOLD2", 15, 1.2e8, 131_000, json!({}));
         // a Meteora coin quoted at $5M on $200 of liquidity: not a top launch
         t.row("launches", t0, &json!({"ts": t0, "created_ms": t0, "source": "jupiter", "mint": "Junk", "launchpad": "met-dbc", "symbol": "JNK"})).unwrap();
         cp("Junk", 15, 5.0e6, 30, json!({"liquidity": 200.0}));
@@ -878,7 +892,7 @@ mod tests {
         assert!(text.contains("graduated: 1"), "{text}");
         // top launch is the graduate, with its early snapshot
         assert!(
-            text.contains("; 1 existing tokens reported as creates left out"),
+            text.contains("; 2 existing tokens reported as creates left out"),
             "{text}"
         );
         assert!(!text.contains("OLD"), "{text}");
