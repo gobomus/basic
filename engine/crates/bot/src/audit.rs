@@ -290,6 +290,18 @@ pub struct Trading {
     pub window_secs: f64,
     pub open_positions: usize,
     pub venues: BTreeMap<String, u32>,
+    /// The three best and three worst round trips: the evidence behind the totals.
+    pub extremes: Vec<TripSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TripSummary {
+    pub mint: String,
+    pub venue: String,
+    pub cost_sol: f64,
+    pub proceeds_sol: f64,
+    pub hold_secs: f64,
+    pub entry_ms: i64,
 }
 
 impl Trading {
@@ -300,6 +312,8 @@ impl Trading {
 }
 
 struct Trip {
+    mint: Pubkey,
+    venue: String,
     entry_ms: i64,
     exit_ms: i64,
     cost: f64,
@@ -334,6 +348,8 @@ pub fn trading(swaps: &[(i64, DetectedSwap)]) -> Trading {
                 let frac = (s.token_amount as f64 / e.2 as f64).min(1.0);
                 let cost = e.1 * frac;
                 trips.push(Trip {
+                    mint: s.mint,
+                    venue: format!("{:?}", s.venue),
                     entry_ms: e.0,
                     exit_ms: *t,
                     cost,
@@ -357,6 +373,32 @@ pub fn trading(swaps: &[(i64, DetectedSwap)]) -> Trading {
         .iter()
         .map(|t| (t.exit_ms - t.entry_ms) as f64 / 1000.0)
         .collect();
+    let mut by_pnl: Vec<&Trip> = trips.iter().collect();
+    by_pnl.sort_by(|a, b| {
+        (b.proceeds - b.cost)
+            .partial_cmp(&(a.proceeds - a.cost))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let pick: Vec<&Trip> = if by_pnl.len() <= 6 {
+        by_pnl
+    } else {
+        by_pnl[..3]
+            .iter()
+            .chain(&by_pnl[by_pnl.len() - 3..])
+            .copied()
+            .collect()
+    };
+    let extremes = pick
+        .into_iter()
+        .map(|t| TripSummary {
+            mint: t.mint.to_string(),
+            venue: t.venue.clone(),
+            cost_sol: t.cost,
+            proceeds_sol: t.proceeds,
+            hold_secs: (t.exit_ms - t.entry_ms) as f64 / 1000.0,
+            entry_ms: t.entry_ms,
+        })
+        .collect();
     let (first, last) = (
         swaps.first().map(|s| s.0).unwrap_or(0),
         swaps.last().map(|s| s.0).unwrap_or(0),
@@ -379,6 +421,7 @@ pub fn trading(swaps: &[(i64, DetectedSwap)]) -> Trading {
         window_secs: (last - first) as f64 / 1000.0,
         open_positions: open.len(),
         venues,
+        extremes,
     }
 }
 

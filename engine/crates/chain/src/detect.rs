@@ -239,10 +239,15 @@ pub fn program_data_logs(tx: &ChainTx, program: &Pubkey) -> Vec<Vec<u8>> {
     out
 }
 
-fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> DetectedSwap {
+fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> Option<DetectedSwap> {
+    if e.quote_mint
+        .is_some_and(|q| q != WSOL_MINT && q != Pubkey::default())
+    {
+        return curve_swap_quoted_elsewhere(tx, e);
+    }
     let (tp, dec) = token_program_of(tx, &e.mint);
     let coin = CurveCoin::sol_paired(e.mint, e.creator, tp, e.mayhem_mode);
-    DetectedSwap {
+    Some(DetectedSwap {
         wallet: e.user,
         mint: e.mint,
         side: if e.is_buy { Side::Buy } else { Side::Sell },
@@ -266,7 +271,57 @@ fn curve_swap(tx: &ChainTx, e: &TradeEvent) -> DetectedSwap {
         },
         creator: Some(e.creator),
         migrated: false,
+    })
+}
+
+/// A curve priced in another token (USDC, USD1…): the event's amounts are in that
+/// token, not SOL. What the trader paid or received in SOL is their SOL balance
+/// change (the transaction swaps SOL for the quote token on the way). Without a SOL
+/// leg, the trader paid in the quote token itself and the trade has no SOL value we
+/// can state, so it is left out. Our execution templates are SOL-paired, so these
+/// trades are recorded but not copied directly.
+fn curve_swap_quoted_elsewhere(tx: &ChainTx, e: &TradeEvent) -> Option<DetectedSwap> {
+    let delta = sol_delta(tx, &e.user)?;
+    if (e.is_buy && delta >= 0) || (!e.is_buy && delta <= 0) {
+        return None;
     }
+    let (tp, dec) = token_program_of(tx, &e.mint);
+    let sol = delta.unsigned_abs() as u64;
+    Some(DetectedSwap {
+        wallet: e.user,
+        mint: e.mint,
+        side: if e.is_buy { Side::Buy } else { Side::Sell },
+        venue: Venue::PumpFunCurve,
+        sol_amount: sol,
+        token_amount: e.token_amount,
+        token_decimals: dec,
+        token_program: tp,
+        price_sol: (sol as f64 / 1e9) / (e.token_amount.max(1) as f64 / 10f64.powi(dec as i32)),
+        pool_sol: None,
+        fraction_sold: if e.is_buy {
+            None
+        } else {
+            fraction_sold(tx, &e.user, &e.mint, e.token_amount)
+        },
+        exact: false,
+        template: Template::Generic,
+        creator: Some(e.creator),
+        migrated: false,
+    })
+}
+
+/// Lamports the wallet gained (+) or spent (−) in the transaction, wrapped SOL
+/// included, network fee excluded.
+fn sol_delta(tx: &ChainTx, wallet: &Pubkey) -> Option<i128> {
+    let idx = tx.key_index(wallet)?;
+    let (pre, post) = (tx.pre_balances.get(idx)?, tx.post_balances.get(idx)?);
+    let mut d = *post as i128 - *pre as i128;
+    if tx.fee_payer() == Some(wallet) {
+        d += tx.fee as i128;
+    }
+    d += token_balance(&tx.post_tokens, wallet, &WSOL_MINT) as i128
+        - token_balance(&tx.pre_tokens, wallet, &WSOL_MINT) as i128;
+    Some(d)
 }
 
 /// Rebuild the AMM execution template from the leader's own instruction.
@@ -350,18 +405,9 @@ fn amm_swap(tx: &ChainTx, e: &SwapEventData) -> Option<DetectedSwap> {
 /// Balance-delta detection for any venue. Also used for our own fills: it
 /// captures the true SOL cost including fees, tips and rent.
 pub fn balance_swaps(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
-    let Some(idx) = tx.key_index(wallet) else {
+    let Some(sol_delta) = sol_delta(tx, wallet) else {
         return vec![];
     };
-    let (Some(pre), Some(post)) = (tx.pre_balances.get(idx), tx.post_balances.get(idx)) else {
-        return vec![];
-    };
-    let mut sol_delta = *post as i128 - *pre as i128;
-    if tx.fee_payer() == Some(wallet) {
-        sol_delta += tx.fee as i128;
-    }
-    sol_delta += token_balance(&tx.post_tokens, wallet, &WSOL_MINT) as i128
-        - token_balance(&tx.pre_tokens, wallet, &WSOL_MINT) as i128;
 
     let mut mints: Vec<Pubkey> = tx
         .pre_tokens
@@ -541,15 +587,36 @@ fn enrich_launchlab(tx: &ChainTx, swaps: &mut [DetectedSwap]) {
     }
 }
 
+/// A curve can be priced in another token (pump.fun `buy_v2` with a quote mint):
+/// traders then buy the quote token with SOL and spend it on the curve in the same
+/// transaction. That first leg is routing, not a position; it is dropped so the
+/// SOL is counted once, against the coin actually bought (and sold the same way).
+fn drop_routing_hops(events: &[PumpEvent], out: &mut Vec<DetectedSwap>) {
+    let hops: Vec<(Pubkey, Pubkey)> = events
+        .iter()
+        .filter_map(|e| match e {
+            PumpEvent::Trade(t) => t
+                .quote_mint
+                .filter(|q| *q != WSOL_MINT && *q != Pubkey::default())
+                .map(|q| (t.user, q)),
+            _ => None,
+        })
+        .collect();
+    if !hops.is_empty() {
+        out.retain(|s| !hops.contains(&(s.wallet, s.mint)));
+    }
+}
+
 /// Swaps executed by `wallet` in this transaction.
 pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
     if tx.failed {
         return vec![];
     }
-    let mut out: Vec<DetectedSwap> = pump_events(tx)
+    let events = pump_events(tx);
+    let mut out: Vec<DetectedSwap> = events
         .iter()
         .filter_map(|e| match e {
-            PumpEvent::Trade(t) if t.user == *wallet => Some(curve_swap(tx, t)),
+            PumpEvent::Trade(t) if t.user == *wallet => curve_swap(tx, t),
             _ => None,
         })
         .collect();
@@ -559,6 +626,7 @@ pub fn swaps_by(tx: &ChainTx, wallet: &Pubkey) -> Vec<DetectedSwap> {
             .filter(|e| e.user == *wallet)
             .filter_map(|e| amm_swap(tx, e)),
     );
+    drop_routing_hops(&events, &mut out);
     if out.is_empty() && tx.has_meta {
         out = balance_swaps(tx, wallet);
         enrich_dbc(tx, &mut out);
@@ -572,14 +640,16 @@ pub fn all_swaps(tx: &ChainTx) -> Vec<DetectedSwap> {
     if tx.failed {
         return vec![];
     }
-    let mut out: Vec<DetectedSwap> = pump_events(tx)
+    let events = pump_events(tx);
+    let mut out: Vec<DetectedSwap> = events
         .iter()
         .filter_map(|e| match e {
-            PumpEvent::Trade(t) => Some(curve_swap(tx, t)),
+            PumpEvent::Trade(t) => curve_swap(tx, t),
             _ => None,
         })
         .collect();
     out.extend(amm_events(tx).iter().filter_map(|e| amm_swap(tx, e)));
+    drop_routing_hops(&events, &mut out);
     if out.is_empty() && tx.has_meta {
         for s in tx.signers().to_vec() {
             out.extend(balance_swaps(tx, &s));

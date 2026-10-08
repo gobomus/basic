@@ -330,3 +330,53 @@ fn pumpswap_quotes_and_reserves_reproduce_real_trades() {
         e.user_quote_amount
     );
 }
+
+/// Curves priced in another token (pump.fun's `buy_v2` with a non-SOL quote mint).
+/// The trade event's amounts are in the quote token: reading them as SOL turned a
+/// 1.54 SOL buy into a 188 "SOL" one in wallet audits. The SOL leg must come from the
+/// buyer's real balance change, and the swap must not claim a SOL-paired curve
+/// template we could execute. (Real transactions from 2026-10-08.)
+#[test]
+fn curve_priced_in_another_token_uses_the_real_sol_leg() {
+    for (f, sol_paid) in [
+        ("pump_curve_nonsol_buy.json", 1.541_495_72),
+        ("pump_curve_nonsol_buy2.json", 3.020_088_039),
+    ] {
+        let tx = load(f);
+        let buyer: chain::solana_sdk::pubkey::Pubkey =
+            "AXgzGEvbgaFeb1xhdXkQc5D5CehZUa89ci2F9ugQPLaA"
+                .parse()
+                .unwrap();
+        let swaps = detect::swaps_by(&tx, &buyer);
+        // the first leg (buying the quote token with SOL) is routing, not a position
+        assert_eq!(
+            swaps.len(),
+            1,
+            "{f}: one buy, not the routing leg too: {:?}",
+            swaps
+                .iter()
+                .map(|s| (s.venue, s.sol_amount))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            detect::all_swaps(&tx)
+                .iter()
+                .filter(|s| s.wallet == buyer)
+                .count(),
+            1,
+            "{f}: the market view agrees"
+        );
+        for s in &swaps {
+            assert_eq!(s.venue, Venue::PumpFunCurve, "{f}");
+            assert_eq!(s.side, Side::Buy, "{f}");
+            assert_eq!(kind(&s.template), "generic", "{f}: not a SOL-paired curve");
+            assert!(!s.exact, "{f}: amounts come from balances, not the event");
+            let paid = s.sol_amount as f64 / 1e9;
+            // the balance leg excludes the network fee; ATA rent stays in (it is real cost)
+            assert!(
+                (paid - sol_paid).abs() < 0.01,
+                "{f}: recorded {paid} SOL, the wallet paid {sol_paid}"
+            );
+        }
+    }
+}
