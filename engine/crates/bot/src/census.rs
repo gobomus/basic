@@ -65,6 +65,7 @@ fn sha256_hex(b: &[u8]) -> String {
 // ------------------------------------------------------------------ storage
 
 /// Append-only day files under `dir/<YYYY-MM-DD>/`.
+#[derive(Clone)]
 pub struct Tape {
     dir: PathBuf,
     raw: RawMode,
@@ -283,6 +284,11 @@ pub struct CensusArgs {
     /// Seconds between trending captures.
     pub trending_secs: u64,
     pub raw: RawMode,
+    /// WebSocket endpoints for the pump program's logs (empty: no trade stream), and
+    /// how many connections to keep to each.
+    pub trades_ws: Vec<String>,
+    pub trades_ws_conns: usize,
+    pub trades: crate::micro::TradesMode,
 }
 
 /// Which response bodies go to the raw archive. Checkpoint lookups are ~95% of the
@@ -498,6 +504,18 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
     let mut c = Counters::default();
     let (pp_tx, mut pp_rx) = mpsc::channel::<PpEvent>(10_000);
     let pp = tokio::spawn(pumpportal(pp_tx));
+    // every create and trade on the pump program, for the first-minute books
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let stream = (!args.trades_ws.is_empty()).then(|| {
+        tokio::spawn(crate::micro::run(
+            args.trades_ws.clone(),
+            args.trades_ws_conns,
+            tape.clone(),
+            args.out.clone(),
+            args.trades,
+            stop_rx,
+        ))
+    });
     let deadline = args
         .minutes
         .map(|m| tokio::time::Instant::now() + Duration::from_secs(m * 60));
@@ -635,6 +653,15 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
     }
     pp.abort();
     sched.save(&state_path)?;
+    if let Some(h) = stream {
+        let _ = stop_tx.send(true);
+        match tokio::time::timeout(Duration::from_secs(30), h).await {
+            Ok(Ok(Err(e))) => eprintln!("pump stream: {e}"),
+            Ok(Err(e)) => eprintln!("pump stream task: {e}"),
+            Err(_) => eprintln!("pump stream did not stop within 30 s"),
+            Ok(Ok(Ok(()))) => {}
+        }
+    }
     eprintln!(
         "census stopped: {} launches, {} checkpoints, {} trending captures; {} coins pending in {}",
         c.launches_pp + c.launches_jup,

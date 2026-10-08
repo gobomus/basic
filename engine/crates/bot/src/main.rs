@@ -21,6 +21,7 @@ mod exec;
 mod gmgn;
 mod journal;
 mod keystore;
+mod micro;
 mod report;
 mod tools;
 
@@ -119,6 +120,16 @@ enum Cmd {
         /// Response bodies kept in the raw archive
         #[arg(long, value_enum, default_value_t = census::RawMode::Lists)]
         raw: census::RawMode,
+        /// WebSocket endpoint(s) streaming the pump program's logs (every create and
+        /// trade; the public one works), comma-separated; `off` to record without it
+        #[arg(long, default_value = "wss://api.mainnet-beta.solana.com")]
+        trades_ws: String,
+        /// Connections kept to each endpoint at once (a recycled one leaves no hole)
+        #[arg(long, default_value_t = 2)]
+        trades_ws_conns: usize,
+        /// Decoded events kept in trades-<hour>.jsonl.gz
+        #[arg(long, value_enum, default_value_t = micro::TradesMode::FirstHour)]
+        trades: micro::TradesMode,
     },
     /// Labels and daily tables from the census tape: coverage, base rates, early-signal
     /// table, top 10 launches and top 20 trending (writes <dir>/<day>/daily.md)
@@ -275,6 +286,9 @@ async fn main() -> anyhow::Result<()> {
             minutes,
             trending_secs,
             raw,
+            trades_ws,
+            trades_ws_conns,
+            trades,
         } => {
             census::run(census::CensusArgs {
                 out: out.into(),
@@ -282,6 +296,14 @@ async fn main() -> anyhow::Result<()> {
                 rpc_url: cfg::env("RPC_URL").ok(),
                 trending_secs,
                 raw,
+                trades_ws: trades_ws
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty() && *u != "off")
+                    .map(String::from)
+                    .collect(),
+                trades_ws_conns,
+                trades,
             })
             .await
         }

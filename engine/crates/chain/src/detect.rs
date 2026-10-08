@@ -209,11 +209,16 @@ pub fn amm_events(tx: &ChainTx) -> Vec<SwapEventData> {
 /// Raydium LaunchLab both emit a `TradeEvent` with the same discriminator —
 /// so unattributed log data must never be decoded.
 pub fn program_data_logs(tx: &ChainTx, program: &Pubkey) -> Vec<Vec<u8>> {
+    program_data_in_logs(&tx.logs, program)
+}
+
+/// Same as [`program_data_logs`] on bare log lines (e.g. a `logsSubscribe` notification).
+pub fn program_data_in_logs(logs: &[String], program: &Pubkey) -> Vec<Vec<u8>> {
     use base64::Engine;
     let target = program.to_string();
     let mut stack: Vec<&str> = Vec::new();
     let mut out = Vec::new();
-    for l in &tx.logs {
+    for l in logs {
         if let Some(rest) = l.strip_prefix("Program ") {
             if let Some(data) = rest.strip_prefix("data: ") {
                 if stack.last() == Some(&target.as_str()) {

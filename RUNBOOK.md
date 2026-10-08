@@ -92,7 +92,7 @@ Everything is also written to `data/journal/*.jsonl` (one JSON per line).
 **Go / no-go for Path B:** all four boxes ticked: 300+ leader buys seen, 100+ closed trades, mean return per trade positive with 95% confidence, and at least 3 leaders individually in profit. Several days of running, not one afternoon. If the verdict is "losing" or "inconclusive": change leaders or exits and run again. That is what Path A is for.
 
 ## A5. Record the market (census)
-The census is the data the v2 engine is tuned on (`docs/10-engine-v2-plan.md`): every new coin, how each one looks at fixed moments of its life, and what is trending. It is free, needs no keys, and trades nothing.
+The census is the data the v2 engine is tuned on (`docs/10-engine-v2-plan.md`): every new coin, every trade in its first hour, how each one looks at fixed moments of its life, and what is trending. It is free, needs no keys, and trades nothing.
 ```bash
 copybot census --out data/census                 # runs until Ctrl-C; --minutes 600 to stop by itself
 copybot census-report --dir data/census          # today's tables; --day 2026-10-08 for another day
@@ -101,6 +101,11 @@ What it records, timestamped when it arrives:
 - **Launches:** every Pump.fun creation as it happens (PumpPortal), and the newest coins of every launchpad (Jupiter, polled every 10 s), with the coin's first stats.
 - **Checkpoints:** each coin's holders, traders, buy/sell flow, market cap, liquidity, top-holder share and dev balance at 15 s, 30 s, 1, 2, 5, 15, 30 min, 1, 3, 6 and 24 h after creation, plus the exact SOL in its Pump.fun curve when `RPC_URL` is set. A coin with no traders and 3 holders or fewer from 5 min on counts as dead and is not checked again.
 - **Trending and attention lists** every 5 min: Jupiter trending (5 min / 1 h / 24 h), organic score, most traded; DexScreener boosts, profiles and community takeovers; Pump.fun live streams.
+- **Every Pump.fun create, trade and graduation**, from the public RPC's log stream (`logsSubscribe` on the pump program; it runs 1–3 s behind the chain, up to ~9 s when the network is busy). Two connections are kept open at once and each transaction is taken from whichever delivers it first, because the public endpoint drops connections every minute or so. For each new coin this gives exact books:
+  - `micro.jsonl`: the coin at 5, 15, 30, 60, 120, 300 and 900 s after its creation, counting only trades stamped at or before that moment, in chain order: holders, buyers, sellers, flow, market cap, curve progress, holder and buyer concentration (HHI), top-1 and top-10 share, dev holding and whether the dev sold, snipers (bought in the create slot or the next one), how many of them sold out, and the SOL flow second by second for the first minute;
+  - `curve_outcomes.jsonl`, written one hour after creation: the market cap at each snapshot and the highest one after it, graduation and when;
+  - `feed.jsonl` each minute: transactions, failures, trades, creates, delay behind the chain, connections up. A coin whose first seconds fall in a moment with every connection down carries `gap_ms` and is left out of the tables;
+  - `trades-<hour>.jsonl.gz`: the decoded events (`--trades first-hour`, the default: creates, graduations and the trades of coins in their first hour, about 1 GB a day; `--trades all`: every pump trade; `--trades none`). `--trades-ws` picks other endpoints (comma-separated), `--trades-ws off` turns the stream off.
 - **Raw responses** in `raw-<hour>.jsonl.gz` with a SHA-256 that each row points to, so any number can be re-derived. `--raw lists` (default) keeps everything except the per-coin batch lookups, `--raw all` keeps those too, `--raw none` keeps nothing.
 
 Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/census/state.json` every 5 min and on stop, so the next run continues where this one left off.
@@ -108,10 +113,11 @@ Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/cen
 `census-report` writes `daily.md` and `labels.jsonl` to the day's folder:
 - **coverage** (launches seen per source, checkpoints on time) and **base rates** (how many coins graduate, double, or die);
 - the **early-signal table**: coins grouped by their holder count at 60 s, and how often each group doubled afterwards (using only later checkpoints, so no hindsight);
+- the **trade-stream tables** (exact books): holders at 15 s, holder concentration at 15 s, dev and sniper behaviour, each against the chance the market cap doubles within the hour, for all the day's coins and separately for its earlier and later half, plus the WO-3 verdict judged on the later half only;
 - the **top 10 launches** of the day, with how they looked at 15 s, 60 s and 5 min;
 - the **top 20 trending** coins, with when they first entered the list and whether we had recorded their launch.
 
-**Running it around the clock for free:** the `census` workflow (`.github/workflows/census.yml`) records for 5 h 45 min every 6 hours, carries the pending checkpoints from run to run, keeps each run's recording for 90 days, and puts the day's report on each run's summary page. Like the other workflows, it runs on schedule only once the file is on the default branch. GitHub's scheduled runs can start late or be skipped when GitHub is busy, so expect small gaps; a $5–15/month server running `copybot census` as a service has none. Size: roughly 0.5 GB per day uncompressed (about a quarter of that zipped).
+**Running it around the clock for free:** the `census` workflow (`.github/workflows/census.yml`) records for 5 h 45 min every 6 hours, carries the pending checkpoints from run to run, keeps each run's recording for 90 days, and puts the day's report on each run's summary page; the trade tape is kept 14 days as a separate artifact (`census-trades`). Like the other workflows, it runs on schedule only once the file is on the default branch. GitHub's scheduled runs can start late or be skipped when GitHub is busy, so expect small gaps; a $5–15/month server running `copybot census` as a service has none. Size per day: about 0.5 GB uncompressed for the checkpoints, lists and books (a quarter of that zipped) plus about 1 GB of trade tape. Coins created in the last hour of a run get no complete outcome (the stream is not carried between runs), so about one in six is left out of the trade-stream tables on Actions; a server loses none.
 
 ## RPC options (all free)
 | | Limits | Notes |

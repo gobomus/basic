@@ -18,6 +18,11 @@ use serde_json::{json, Value};
 /// Every row of the given kind under `dir` (all day folders: a day's coins keep
 /// being checkpointed into the next day).
 fn read_kind(dir: &Path, kind: &str) -> Vec<Value> {
+    read_kind_where(dir, kind, |_| true)
+}
+
+/// Rows of `kind` for which `keep` is true (parsed one line at a time).
+fn read_kind_where(dir: &Path, kind: &str, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
     let mut out = vec![];
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -30,7 +35,11 @@ fn read_kind(dir: &Path, kind: &str) -> Vec<Value> {
                 stack.push(p);
             } else if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{kind}.jsonl")) {
                 if let Ok(text) = std::fs::read_to_string(&p) {
-                    out.extend(text.lines().filter_map(|l| serde_json::from_str(l).ok()));
+                    out.extend(
+                        text.lines()
+                            .filter_map(|l| serde_json::from_str(l).ok())
+                            .filter(|v| keep(v)),
+                    );
                 }
             }
         }
@@ -297,6 +306,24 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
         base * 100.0
     );
 
+    // ---- first-minute microstructure (trade stream)
+    let outcomes = read_kind_where(dir, "curve_outcomes", |r| {
+        r["created_ts"]
+            .as_i64()
+            .map(|t| day_of(t * 1000))
+            .as_deref()
+            == Some(day)
+    });
+    let snaps: HashMap<String, Value> = read_kind_where(dir, "micro", |r| r["t"] == MICRO_T)
+        .into_iter()
+        .filter_map(|r| Some((r["mint"].as_str()?.to_string(), r)))
+        .collect();
+    let feed: Vec<Value> = read_kind(dir, "feed")
+        .into_iter()
+        .filter(|r| r["ts"].as_i64().map(day_of).as_deref() == Some(day))
+        .collect();
+    o.push_str(&micro_section(&outcomes, &snaps, &feed, pp));
+
     // ---- top 10 launches
     // a launch is a coin from a launchpad that real wallets hold: new pools of old tokens
     // and one-holder tokens with a made-up market cap are left out
@@ -494,6 +521,257 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
     (o, labels)
 }
 
+/// Snapshot the WO-3 table is built on (seconds after creation).
+const MICRO_T: i64 = 15;
+/// Index of [`MICRO_T`] in `micro::SNAPSHOTS` (outcome arrays use that order).
+const MICRO_I: usize = 1;
+/// Launches the WO-3 gate needs before it is judged.
+const GATE_MIN_COINS: usize = 10_000;
+
+/// A named bucket of a lift table: which coins (by their snapshot) fall in it.
+type Rule<'a> = (&'a str, &'a dyn Fn(&Value) -> bool);
+
+/// One row of a lift table: coins, doubled, and the same for the earlier and later half.
+struct Bucket {
+    all: (usize, usize),
+    early: (usize, usize),
+    late: (usize, usize),
+}
+
+fn lift_table(
+    o: &mut String,
+    title: &str,
+    coins: &[(i64, &Value, bool)],
+    half_ts: i64,
+    buckets: &[Rule],
+    base: (f64, f64, f64),
+) -> Vec<Bucket> {
+    let _ = writeln!(o, "\n| {title} | coins | doubled | rate | lift | earlier half: rate · lift | later half: rate · lift |");
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|");
+    let mut out = vec![];
+    let pct = |k: usize, n: usize| 100.0 * k as f64 / n.max(1) as f64;
+    let lift = |k: usize, n: usize, b: f64| {
+        if n == 0 || b <= 0.0 {
+            "-".to_string()
+        } else {
+            format!("{:.1}x", (k as f64 / n as f64) / b)
+        }
+    };
+    for (label, f) in buckets {
+        let mut b = Bucket {
+            all: (0, 0),
+            early: (0, 0),
+            late: (0, 0),
+        };
+        for (ts, snap, up) in coins {
+            if !f(snap) {
+                continue;
+            }
+            let part = if *ts < half_ts {
+                &mut b.early
+            } else {
+                &mut b.late
+            };
+            for x in [&mut b.all, part] {
+                x.0 += 1;
+                x.1 += *up as usize;
+            }
+        }
+        let _ = writeln!(
+            o,
+            "| {label} | {} | {} | {:.1}% | {} | {:.1}% · {} | {:.1}% · {} |",
+            b.all.0,
+            b.all.1,
+            pct(b.all.1, b.all.0),
+            lift(b.all.1, b.all.0, base.0),
+            pct(b.early.1, b.early.0),
+            lift(b.early.1, b.early.0, base.1),
+            pct(b.late.1, b.late.0),
+            lift(b.late.1, b.late.0, base.2),
+        );
+        out.push(b);
+    }
+    out
+}
+
+/// The early-signal tables from the trade stream (exact first-minute books) and the
+/// WO-3 gate: does holders@15 s lift ≥ 5x and HHI ≥ 0.8 → ≈ 0% hold on the later half
+/// of the day's coins (chronological split: nothing from the later half was looked at
+/// to pick the buckets).
+fn micro_section(
+    outcomes: &[Value],
+    snaps: &HashMap<String, Value>,
+    feed: &[Value],
+    pumpportal_launches: usize,
+) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "\n## Early signal from the trade stream (every trade, first {MICRO_T} s)"
+    );
+    if outcomes.is_empty() {
+        let _ = writeln!(o, "_No trade-stream outcomes for this day yet (each coin's outcome is written one hour after its creation)._");
+        return o;
+    }
+    let lags: Vec<f64> = feed
+        .iter()
+        .filter_map(|r| r["lag_p50_ms"].as_f64())
+        .collect();
+    let minutes = feed.len();
+    let down = feed.iter().filter(|r| r["connected"] == false).count();
+    let gaps = feed
+        .iter()
+        .filter_map(|r| r["disconnects"].as_u64())
+        .max()
+        .unwrap_or(0);
+    let _ = writeln!(
+        o,
+        "- stream: {} coins followed from their create (PumpPortal saw {pumpportal_launches} launches); delay behind the chain median {} ms; {minutes} minutes logged, {down} of them with every connection down; {gaps} gaps",
+        outcomes.len(),
+        opt(engine_core::stats::median(&lags).map(|x| x.round()))
+    );
+    // a coin counts when its hour was recorded whole, its 15 s book had no gap, it is
+    // priced in SOL, and it had a market cap at 15 s
+    let mut coins: Vec<(i64, &Value, bool)> = outcomes
+        .iter()
+        .filter(|r| {
+            r["full_window"] == true
+                && r["quote"].is_null()
+                && r["gap_ms"].as_i64().unwrap_or(0) <= 60_000
+        })
+        .filter_map(|r| {
+            let snap = snaps.get(r["mint"].as_str()?)?;
+            if snap["gap_ms"].as_i64() != Some(0) {
+                return None;
+            }
+            let at = r["mcap_at"][MICRO_I].as_f64().filter(|m| *m > 0.0)?;
+            let peak = r["peak_after"][MICRO_I].as_f64()?;
+            Some((r["created_ts"].as_i64()?, snap, peak >= 2.0 * at))
+        })
+        .collect();
+    coins.sort_by_key(|c| c.0);
+    let n = coins.len();
+    let grads = outcomes.iter().filter(|r| r["graduated"] == true).count();
+    let _ = writeln!(
+        o,
+        "- usable coins (whole hour recorded, no gap in the first {MICRO_T} s, priced in SOL): **{n}** of {} · graduated within the hour: {grads} ({:.2}%)",
+        outcomes.len(),
+        100.0 * grads as f64 / outcomes.len() as f64
+    );
+    if n == 0 {
+        return o;
+    }
+    let half_ts = coins[n / 2].0;
+    let rate = |v: &[&(i64, &Value, bool)]| {
+        v.iter().filter(|c| c.2).count() as f64 / v.len().max(1) as f64
+    };
+    let all: Vec<_> = coins.iter().collect();
+    let early: Vec<_> = coins.iter().filter(|c| c.0 < half_ts).collect();
+    let late: Vec<_> = coins.iter().filter(|c| c.0 >= half_ts).collect();
+    let base = (rate(&all), rate(&early), rate(&late));
+    let _ = writeln!(
+        o,
+        "- base rate (market cap doubles within the hour after {MICRO_T} s): {:.2}% · earlier half {:.2}% · later half {:.2}%",
+        base.0 * 100.0, base.1 * 100.0, base.2 * 100.0
+    );
+    let h = |lo: u64, hi: u64| {
+        move |s: &Value| s["holders"].as_u64().is_some_and(|x| x >= lo && x < hi)
+    };
+    let (h01, h24, h59, h1019, h2029, h30) = (
+        h(0, 2),
+        h(2, 5),
+        h(5, 10),
+        h(10, 20),
+        h(20, 30),
+        h(30, u64::MAX),
+    );
+    let holders = lift_table(
+        &mut o,
+        &format!("holders at {MICRO_T} s"),
+        &coins,
+        half_ts,
+        &[
+            ("0-1", &h01),
+            ("2-4", &h24),
+            ("5-9", &h59),
+            ("10-19", &h1019),
+            ("20-29", &h2029),
+            ("30+", &h30),
+        ],
+        base,
+    );
+    let hh =
+        |lo: f64, hi: f64| move |s: &Value| s["hhi"].as_f64().is_some_and(|x| x >= lo && x < hi);
+    let (a, b, c, d) = (
+        hh(0.0, 0.2),
+        hh(0.2, 0.5),
+        hh(0.5, 0.8),
+        hh(0.8, f64::INFINITY),
+    );
+    let hhi = lift_table(
+        &mut o,
+        &format!("holder concentration (HHI) at {MICRO_T} s"),
+        &coins,
+        half_ts,
+        &[
+            ("< 0.2", &a),
+            ("0.2-0.5", &b),
+            ("0.5-0.8", &c),
+            ("≥ 0.8", &d),
+        ],
+        base,
+    );
+    let (ds, dk) = (
+        |s: &Value| s["dev_sold"] == true,
+        |s: &Value| s["dev_sold"] == false,
+    );
+    let (sn_hi, sn_lo) = (
+        |s: &Value| s["snipers_pct"].as_f64().is_some_and(|x| x >= 10.0),
+        |s: &Value| s["snipers_pct"].as_f64().is_some_and(|x| x < 10.0),
+    );
+    lift_table(
+        &mut o,
+        &format!("dev and snipers at {MICRO_T} s"),
+        &coins,
+        half_ts,
+        &[
+            ("dev sold", &ds),
+            ("dev did not sell", &dk),
+            ("snipers hold ≥ 10%", &sn_hi),
+            ("snipers hold < 10%", &sn_lo),
+        ],
+        base,
+    );
+    // the gate, judged on the later half only
+    let later_lift = |b: &Bucket| {
+        (b.late.0 > 0 && base.2 > 0.0).then(|| (b.late.1 as f64 / b.late.0 as f64) / base.2)
+    };
+    let h30 = &holders[5];
+    let hhi8 = &hhi[3];
+    let enough = n >= GATE_MIN_COINS && h30.late.0 >= 30 && hhi8.late.0 >= 30;
+    let lift30 = later_lift(h30);
+    let lift_hhi = later_lift(hhi8);
+    let verdict = |ok: Option<bool>| match (enough, ok) {
+        (false, _) => "not judged yet",
+        (true, Some(true)) => "**reproduces**",
+        (true, _) => "**does not reproduce**",
+    };
+    let _ = writeln!(
+        o,
+        "\n**WO-3 gate (later half, out of sample):** holders ≥ 30 at {MICRO_T} s lift {} (needs ≥ 5x): {} · HHI ≥ 0.8 lift {} (needs ≈ 0, i.e. ≤ 0.2x): {}{}",
+        opt(lift30.map(|x| format!("{x:.1}x"))),
+        verdict(lift30.map(|x| x >= 5.0)),
+        opt(lift_hhi.map(|x| format!("{x:.2}x"))),
+        verdict(lift_hhi.map(|x| x <= 0.2)),
+        if enough {
+            String::new()
+        } else {
+            format!(" _(needs {GATE_MIN_COINS}+ usable coins and 30+ in each tested bucket of the later half; have {n}, {} and {})_", h30.late.0, hhi8.late.0)
+        }
+    );
+    o
+}
+
 pub fn write(dir: &Path, day: &str) -> anyhow::Result<String> {
     let (text, labels) = report(dir, day);
     let d = dir.join(day);
@@ -595,6 +873,67 @@ mod tests {
         assert_eq!(
             b["fwd_mult_after_300"], 1.0,
             "nothing after the last checkpoint"
+        );
+    }
+
+    #[test]
+    fn trade_stream_lift_tables_split_by_time_and_skip_incomplete_coins() {
+        // 40 coins in time order; every 4th has 30+ holders at 15 s and doubles, the
+        // rest have 1 holder (HHI 1) and do not; plus coins that must be left out
+        let mut outcomes = vec![];
+        let mut snaps = HashMap::new();
+        for i in 0..40i64 {
+            let strong = i % 4 == 0;
+            let mint = format!("M{i}");
+            outcomes.push(json!({
+                "mint": mint, "created_ts": 1_791_500_000 + i * 60, "full_window": true, "gap_ms": 0,
+                "mcap_at": [30.0, 30.0], "peak_after": [30.0, if strong { 90.0 } else { 33.0 }],
+                "graduated": strong && i < 8,
+            }));
+            snaps.insert(
+                mint.clone(),
+                json!({"mint": mint, "t": 15, "gap_ms": 0,
+                "holders": if strong { 35 } else { 1 }, "hhi": if strong { 0.1 } else { 1.0 },
+                "dev_sold": !strong, "snipers_pct": 2.0}),
+            );
+        }
+        let skip = |mint: &str, extra: Value, snap_gap: i64| {
+            let mut r = json!({"mint": mint, "created_ts": 1_791_500_000, "full_window": true, "gap_ms": 0,
+                "mcap_at": [30.0, 30.0], "peak_after": [30.0, 300.0]});
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            (
+                r,
+                json!({"mint": mint, "t": 15, "gap_ms": snap_gap, "holders": 50, "hhi": 0.1}),
+            )
+        };
+        for (mint, extra, gap) in [
+            ("cut", json!({"full_window": false}), 0),
+            ("quoted", json!({"quote": "So1ana"}), 0),
+            ("gap15", json!({}), 2000),
+            ("gaphour", json!({"gap_ms": 120_000}), 0),
+        ] {
+            let (r, sn) = skip(mint, extra, gap);
+            outcomes.push(r);
+            snaps.insert(mint.to_string(), sn);
+        }
+        let feed = vec![json!({"lag_p50_ms": 1100, "connected": true, "disconnects": 0})];
+        let text = micro_section(&outcomes, &snaps, &feed, 44);
+        assert!(text.contains("usable coins (whole hour recorded, no gap in the first 15 s, priced in SOL): **40** of 44"), "{text}");
+        assert!(text.contains("graduated within the hour: 2"), "{text}");
+        assert!(text.contains("base rate (market cap doubles within the hour after 15 s): 25.00% · earlier half 25.00% · later half 25.00%"), "{text}");
+        assert!(
+            text.contains("| 30+ | 10 | 10 | 100.0% | 4.0x | 100.0% · 4.0x | 100.0% · 4.0x |"),
+            "{text}"
+        );
+        assert!(text.contains("| 0-1 | 30 | 0 | 0.0% | 0.0x |"), "{text}");
+        assert!(text.contains("| ≥ 0.8 | 30 | 0 | 0.0% | 0.0x |"), "{text}");
+        assert!(text.contains("| dev sold | 30 | 0 |"), "{text}");
+        assert!(text.contains("not judged yet"), "{text}");
+        assert!(
+            text.contains("delay behind the chain median 1100 ms"),
+            "{text}"
         );
     }
 }

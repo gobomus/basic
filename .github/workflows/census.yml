@@ -1,6 +1,7 @@
 name: census
 # The tape, free and around the clock: every launch, each coin's state at checkpoints
-# from 15 s to 24 h, and the trending lists (see `copybot census`).
+# from 15 s to 24 h, the trending lists, and every Pump.fun trade in each new coin's
+# first hour from the public RPC log stream (see `copybot census`).
 #
 # Runs every 6 hours for 5 h 45 min. Each run continues the previous one's pending
 # checkpoints (state artifact), keeps its own recording as an artifact for 90 days,
@@ -69,7 +70,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p data/all
-          cp -r data/census data/all/this-run
+          mkdir -p data/all/this-run
+          rsync -a --exclude 'trades-*' data/census/ data/all/this-run/
           for id in $(gh run list --workflow census.yml --status success --limit 8 --json databaseId --jq '.[].databaseId'); do
             gh run download "$id" --name census-tape --dir "data/all/$id" 2>/dev/null || true
           done
@@ -92,4 +94,14 @@ jobs:
           path: |
             data/census
             !data/census/state.json
+            !data/census/**/trades-*.jsonl.gz
           retention-days: 90
+      - name: Keep the trade tape (decoded creates, trades, graduations)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-trades
+          path: data/census/**/trades-*.jsonl.gz
+          retention-days: 14     # ~1 GB a day; the micro rows and outcomes in census-tape are kept 90 days
+          compression-level: 0   # already gzip
+          if-no-files-found: ignore

@@ -150,7 +150,7 @@ Nine of sixteen are machine-gun bots: they fire 100+ transactions per second at 
 | Launch rate | 32,600/day measured today (PumpPortal); 42–60k/day in the studies; 263k SPL tokens on the record day | the census must be streaming, not polled |
 | Pump curve economics | start $3.1k mcap, full at 85 SOL ($9.5k) = $45.9k mcap, ceiling 14.7x | curve positions are 0.1–1 SOL; 100x only after graduation |
 | Graduation rate | 0.2–1.4% (studies); 5.5% bonded within 20 min in the 40-min sample | graduation is a base rate, not a filter |
-| Early signal | holders@15 s: 2.8% → 21% double-again across 1 → 30 holders; HHI ≥ 0.8 → 0% | needs trade-level data in the first minute (gRPC or metered PumpPortal), not 5-minute polling |
+| Early signal | holders@15 s: 2.8% → 21% double-again across 1 → 30 holders; HHI ≥ 0.8 → 0% | needs trade-level data in the first minute, not 5-minute polling. *Update 2026-10-08:* the public RPC's `logsSubscribe` on the pump program delivers every trade for free (WO-3 status below); gRPC is only needed for sub-second speed |
 | Speed ladder | shreds → gRPC +33 ms → confirmed APIs +1–3 s → terminals +2–10 s → Telegram alerts +10 s–min; our free feed 1–6 s | free feed = "confirmed-data crowd"; to be a first follower the engine needs gRPC on a nearby server |
 | Slot time | 400 ms → 200 ms (Agave 4.2) | budgets written for 200 ms |
 | Cost floor | pump curve 1.25% per side, PumpSwap 0.25–0.30%, priority fee + tip 0.001–0.005 SOL | a 0.1 SOL copy needs ≈ 4.5% to break even; a 1 SOL copy ≈ 2.7% |
@@ -186,7 +186,7 @@ Positions are never opened outside the band of the coin's current state. Exits s
 | Source | Feed (free) | Feed (paid) | Features |
 |---|---|---|---|
 | **W** tracked wallets | RPC WebSocket (1–6 s) | gRPC (30–300 ms) | `tracked_buys_5m`, `tracked_net_flow_5m`, `tracked_first_buyer_age`, per-wallet quality score, "wallet arrived after us" (pre-arrival telemetry) |
-| **L** launch microstructure | PumpPortal creations + migrations; RPC account polling for curve state (5–10 s) | gRPC pump program stream (every trade) | holders@t, HHI@t, inflow buckets, sniper/dev behaviour, rail (vanity suffix), creator history from our own archive |
+| **L** launch microstructure | PumpPortal creations + migrations; RPC `logsSubscribe` on the pump program (every trade, 1–3 s behind) | gRPC pump program stream (every trade) | holders@t, HHI@t, inflow buckets, sniper/dev behaviour, rail (vanity suffix), creator history from our own archive |
 | **T** trending flow | Jupiter `toptrending`/`toporganicscore`/`recent` + DexScreener boosts/profiles + pump.fun live, every 5 min | Birdeye/Solana Tracker streams (optional) | organic volume, net buyers, holder change, liquidity change, rank momentum, age |
 | **X** attention | DexScreener boosts, pump.fun livestream flags | — | `dex_boosts`, `is_live`, profile present |
 
@@ -230,7 +230,8 @@ Free POC: JSONL/Parquet files produced by the recorder, kept as GitHub Actions a
 
 | Item | Free tier | Paid | Needed for |
 |---|---|---|---|
-| Launch events | PumpPortal `subscribeNewToken` + `subscribeMigration` (no key) | PumpPortal trade stream (metered) | census (free), first-minute features (paid or gRPC) |
+| Launch events | PumpPortal `subscribeNewToken` + `subscribeMigration` (no key) | PumpPortal trade stream (metered) | census (free) |
+| Every pump trade | public RPC `logsSubscribe` on the pump program (no key; 1–3 s behind, p99 ≤ ~9 s; connections recycled every minute or so, so two are kept open) | gRPC (30–300 ms) | first-minute features (free is enough for research and for decisions at ≥ 15 s) |
 | Trending/discovery | Jupiter tokens v2 (trending, organic, recent, search), DexScreener (boosts, profiles, pairs; 60–300 rpm) | Birdeye / Solana Tracker ($) | trending tier (free is enough) |
 | RPC | public endpoint (4 rps/method), Helius free (1M credits, 10 rps) | Helius Developer $49 | history, account polling, paper runs |
 | Streaming | — | Yellowstone gRPC: Triton from ~$49/mo (1 stream); Solana Tracker/Chainstack mid tiers; Helius LaserStream $499+ | sub-second detection, first-minute microstructure |
@@ -249,12 +250,12 @@ Each has an output, a gate and a cost. Nothing after WO-2 starts until WO-1/WO-2
 |---|---|---|---|---|---|
 | **WO-1** | **Wallet classifier + continuous re-vetting.** `copybot wallet-audit <list>`: bot/trader/holder class from tx rate, failure share and burstiness; realized PnL, hold time, venues, position sizes from chain; copyability verdict; weekly re-run; writes the leader list the engine uses. | table + auto-maintained `leaders` config | ≥ 5 wallets classed *trader* with positive 30-day on-chain PnL and median hold ≥ 60 s | 1–2 days | free (Helius free key for speed) |
 | **WO-2** | **Census recorder.** `copybot census`: PumpPortal creations/migrations continuously; Jupiter recent/trending/organic, DexScreener boosts/profiles, pump.fun live every 5 min; curve/pool state of every seen coin at the checkpoints; raw bytes + hashes; Parquet by day; nightly labels; daily top-10 launches / top-20 trending tables. | the tape + daily tables | 14 days recorded with ≥ 95% checkpoint completeness; launch count and graduation rate stated from our own data | 3–5 days | free on Actions; better on a $5–15 VPS |
-| **WO-3** | **First-minute microstructure.** gRPC (or metered PumpPortal) trade stream on the pump program; holders@t, HHI@t, inflow buckets, sniper/dev exits per coin; reproduce the DeepSeek thresholds on ≥ 10k of our own launches with chronological splits. | validated early-signal table | holders@15 s lift ≥ 5x and HHI ≥ 0.8 → ≈ 0% reproduce out-of-sample | 1 week | gRPC $49–$499/mo |
+| **WO-3** | **First-minute microstructure.** Trade stream on the pump program (planned: gRPC or metered PumpPortal; built: the free RPC log stream); holders@t, HHI@t, inflow buckets, sniper/dev exits per coin; reproduce the DeepSeek thresholds on ≥ 10k of our own launches with chronological splits. | validated early-signal table | holders@15 s lift ≥ 5x and HHI ≥ 0.8 → ≈ 0% reproduce out-of-sample | 1 week | free (was: gRPC $49–$499/mo) |
 | **WO-4** | **State machine in the engine + trending policy, shadow.** Lifecycle states, per-state gates and size bands, trending entry rules on census features, copy signals demoted to features, shadow fills with the honest cost model, all exits replayed; pre-arrival telemetry. | shadow journal with ≥ 200 trending entries and ≥ 100 copy entries | expectancy after costs > 0 with CI on untouched future data; pre-arrival rate measured | 1–2 weeks | free |
 | **WO-5** | **Live at minimum size.** 0.1–1 SOL on the trending tier and the best wallets, Helius Sender/Jito tips, server near the leaders, landing-rate and realized-vs-shadow reconciliation. | 200 live round trips | landed ≥ 90%; realized within tolerance of shadow; positive after all costs including infrastructure | 1 week + run time | Tier B/C |
 | **WO-6** | **Learned models and scaling.** Per-state entry models trained on our labels (meta-labels on the rules), champion/challenger in shadow, size scaled by pool depth and posterior, wallet rotation automated. | model registry + promotion log | out-of-sample lift over the rules; 8 weeks of leader-free shadow ≥ copy returns (roadmap graduation gate) | ongoing | — |
 
-Work orders run **one at a time on the $0 tier** (decided 2026-10-08). WO-1 and WO-2 need no money. WO-3 is the first step that needs a paid feed, and it is also the one that decides whether the launch tier is worth entering at all; if its gate fails, the engine lives in the trending and wallet tiers only.
+Work orders run **one at a time on the $0 tier** (decided 2026-10-08). WO-1 and WO-2 need no money. WO-3 was planned as the first step needing a paid feed; it turned out not to (status below). It is the one that decides whether the launch tier is worth entering at all; if its gate fails, the engine lives in the trending and wallet tiers only.
 
 ### WO-1 result (closed 2026-10-08)
 
@@ -286,6 +287,19 @@ Delivered: `copybot census` (the recorder), `copybot census-report` (labels and 
 
 Gate (unchanged): 14 days recorded with ≥ 95% checkpoint completeness, launch count and graduation rate stated from our own data. The 14 days start when the workflow is on the default branch (or a server runs it). On Actions the gaps between runs (startup and build, a few minutes every 6 hours, plus any late schedule) cost about 2–4% of the day, so the completeness gate is reachable there but with little margin; a small server has no gaps.
 
+### WO-3 status (built 2026-10-08 on the free tier; recording, gate open)
+
+Found while building: the public RPC endpoint streams every transaction that touches the pump program over `logsSubscribe` (no key). A 70 s probe: 237 transactions/s, 57% of them failed (bots), 62 trades/s and 48 creates, i.e. ~59k launches a day, matching PumpPortal. The `Program data:` lines carry the full create, trade and graduation events, so no transaction has to be fetched. Delay behind the block time: p50 1.1 s / p99 1.7 s on a quiet minute, p50 2.4–2.8 s / p99 7.5–8.8 s under load (the same from an independent client, so it is the endpoint, not us). The endpoint closes each connection every minute or so; two connections with de-duplication by signature gave **0 gaps across 11 recycles** in an 8-minute test.
+
+Delivered, inside `copybot census` (no new command):
+- per-coin books from the stream, written at 5, 15, 30, 60, 120, 300 and 900 s after creation (`micro.jsonl`). Each snapshot is rebuilt from the trades stamped at or before its moment, sorted in chain order, 10 s after that moment; trades that arrive later still are counted as `late`. Features: holders, buyers, sellers, flow, market cap, curve progress, HHI of holdings and of buy volume, top-1/top-10 share, dev holding and dev sold, snipers (create slot + 1) with their share and how many sold out, new buyers in the last 5 s, and the per-second SOL flow of the first minute.
+- outcome per coin one hour after creation (`curve_outcomes.jsonl`): market cap at each snapshot and the highest after it (labels with no lookahead), graduation and its time.
+- feed health per minute (`feed.jsonl`) and `gap_ms` on every row, so coins seen with a hole are left out.
+- the decoded trade tape (`trades-<hour>.jsonl.gz`), for re-deriving features under new definitions and, later, for finding wallets ourselves from every trade.
+- `census-report`: holders@15 s, HHI@15 s and dev/sniper tables against "market cap doubles within the hour", for the whole day and for its earlier and later half, and the WO-3 verdict judged on the later half only (needs ≥ 10,000 usable coins and ≥ 30 in each tested bucket).
+
+What the free stream does not give: sub-second speed (gRPC's job, only relevant once the launch tier is proven), and PumpSwap trades after graduation (a second subscription on the AMM program when MIGRATED_FRESH is built). Holdings are from curve trades only; plain token transfers are not seen.
+
 ---
 
 ## 8. KPIs
@@ -311,7 +325,7 @@ Gate (unchanged): 14 days recorded with ≥ 95% checkpoint completeness, launch 
 
 ## 10. Decisions needed
 
-1. **Budget tier for the next 4–6 weeks.** A ($0: census + trending at 5-min resolution + wallet copies 1–6 s late), **B (≈ $60–120/mo: slot-level launch data and a 24/7 census; recommended)**, or C (≈ $600–1,500/mo: latency-competitive execution, only after WO-4 passes).
+1. **Budget tier for the next 4–6 weeks.** A ($0: census + trending at 5-min resolution + wallet copies 1–6 s late), **B (≈ $60–120/mo: slot-level launch data and a 24/7 census; recommended)**, or C (≈ $600–1,500/mo: latency-competitive execution, only after WO-4 passes). *Decided 2026-10-08: A, until something proves profitable. Since then the free log stream covers B's launch data at 1–3 s instead of sub-second.*
 2. **Where the census runs 24/7.** GitHub Actions (free, 5-minute granularity, interruptions) or a small VPS (recommended, $5–15/mo; I set it up from `deploy/`). Your Windows machine works for the console and research, not for the recorder.
 3. **Leader list.** Settled by WO-1: the weekly `wallet-audit` writes it (this week mofo chad, kol-CkPFG, kol-4Ddrf, 9WhiK).
 4. **Capital framing.** Agree that the engine's size lives in the trending/migrated tier (positions ≤ 1% of pool, $1–10k each) and that the curve tier is for 0.1–1 SOL probes. This changes which gates get built first (trending rules before launch sniping).
