@@ -800,8 +800,9 @@ pub async fn run(
                 "curve_outcomes" => totals.2 += 1,
                 "feed" => {
                     row["connections_up"] = json!(live);
-                    row["recycles"] = json!(recycles);
-                    row["duplicates"] = json!(dupes);
+                    // since the recorder started (the other counts are per row)
+                    row["recycles_total"] = json!(recycles);
+                    row["duplicates_total"] = json!(dupes);
                 }
                 _ => {}
             }
