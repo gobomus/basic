@@ -19,6 +19,10 @@ default_exit = "ladder_trail"
 # `copybot report`, so one run compares all exit styles.
 shadow_exits = ["mirror_leader", "fast_scalp", "moonbag"]
 
+# Leaders audited by `copybot wallet-audit --leaders-out config/leaders.local.toml`
+# (re-run weekly). The leaders listed further down are added to them.
+# leaders_file = "config/leaders.local.toml"
+
 [sizing]
 mode = "leader_pct"        # leader_pct | balance_fraction | fixed
 copy_pct = 0.10            # copy 10% of the leader's SOL size

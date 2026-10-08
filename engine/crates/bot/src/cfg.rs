@@ -174,6 +174,7 @@ pub struct BotConfig {
 impl BotConfig {
     pub fn from_toml(s: &str) -> anyhow::Result<Self> {
         let mut v: toml::Table = toml::from_str(s)?;
+        merge_leaders_file(&mut v)?;
         let infra = v
             .remove("infra")
             .ok_or_else(|| anyhow::anyhow!("missing [infra] section"))?;
@@ -220,6 +221,59 @@ impl BotConfig {
     }
 }
 
+/// `leaders_file = "path"` (or a list of paths): append their `[[leaders]]` to the
+/// config's own. `copybot wallet-audit --leaders-out` writes such a file; a leader
+/// listed in the config itself wins over the same address in a file.
+fn merge_leaders_file(v: &mut toml::Table) -> anyhow::Result<()> {
+    let Some(files) = v.remove("leaders_file") else {
+        return Ok(());
+    };
+    let files: Vec<String> = match files {
+        toml::Value::String(s) => vec![s],
+        toml::Value::Array(a) => a
+            .into_iter()
+            .map(|x| {
+                x.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| anyhow::anyhow!("leaders_file entries must be paths"))
+            })
+            .collect::<anyhow::Result<_>>()?,
+        _ => anyhow::bail!("leaders_file must be a path or a list of paths"),
+    };
+    let mut leaders = match v.remove("leaders") {
+        Some(toml::Value::Array(a)) => a,
+        Some(_) => anyhow::bail!("leaders must be [[leaders]] tables"),
+        None => vec![],
+    };
+    for f in files {
+        let text = std::fs::read_to_string(&f).map_err(|e| {
+            anyhow::anyhow!(
+                "leaders_file {f}: {e} (write it with `copybot wallet-audit --leaders-out {f}`)"
+            )
+        })?;
+        let t: toml::Table = toml::from_str(&text).map_err(|e| anyhow::anyhow!("{f}: {e}"))?;
+        for l in t
+            .get("leaders")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let addr = l
+                .get("address")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default();
+            if !leaders
+                .iter()
+                .any(|x| x.get("address").and_then(|a| a.as_str()) == Some(addr))
+            {
+                leaders.push(l);
+            }
+        }
+    }
+    v.insert("leaders".into(), toml::Value::Array(leaders));
+    Ok(())
+}
+
 pub fn env(name: &str) -> anyhow::Result<String> {
     std::env::var(name)
         .ok()
@@ -264,6 +318,37 @@ mod tests {
         let merged = format!("{}{}\n{}", &poc[..i], s, &poc[j..]);
         let c = BotConfig::from_toml(&merged).expect("merged config loads");
         assert_eq!(c.engine.leaders.len(), leaders.len());
+    }
+
+    #[test]
+    fn leaders_file_adds_the_audited_leaders() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("leaders.local.toml");
+        std::fs::write(
+            &f,
+            "[[leaders]]\naddress = \"AYZryL5JYFhAJ7PtA9uvebDqcFrifcPTucvDyjbd7xzN\"\nlabel = \"early-biddy\"\n\
+             [[leaders]]\naddress = \"3VUNtVtjjx5ckUojT7UocJ5fbuAJRsNUXNfTBnPte9vC\"\nlabel = \"from-file\"\n",
+        )
+        .unwrap();
+        let s = include_str!("../../../../config/poc.example.toml");
+        let i = s.find("[sizing]").unwrap();
+        // the config already lists one of the two: its own entry wins, no duplicate
+        let with_file = format!(
+            "leaders_file = {:?}\n{}",
+            f.to_str().unwrap(),
+            &s[..i]
+        ) + &s[i..].replace(
+            "REPLACE_WITH_LEADER_WALLET_1",
+            "3VUNtVtjjx5ckUojT7UocJ5fbuAJRsNUXNfTBnPte9vC",
+        )
+        .replace("[[leaders]]\naddress = \"REPLACE_WITH_LEADER_WALLET_2\"\nlabel = \"leader-2\"\n", "");
+        let c = BotConfig::from_toml(&with_file).unwrap();
+        let labels: Vec<_> = c.engine.leaders.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, vec!["leader-1", "early-biddy"]);
+        // a missing file is an error that says how to make it
+        let missing = format!("leaders_file = \"nope.toml\"\n{s}");
+        let e = BotConfig::from_toml(&missing).unwrap_err().to_string();
+        assert!(e.contains("wallet-audit --leaders-out"), "{e}");
     }
 
     #[test]

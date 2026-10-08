@@ -407,51 +407,18 @@ pub async fn leader_report(
     limit: usize,
 ) -> anyhow::Result<WalletSummary> {
     let rpc = Rpc::new(cfg.rpc_url()?);
-    let mut sigs = vec![];
-    let mut before: Option<String> = None;
-    while sigs.len() < limit {
-        let page = rpc
-            .signatures_for_address(&wallet, 1000.min(limit - sigs.len()), before.as_deref())
-            .await?;
-        if page.is_empty() {
-            break;
-        }
-        before = page
-            .last()
-            .and_then(|v| v["signature"].as_str().map(String::from));
-        sigs.extend(
-            page.into_iter()
-                .filter(|v| v["err"].is_null())
-                .filter_map(|v| v["signature"].as_str().map(String::from)),
+    eprintln!("reading its last {limit} own transactions…");
+    let (_, h) = crate::audit::history(&rpc, &wallet, limit).await?;
+    if h.fetch_failed > 0 {
+        eprintln!("warning: {} of {} transactions could not be fetched (RPC rate limit); the numbers below miss them", h.fetch_failed, h.fetched + h.fetch_failed);
+    }
+    if h.foreign_txs > 0 {
+        eprintln!(
+            "note: {} of the transactions read were sent by other wallets (transfers to it, fee payouts); only its own count toward --limit",
+            h.foreign_txs
         );
     }
-    eprintln!("fetching {} transactions…", sigs.len());
-    let mut swaps = vec![];
-    let mut failed = 0usize;
-    // ~4 transactions per second: what a free RPC tolerates per method
-    for chunk in sigs.chunks(4) {
-        let futs = chunk.iter().map(|s| rpc.transaction_json(s));
-        for res in futures::future::join_all(futs).await {
-            match res {
-                Ok(v) if !v.is_null() => {
-                    if let Ok(t) = ChainTx::from_rpc_json(&v) {
-                        for s in detect::swaps_by(&t, &wallet) {
-                            // parking SOL in USDC or staking it says nothing about coin picking
-                            if !chain::base_assets::is_base_asset(&s.mint) {
-                                swaps.push((t.block_time_ms.unwrap_or(0), s));
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => failed += 1,
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(900)).await;
-    }
-    if failed > 0 {
-        eprintln!("warning: {failed} of {} transactions could not be fetched (RPC rate limit); the numbers below miss them", sigs.len());
-    }
+    let mut swaps = h.swaps;
     swaps.sort_by_key(|(t, _)| *t);
     // FIFO round trips per mint
     let mut open: HashMap<Pubkey, (i64, f64, u64)> = HashMap::new(); // first entry ts, cost, tokens

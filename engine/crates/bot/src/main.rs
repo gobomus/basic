@@ -5,10 +5,12 @@
 //!   copybot report           profit proof from the journal: PnL, leaders, exits, execution cost
 //!   copybot simulate         dry-run our real buy against mainnet (no keys, no funds)
 //!   copybot leader-report    score a wallet from its on-chain history
+//!   copybot wallet-audit     classify many wallets (bot / sniper / trader / holder) and write the leader list
 //!   copybot discover         leader candidates from GMGN smart-money / KOL feeds
 //!   copybot wallet …         create / import / balance / sweep / close-empty
 //!   copybot ctl <cmd>        talk to the running engine: status | positions | leaders | pause | resume | kill | flatten
 
+mod audit;
 mod cfg;
 mod control;
 mod engine;
@@ -79,6 +81,24 @@ enum Cmd {
         /// Transactions to read per wallet (more = steadier verdict, slower on a free RPC)
         #[arg(long, default_value_t = 1000)]
         limit: usize,
+    },
+    /// Classify wallets as bot / sniper / trader / holder from their own on-chain history and
+    /// write the leaders the engine may follow (free; re-run weekly)
+    WalletAudit {
+        /// Wallet addresses (or use --file)
+        addresses: Vec<String>,
+        /// File with one wallet per line: `name: address`, `name address` or `address`
+        #[arg(long)]
+        file: Option<String>,
+        /// Own transactions to read per wallet (more = steadier verdict, slower on a free RPC)
+        #[arg(long, default_value_t = 300)]
+        limit: usize,
+        /// Folder for the full results (JSON + table)
+        #[arg(long, default_value = "data/wallet-audit")]
+        out: String,
+        /// Write the wallets that qualify as `[[leaders]]` here (load it with `leaders_file = "…"`)
+        #[arg(long)]
+        leaders_out: Option<String>,
     },
     /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<address>] | unblacklist <address>
     Ctl {
@@ -207,6 +227,20 @@ async fn main() -> anyhow::Result<()> {
             tools::bench(iterations);
             Ok(())
         }
+        Cmd::WalletAudit {
+            addresses,
+            file,
+            limit,
+            out,
+            leaders_out,
+        } => {
+            // needs only an RPC: RPC_URL, else the config's
+            let url = match cfg::env("RPC_URL") {
+                Ok(u) => u,
+                Err(_) => cfg::BotConfig::load(&cli.config)?.rpc_url()?,
+            };
+            wallet_audit(&url, addresses, file, limit, &out, leaders_out.as_deref()).await
+        }
         Cmd::Report { dir, hours } => {
             let dir = match dir {
                 Some(d) => d,
@@ -307,7 +341,10 @@ async fn main() -> anyhow::Result<()> {
                     );
                     Ok(())
                 }
-                Cmd::Wallet { .. } | Cmd::Bench { .. } | Cmd::Report { .. } => unreachable!(),
+                Cmd::Wallet { .. }
+                | Cmd::Bench { .. }
+                | Cmd::Report { .. }
+                | Cmd::WalletAudit { .. } => unreachable!(),
             }
         }
     }
@@ -519,4 +556,69 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+async fn wallet_audit(
+    rpc_url: &str,
+    addresses: Vec<String>,
+    file: Option<String>,
+    limit: usize,
+    out: &str,
+    leaders_out: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut text = addresses.join("\n");
+    if let Some(f) = &file {
+        text.push('\n');
+        text.push_str(&std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("{f}: {e}"))?);
+    }
+    let list = audit::parse_list(&text);
+    anyhow::ensure!(
+        !list.is_empty(),
+        "no wallet addresses given (arguments or --file)"
+    );
+    let rpc = Rpc::new(rpc_url.to_string());
+    let mut rows = vec![];
+    for (i, c) in list.iter().enumerate() {
+        if i > 0 {
+            // a free RPC counts calls over a window: give it a breather between wallets
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        eprintln!("[{}/{}] {} {}", i + 1, list.len(), c.name, c.wallet);
+        match audit::audit_one(&rpc, c, limit).await {
+            Ok(r) => {
+                eprintln!(
+                    "    {:?} / {:?}: {} trips, {:+.2} SOL, read {}/{} ({} sent by others)",
+                    r.assessment.verdict,
+                    r.assessment.class,
+                    r.trading.round_trips,
+                    r.trading.pnl_sol,
+                    r.fetched,
+                    r.fetched + r.fetch_failed,
+                    r.foreign_txs
+                );
+                rows.push(r)
+            }
+            Err(e) => eprintln!("    could not be audited: {e}"),
+        }
+    }
+    let table = audit::table(&rows);
+    println!(
+        "\nWALLET AUDIT ({} wallets, last {limit} own transactions each)\n{table}",
+        rows.len()
+    );
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    std::fs::create_dir_all(out)?;
+    let json_path = format!("{out}/{day}.json");
+    std::fs::write(&json_path, serde_json::to_string_pretty(&rows)?)?;
+    std::fs::write(format!("{out}/{day}.txt"), &table)?;
+    println!("full results: {json_path}");
+    if let Some(p) = leaders_out {
+        std::fs::write(p, audit::leaders_toml(&rows, &day))?;
+        let n = rows
+            .iter()
+            .filter(|r| r.assessment.verdict == audit::Verdict::Leader)
+            .count();
+        println!("{n} leader(s) written to {p}");
+    }
+    Ok(())
 }

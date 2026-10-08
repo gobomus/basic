@@ -19,7 +19,30 @@ Paper mode follows your chosen wallets on live Solana and simulates every copy *
 ## A1. Pick leader wallets
 **Quick start:** `config/starter-leaders.example.toml` holds seven candidates already vetted this way (with the numbers next to each), ready to paste under `[[leaders]]`. Treat them as a starting point, not a recommendation.
 
-To pick your own: GMGN smart-money / KOL lists, Axiom, KOLscan (copy 3-10 addresses). Then vet each one on-chain, free:
+To pick your own: GMGN smart-money / KOL lists, Axiom, KOLscan. A leaderboard is only a list of candidates: most "profitable wallets" on them are sniper bots whose edge is their position in the block, and vendor PnL figures are not checked. **Audit the whole list at once, free:**
+```bash
+# wallets.txt: one per line, `name: address` (the Notion / GMGN format works as is)
+RPC_URL=https://solana-rpc.publicnode.com \
+copybot wallet-audit --file wallets.txt --leaders-out config/leaders.local.toml
+```
+For every wallet it reads the transactions the wallet signed itself (transfers and fee payouts sent to it by others are counted but skipped), decodes its round trips, and sorts it into one of:
+
+| Class | Means | Verdict |
+|---|---|---|
+| bot | fires many transactions per second, most of them fail, or 1,000 transactions in minutes | reject |
+| sniper | profitable or not, its median hold is under 20 s: nobody can copy that | reject |
+| holder | selling a position it already had (no buys in the window) | reject |
+| trader, losing | 30+ round trips and down over the window | reject |
+| trader | decision-speed trading | **LEADER** with 30+ round trips, positive realised PnL, profit factor ≥ 1.5, median hold ≥ 30 s and ≥ 90% of its transactions read; otherwise watch |
+| unclear | under 10 decoded round trips (or mostly other people's transactions) | watch |
+
+The table goes to the screen and to `data/wallet-audit/<date>.txt` (full numbers in `<date>.json`); the leaders go to `config/leaders.local.toml`. Load them in the engine config with one line near the top (before any `[section]`):
+```toml
+leaders_file = "config/leaders.local.toml"
+```
+Leaders written directly in the config stay too (a config entry wins over the same address in the file). Re-run the audit weekly: wallets that stop qualifying drop out by themselves. The `wallet-audit` workflow does this every Monday once it is on the default branch; put your list in the repository secret `AUDIT_WALLETS` so it stays private.
+
+To look at one wallet in more detail:
 ```bash
 copybot leader-report <WALLET> [<WALLET> ...]    # profit, win rate, hold time, bot check; several wallets get a comparison table
 ```
