@@ -65,26 +65,43 @@ pub struct Coin {
     pub cps: BTreeMap<i64, Value>,
     pub migrated: bool,
     pub dead_at: Option<i64>,
+    /// an existing token reported as a create (Jupiter dates it long before)
+    pub not_new: bool,
+}
+
+/// A market cap counts only when the pool behind it holds at least this share of it in
+/// liquidity. Real pools hold far more (a fresh PumpSwap pool ~40%, a curve more); a
+/// quote on a few hundred dollars of liquidity can show millions.
+const MIN_LIQUIDITY_SHARE: f64 = 0.01;
+
+/// The row's market cap if liquidity backs it.
+fn backed_mcap(r: &Value) -> Option<f64> {
+    let m = r["mcap"].as_f64().filter(|m| *m > 0.0)?;
+    (r["liquidity"].as_f64().unwrap_or(0.0) >= MIN_LIQUIDITY_SHARE * m).then_some(m)
 }
 
 impl Coin {
     fn at(&self, cp: i64, key: &str) -> Option<f64> {
-        self.cps.get(&cp).and_then(|r| r[key].as_f64())
+        let r = self.cps.get(&cp)?;
+        if key == "mcap" {
+            return backed_mcap(r);
+        }
+        r[key].as_f64()
     }
-    /// Highest market cap observed at any checkpoint, and when.
+    /// Highest (liquidity-backed) market cap observed at any checkpoint, and when.
     pub fn peak(&self) -> Option<(i64, f64)> {
         self.cps
             .iter()
-            .filter_map(|(cp, r)| r["mcap"].as_f64().map(|m| (*cp, m)))
+            .filter_map(|(cp, r)| backed_mcap(r).map(|m| (*cp, m)))
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
     }
     /// Highest market cap at checkpoints strictly after `cp`, as a multiple of the one at `cp`.
     pub fn forward_multiple(&self, cp: i64) -> Option<f64> {
-        let base = self.at(cp, "mcap").filter(|m| *m > 0.0)?;
+        let base = self.at(cp, "mcap")?;
         let later = self
             .cps
             .range(cp + 1..)
-            .filter_map(|(_, r)| r["mcap"].as_f64())
+            .filter_map(|(_, r)| backed_mcap(r))
             .fold(f64::NAN, f64::max);
         // a coin that died after `cp` simply never went higher
         Some(if later.is_nan() { 1.0 } else { later / base })
@@ -136,6 +153,7 @@ pub fn coins_of_day(dir: &Path, day: &str) -> Vec<Coin> {
             if r["stop"] == "dead" {
                 c.dead_at = Some(cp);
             }
+            c.not_new |= r["stop"] == "not_new";
             c.cps.insert(cp, r);
         }
     }
@@ -181,7 +199,8 @@ fn age(ms: i64) -> String {
 
 /// The report text and the per-coin label rows.
 pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
-    let coins = coins_of_day(dir, day);
+    let (coins, not_new): (Vec<Coin>, Vec<Coin>) =
+        coins_of_day(dir, day).into_iter().partition(|c| !c.not_new);
     let mut o = String::new();
     let _ = writeln!(o, "# Census {day}\n");
 
@@ -212,8 +231,13 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
     let _ = writeln!(o, "## Coverage");
     let _ = writeln!(
         o,
-        "- launches recorded: **{n}** (PumpPortal {pp}; Jupiter only {}: other launchpads and Pump.fun coins PumpPortal missed)",
-        n - pp
+        "- launches recorded: **{n}** (PumpPortal {pp}; Jupiter only {}: other launchpads and Pump.fun coins PumpPortal missed){}",
+        n - pp,
+        if not_new.is_empty() {
+            String::new()
+        } else {
+            format!("; {} existing tokens reported as creates left out", not_new.len())
+        }
     );
     let _ = writeln!(
         o,
@@ -800,7 +824,7 @@ mod tests {
         }
         t.row("launches", t0, &json!({"ts": t0 + 5000, "created_ms": t0, "source": "jupiter", "mint": "Apump", "launchpad": "pump.fun"})).unwrap();
         let cp = |mint: &str, cp: i64, mcap: f64, holders: u64, extra: Value| {
-            let mut r = json!({"ts": t0 + cp * 1000, "mint": mint, "cp": cp, "mcap": mcap, "holders": holders, "late_ms": 500, "traders_5m": holders});
+            let mut r = json!({"ts": t0 + cp * 1000, "mint": mint, "cp": cp, "mcap": mcap, "liquidity": mcap * 0.3, "holders": holders, "late_ms": 500, "traders_5m": holders});
             for (k, v) in extra.as_object().unwrap() {
                 r[k] = v.clone();
             }
@@ -834,6 +858,13 @@ mod tests {
         }
         // a stablecoin in a trending list is not a memecoin
         t.row("trending", t0, &json!({"ts": t0, "list": "jup_trending_1h", "rank": 3, "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "launchpad": "-"})).unwrap();
+        // a Meteora coin quoted at $5M on $200 of liquidity: not a top launch
+        t.row("launches", t0, &json!({"ts": t0, "created_ms": t0, "source": "jupiter", "mint": "Junk", "launchpad": "met-dbc", "symbol": "JNK"})).unwrap();
+        cp("Junk", 15, 5.0e6, 30, json!({"liquidity": 200.0}));
+        cp("Junk", 60, 5.1e6, 40, json!({"liquidity": 250.0}));
+        // an existing token PumpPortal reported as a create: huge, flagged, left out
+        t.row("launches", t0, &json!({"ts": t0, "source": "pumpportal", "mint": "pumpOLD", "launchpad": "pump.fun", "symbol": "OLD"})).unwrap();
+        t.row("checkpoints", t0 + 15_000, &json!({"mint": "pumpOLD", "cp": 15, "holders": 320000, "mcap": 2.6e9, "stop": "not_new"})).unwrap();
     }
 
     #[test]
@@ -842,10 +873,19 @@ mod tests {
         tape(dir.path());
         let day = day_of(1_791_500_000_000);
         let (text, labels) = report(dir.path(), &day);
-        assert!(text.contains("launches recorded: **3**"), "{text}");
+        assert!(text.contains("launches recorded: **4**"), "{text}");
         assert!(text.contains("PumpPortal 3;"), "{text}");
         assert!(text.contains("graduated: 1"), "{text}");
         // top launch is the graduate, with its early snapshot
+        assert!(
+            text.contains("; 1 existing tokens reported as creates left out"),
+            "{text}"
+        );
+        assert!(!text.contains("OLD"), "{text}");
+        assert!(
+            !text.contains("JNK"),
+            "price-only market caps do not rank: {text}"
+        );
         let top = text.split("## Top 10 launches").nth(1).unwrap();
         let first = top.lines().find(|l| l.starts_with("| 1 |")).unwrap();
         assert!(

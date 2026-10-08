@@ -39,6 +39,9 @@ pub const CHECKPOINTS: [i64; 11] = [
 /// From this checkpoint on, a coin with no traders and at most this many holders is dead.
 const DEAD_FROM_SECS: i64 = 300;
 const DEAD_MAX_HOLDERS: u64 = 3;
+/// A "launch" whose token Jupiter dates this much earlier is not new (PumpPortal has
+/// reported existing tokens, the PUMP token among them, as creates).
+const NOT_NEW_MS: i64 = 600_000;
 /// Coins tracked at once (oldest dropped beyond this).
 const MAX_TRACKED: usize = 60_000;
 const JUP: &str = "https://lite-api.jup.ag/tokens/v2";
@@ -233,6 +236,13 @@ fn ts_of(v: &Value) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 
+/// Jupiter dates this token well before our launch time: not a new coin.
+pub fn dated_before(tok: &Value, launch_ms: i64) -> bool {
+    ts_of(&tok["createdAt"])
+        .or_else(|| ts_of(&tok["firstPool"]["createdAt"]))
+        .is_some_and(|created| created < launch_ms - NOT_NEW_MS)
+}
+
 /// The compact row kept for one coin at one checkpoint (all values as Jupiter reports
 /// them; the raw body is in the raw archive).
 pub fn checkpoint_row(tok: &Value) -> Value {
@@ -311,6 +321,7 @@ struct Counters {
     checkpoints: u64,
     late_checkpoints: u64,
     not_found: u64,
+    not_new: u64,
     dead: u64,
     trending_captures: u64,
     errors: u64,
@@ -644,8 +655,8 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                 if now - last_log > 60_000 {
                     last_log = now;
                     eprintln!(
-                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} not indexed yet) · dead {} · tracked {} · trending captures {} · errors {}",
-                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.not_found, c.dead, sched.coins.len(), c.trending_captures, c.errors
+                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} not indexed yet) · dead {} · not new {} · tracked {} · trending captures {} · errors {}",
+                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.not_found, c.dead, c.not_new, sched.coins.len(), c.trending_captures, c.errors
                     );
                 }
             }
@@ -746,6 +757,9 @@ async fn take_checkpoints(
             row["curve_complete"] = json!(complete);
         }
         let dead = looks_dead(cp, &row);
+        let not_new = by_mint
+            .get(mint.as_str())
+            .is_some_and(|tok| dated_before(tok, t.created_ms));
         row["ts"] = json!(ts);
         row["mint"] = json!(mint);
         row["cp"] = json!(cp);
@@ -753,7 +767,10 @@ async fn take_checkpoints(
         row["late_ms"] = json!(late);
         row["launchpad"] = json!(t.launchpad);
         row["raw_sha256"] = json!(sha);
-        if dead {
+        if not_new {
+            row["stop"] = json!("not_new");
+            c.not_new += 1;
+        } else if dead {
             row["stop"] = json!("dead");
             c.dead += 1;
         }
@@ -762,7 +779,7 @@ async fn take_checkpoints(
         if late > 10_000 {
             c.late_checkpoints += 1;
         }
-        sched.advance(mint, dead);
+        sched.advance(mint, dead || not_new);
     }
     Ok(())
 }
@@ -779,6 +796,23 @@ mod tests {
             launchpad: "pump.fun".into(),
             pump_curve: true,
         }
+    }
+
+    #[test]
+    fn existing_tokens_reported_as_creates_are_recognised() {
+        let launch = chrono::DateTime::parse_from_rfc3339("2026-10-08T21:51:22Z")
+            .unwrap()
+            .timestamp_millis();
+        let new = json!({"createdAt": "2026-10-08T21:51:20Z"});
+        let pump_token = json!({"createdAt": "2025-07-12T10:00:00Z"});
+        let pool_only = json!({"firstPool": {"createdAt": "2026-10-01T00:00:00Z"}});
+        assert!(!dated_before(&new, launch));
+        assert!(dated_before(&pump_token, launch));
+        assert!(dated_before(&pool_only, launch));
+        assert!(
+            !dated_before(&json!({}), launch),
+            "no date: benefit of the doubt"
+        );
     }
 
     #[test]

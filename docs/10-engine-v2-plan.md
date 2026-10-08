@@ -285,6 +285,8 @@ Delivered: `copybot census` (the recorder), `copybot census-report` (labels and 
 | Parquet by day | **JSON lines by day instead.** No columnar dependency is needed at this volume, and the report reads it directly; conversion is one step when WO-5's training set needs it |
 | nightly labels, daily top-10 launches / top-20 trending | `census-report` → `daily.md` + `labels.jsonl` (forward outcomes from later checkpoints only) |
 
+Found in the first hour of data and fixed: PumpPortal reports some existing tokens as creates (the PUMP token itself, at $2.6B and 320k holders "at 15 s"); a launch whose token Jupiter dates more than 10 minutes earlier is now flagged `not_new` and left out. Meteora DBC coins can be quoted at millions on a few hundred dollars of liquidity; the report counts a market cap only when liquidity of at least 1% of it backs it (real pools hold far more).
+
 Gate (unchanged): 14 days recorded with ≥ 95% checkpoint completeness, launch count and graduation rate stated from our own data. The 14 days start when the workflow is on the default branch (or a server runs it). On Actions the gaps between runs (startup and build, a few minutes every 6 hours, plus any late schedule) cost about 2–4% of the day, so the completeness gate is reachable there but with little margin; a small server has no gaps.
 
 ### WO-3 status (built 2026-10-08 on the free tier; recording, gate open)
