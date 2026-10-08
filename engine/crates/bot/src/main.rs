@@ -6,11 +6,14 @@
 //!   copybot simulate         dry-run our real buy against mainnet (no keys, no funds)
 //!   copybot leader-report    score a wallet from its on-chain history
 //!   copybot wallet-audit     classify many wallets (bot / sniper / trader / holder) and write the leader list
+//!   copybot census           record every launch, its checkpoints and the trending lists (free)
 //!   copybot discover         leader candidates from GMGN smart-money / KOL feeds
 //!   copybot wallet …         create / import / balance / sweep / close-empty
 //!   copybot ctl <cmd>        talk to the running engine: status | positions | leaders | pause | resume | kill | flatten
 
 mod audit;
+mod census;
+mod census_report;
 mod cfg;
 mod control;
 mod engine;
@@ -100,6 +103,31 @@ enum Cmd {
         /// Write the wallets that qualify as `[[leaders]]` here (load it with `leaders_file = "…"`)
         #[arg(long)]
         leaders_out: Option<String>,
+    },
+    /// Record every launch, each coin's state at checkpoints from 15 s to 24 h, and the
+    /// trending lists, from free sources (RPC_URL optional: adds exact Pump.fun curve state)
+    Census {
+        /// Folder for the tape (one subfolder per UTC day; state.json for resuming)
+        #[arg(long, default_value = "data/census")]
+        out: String,
+        /// Stop after this many minutes (pending checkpoints are saved for the next run)
+        #[arg(long)]
+        minutes: Option<u64>,
+        /// Seconds between captures of the trending and attention lists
+        #[arg(long, default_value_t = 300)]
+        trending_secs: u64,
+        /// Response bodies kept in the raw archive
+        #[arg(long, value_enum, default_value_t = census::RawMode::Lists)]
+        raw: census::RawMode,
+    },
+    /// Labels and daily tables from the census tape: coverage, base rates, early-signal
+    /// table, top 10 launches and top 20 trending (writes <dir>/<day>/daily.md)
+    CensusReport {
+        #[arg(long, default_value = "data/census")]
+        dir: String,
+        /// UTC day (YYYY-MM-DD); default today
+        #[arg(long)]
+        day: Option<String>,
     },
     /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<address>] | unblacklist <address>
     Ctl {
@@ -242,6 +270,29 @@ async fn main() -> anyhow::Result<()> {
             };
             wallet_audit(&url, addresses, file, limit, &out, leaders_out.as_deref()).await
         }
+        Cmd::Census {
+            out,
+            minutes,
+            trending_secs,
+            raw,
+        } => {
+            census::run(census::CensusArgs {
+                out: out.into(),
+                minutes,
+                rpc_url: cfg::env("RPC_URL").ok(),
+                trending_secs,
+                raw,
+            })
+            .await
+        }
+        Cmd::CensusReport { dir, day } => {
+            let day = day.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+            print!(
+                "{}",
+                census_report::write(std::path::Path::new(&dir), &day)?
+            );
+            Ok(())
+        }
         Cmd::Report { dir, hours } => {
             let dir = match dir {
                 Some(d) => d,
@@ -345,7 +396,9 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Wallet { .. }
                 | Cmd::Bench { .. }
                 | Cmd::Report { .. }
-                | Cmd::WalletAudit { .. } => unreachable!(),
+                | Cmd::WalletAudit { .. }
+                | Cmd::Census { .. }
+                | Cmd::CensusReport { .. } => unreachable!(),
             }
         }
     }

@@ -271,6 +271,21 @@ Gate: "≥ 5 wallets classed trader with positive on-chain PnL and median hold �
 
 Honest reading: the gate passes, narrowly. The window is a day, not a month, so the leader list is provisional and the weekly re-run is what makes it trustworthy. Activating that weekly run needs the workflow file on the default branch (same one-file step as paper-run). The leader count is the limiting factor for signal volume; adding candidates (KOLscan, GMGN lists) and auditing them is a cheap repeatable step.
 
+### WO-2 status (built 2026-10-08; recording, gate open)
+
+Delivered: `copybot census` (the recorder), `copybot census-report` (labels and the daily tables), the `census` workflow (5 h 45 min every 6 hours, checkpoints carried from run to run, 90-day retention, the day's report on each run's summary page), RUNBOOK section A5.
+
+| WO-2 item | Built as |
+|---|---|
+| PumpPortal creations and migrations | WebSocket, reconnects by itself |
+| Jupiter recent / trending / organic, DexScreener boosts / profiles, pump.fun live | recent every 10 s (all launchpads); 10 lists every 5 min |
+| state of every seen coin at the checkpoints | Jupiter batch stats (100 coins per call) at 15 s … 24 h, plus the exact curve SOL from the chain when `RPC_URL` is set; dead coins stop at 5 min |
+| raw bytes + hashes | gzip archive per hour, SHA-256 on every row |
+| Parquet by day | **JSON lines by day instead.** No columnar dependency is needed at this volume, and the report reads it directly; conversion is one step when WO-5's training set needs it |
+| nightly labels, daily top-10 launches / top-20 trending | `census-report` → `daily.md` + `labels.jsonl` (forward outcomes from later checkpoints only) |
+
+Gate (unchanged): 14 days recorded with ≥ 95% checkpoint completeness, launch count and graduation rate stated from our own data. The 14 days start when the workflow is on the default branch (or a server runs it). On Actions the gaps between runs (startup and build, a few minutes every 6 hours, plus any late schedule) cost about 2–4% of the day, so the completeness gate is reachable there but with little margin; a small server has no gaps.
+
 ---
 
 ## 8. KPIs

@@ -1,0 +1,95 @@
+name: census
+# The tape, free and around the clock: every launch, each coin's state at checkpoints
+# from 15 s to 24 h, and the trending lists (see `copybot census`).
+#
+# Runs every 6 hours for 5 h 45 min. Each run continues the previous one's pending
+# checkpoints (state artifact), keeps its own recording as an artifact for 90 days,
+# and writes today's report (top 10 launches, top 20 trending, early-signal table)
+# over all of today's runs to its summary page.
+#
+# Optional repository secret RPC_URL adds the exact Pump.fun curve state at each
+# checkpoint (the public Solana endpoint is used otherwise).
+on:
+  schedule:
+    - cron: "7 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to record (max 345)"
+        required: false
+        default: "345"
+      ref:
+        # lets this file live on the default branch while the code is on the development branch
+        description: "Branch with the code to run (leave as it is)"
+        required: false
+        default: "claude/solana-copy-trading-bot-xlkuzm"
+
+concurrency:
+  group: census
+  cancel-in-progress: false
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read   # to fetch the previous runs' state and recordings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'claude/solana-copy-trading-bot-xlkuzm' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build
+        run: cargo build --release -p bot
+        working-directory: engine
+      - name: Pending checkpoints from the previous run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/census
+          id=$(gh run list --workflow census.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -n "$id" ]; then
+            gh run download "$id" --name census-state --dir data/census && echo "resuming from run $id"
+          fi
+      - name: Record
+        env:
+          RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+        run: |
+          mins=$(python3 -c "print(min(int('${{ inputs.minutes || '345' }}'), 345))")
+          ./engine/target/release/copybot census --out data/census --minutes "$mins" --raw lists
+      - name: Today's report over all of today's runs
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/all
+          cp -r data/census data/all/this-run
+          for id in $(gh run list --workflow census.yml --status success --limit 8 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$id" --name census-tape --dir "data/all/$id" 2>/dev/null || true
+          done
+          for day in $(date -u -d yesterday +%F) $(date -u +%F); do
+            ./engine/target/release/copybot census-report --dir data/all --day "$day" > "report-$day.md" || true
+          done
+          { cat "report-$(date -u +%F).md"; echo; echo "---"; cat "report-$(date -u -d yesterday +%F).md"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the pending checkpoints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-state
+          path: data/census/state.json
+          retention-days: 7
+      - name: Keep the recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-tape
+          path: |
+            data/census
+            !data/census/state.json
+          retention-days: 90
