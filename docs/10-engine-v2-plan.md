@@ -75,26 +75,22 @@ For each wallet: the last 1,000 transactions from the public RPC (time span, tra
 
 ### 2.2 The 16 "PROFITABLE WALLETS" (Notion)
 
-| Wallet | tx/day | failed | peak tx/s | Class | Copyable? |
-|---|---:|---:|---:|---|---|
-| decu | 1,000 in 18 s | 97% | 141 | latency sniper bot | no |
-| truonest | 1,000 in seconds | 100% | — | bot, currently all failing | no |
-| theo | 1,000 in seconds | 98% | — | bot | no |
-| beanzol | 1,000 in seconds | 100% | — | bot | no |
-| megga | 1,000 in seconds | 93% | — | bot | no |
-| dv | 1,000 in seconds | 94% | — | bot | no |
-| daumen | 1,000 in seconds | 94% | — | bot | no |
-| cupsey | 1,390 | 88% | — | high-frequency bot | no |
-| bennytradez | 1,394 | 61% | — | bot: 203 round trips, median hold **7 s**, **−14.9 SOL** over the last 400 tx | no |
-| mofo chad | 767 | 7% | — | **decision trader**: +73.9 SOL over 182 round trips, 74% win, median hold 35 s | yes (fast) |
-| orange | 146 | 44% | — | 4 decodable swaps in 400 tx; mostly failed sends and non-swap activity | re-check |
-| FoulMidiPumper | 360 | 36% | — | sniper: median hold **4 s**, −20.8 SOL over 65 trips | no |
-| slyorca69467 | 181 | 0% | — | well-built sniper bot: +47.7 SOL, 61% win, median hold **6 s** | no |
-| LuckBlueParsley | 831 | 18% | — | sniper lottery: median trip **−100%**, a few big wins, hold **3 s** | no |
-| early biddy | 301 | 3% | — | **decision trader**: +133.3 SOL over 100 trips, 69% win, median hold 123 s, trades migrated coins | **yes** |
-| skarraOG | 1,290 | 2% | — | **decision trader**: +26.5 SOL over 85 trips, 41% win, median hold 242 s, 15 open positions | yes |
+Final classification from `copybot wallet-audit` (§2.4), 2026-10-08 evening, last 1,000 own transactions per wallet.
 
-Nine of sixteen are machine-gun snipers: they fire 100+ transactions per second at every new coin and 93–100% of them fail (slippage, curve already full). Their profit, if any, comes from **position in the block**, which no follower can copy. GLM 5.3's pilot reached the same split (11 of 20 bots) two days earlier. The on-chain read (§2.4) then moved three more into the uncopyable column: `slyorca69467` and `LuckBlueParsley` are profitable *because* they hold for 3–6 seconds, and `FoulMidiPumper` holds 4 s and loses. **Three wallets survive as leaders: early biddy, mofo chad and skarraOG.**
+| Wallet | Class | Evidence | Copyable? |
+|---|---|---|---|
+| decu, truonest, theo, beanzol, megga, dv, daumen | bot | 1,000 transactions in seconds, 93–99% failed, 116–825 per second | no |
+| orange | bot | 85% failed, bursts of 103 per second; 5 decodable round trips | no |
+| bennytradez | sniper | +46.7 SOL over 168 trips, median hold **5 s** | no |
+| LuckBlueParsley | sniper | +89.4 SOL over 96 trips, 97% win, median hold **3 s** | no |
+| FoulMidiPumper | sniper | +52.6 SOL over 70 trips, 99% win, median hold **4 s** | no |
+| slyorca69467 | sniper | +40.7 SOL over 72 trips, 97% win, median hold **6 s** | no |
+| cupsey | unclear | 6 decodable round trips in 20 h, −12.3 SOL | no |
+| **mofo chad** | **trader** | **+87.2 SOL over 230 trips in 20 h, 74% win, profit factor 4.1, median hold 42 s** | **leader (fast)** |
+| skarraOG | trader | +24.7 SOL over 221 trips in 20 h, 39% win, profit factor 1.40, hold 176 s | watch (just under the 1.5 profit-factor bar) |
+| early biddy | trader | −33.1 SOL over 116 trips in 11 h (it was +133 SOL in the 32 h before) | reject this week |
+
+Nine of sixteen are machine-gun bots: they fire 100+ transactions per second at every new coin and 93–99% fail. Four more are snipers that are very profitable *because* they hold for 3–6 seconds: they buy in the creation block and sell to the copy herd seconds later (97–99% win rates, +40 to +89 SOL a day). Nobody can copy that; following them means being the herd they sell to. GLM 5.3's pilot reached the same split two days earlier. **One wallet from the Notion list qualifies as a leader this week: mofo chad.**
 
 ### 2.3 The 8 GMGN-sourced watchlist wallets (the six-figure days)
 
@@ -113,38 +109,36 @@ Nine of sixteen are machine-gun snipers: they fire 100+ transactions per second 
 
 ### 2.4 On-chain realized PnL (our decoder, fees included)
 
-`copybot leader-report`, last 400 transactions per wallet on PublicNode (complete reads). The window is however long 400 transactions took that wallet, so it is a slice of one day, not a monthly rate. SOL at $111.6.
+`copybot wallet-audit --limit 1000` on PublicNode, 2026-10-08 ~21:00 UTC: each wallet's last 1,000 **own** transactions (transfers and fee payouts sent to it by others are skipped), every one read (0 refused after retries). For active traders that is about **20 hours**, so these are one-day slices, not monthly rates. SOL at $111.6.
 
-| Wallet | Window | Round trips | Realized PnL | Win rate | Median trip | Profit factor | Median hold | Pace |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **early biddy** | ~32 h | 100 | **+133.3 SOL ($14.9k)** | 69% | +146% | 3.8 | 123 s | ~$11k/day |
-| **mofo chad** | ~12.5 h | 182 | **+73.9 SOL ($8.2k)** | 74% | +20% | 5.6 | 35 s | ~$16k/day |
-| **skarraOG** | ~7.4 h | 85 | **+26.5 SOL ($3.0k)** | 41% | −7% | 2.4 | 242 s | ~$10k/day |
-| slyorca69467 | ~53 h | 135 | +47.7 SOL | 61% | +36% | 11.3 | **6 s** | sniper |
-| LuckBlueParsley | ~12 h | 152 | +6.4 SOL | 26% | **−100%** | 1.3 | **3 s** | sniper |
-| FoulMidiPumper | ~27 h | 65 | −20.8 SOL | 57% | +19% | 0.6 | **4 s** | sniper, losing |
-| cupsey | ~7 h | 9 | −46.8 SOL | 11% | −20% | 0.1 | 24 min | losing |
-| bennytradez | ~7 h | 203 | −14.9 SOL | 44% | −4% | 0.7 | **7 s** | bot, losing |
-| orange | ~66 h | 1 | −0.5 SOL | — | — | — | 2.2 h | too few swaps |
-| decu, truonest, theo, beanzol, megga, dv, daumen | seconds–minutes | 0–1 | ≈ 0 (beanzol one +5.5 SOL hit, 3 s hold) | — | — | — | — | bots |
+| Wallet | Source | Verdict | Round trips | Realized PnL | Hours | Win | Profit factor | Median hold |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| **mofo chad** | Notion | **LEADER** | 230 | **+87.2 SOL ($9.7k)** | 20.4 | 74% | 4.1 | 42 s |
+| **kol-CkPFG** | starter | **LEADER** | 57 | **+35.1 SOL ($3.9k)** | 17.7 | 56% | 3.0 | 84 s |
+| **kol-4Ddrf** | starter | **LEADER** | 41 | **+16.2 SOL ($1.8k)** | 20.0 | 63% | 16.9 | 31 s |
+| **9WhiKDT…** | watchlist | **LEADER** | 88 | **+5.4 SOL** | 20.3 | 52% | 1.7 | 172 s |
+| skarraOG | Notion | watch | 221 | +24.7 SOL | 20.3 | 39% | 1.40 | 176 s |
+| kol-CCUcj | starter | watch | 15 | +10.3 SOL | 8.2 | 87% | — | 384 s |
+| kol-AEeJU | starter | watch | 11 | +4.1 SOL | 20.4 | 55% | — | 35 min |
+| early biddy | Notion | reject | 116 | −33.1 SOL | 10.8 | 53% | <1 | 120 s |
+| LuckBlueParsley | Notion | reject (sniper) | 96 | +89.4 SOL | 19.8 | 97% | 276 | 3 s |
+| FoulMidiPumper | Notion | reject (sniper) | 70 | +52.6 SOL | 9.1 | 99% | 193 | 4 s |
+| bennytradez | Notion | reject (sniper) | 168 | +46.7 SOL | 20.2 | 58% | — | 5 s |
+| slyorca69467 | Notion | reject (sniper) | 72 | +40.7 SOL | 18.2 | 97% | — | 6 s |
+| 8deJ9xe… | watchlist | reject (holder) | 5 | −29.9 SOL | 19.0 | — | — | — |
+| EC2f5Dn…, 9qgh1ed…, 3XrqaGd… | watchlist | watch (unclear) | 0 | — | — | — | — | 85–100% of their transactions are sent to them by others; no decodable trades of their own in the window |
+| EnaatNf… | watchlist | watch (unclear) | — | — | — | — | — | the RPC returned no history |
+| MfDuWeq… | watchlist | reject (bot) | — | — | — | — | — | 207,000 transactions/day |
 
-Watchlist wallets, read on the public endpoint with `--limit 300`; **32–80% of their transactions could not be fetched (rate limit)**, so these are partial:
+**Corrections to the first version of this section.** The numbers first published here (early biddy +133 SOL, mofo chad +74, skarraOG +26, LuckBlueParsley −100% median trip, FoulMidiPumper −20.8 SOL, bennytradez −14.9) came from `leader-report` before two decoder bugs were found and fixed while building WO-1: (1) curves priced in another token were read in that token's units as if they were SOL, and (2) wallets' histories were full of transactions sent *to* them, which pushed their own trades out of the window. Both are fixed and covered by tests on the real transactions. Separately, early biddy's swing from +133 SOL (32 h) to −33 SOL (11 h) is real: single-day slices of one trader vary that much, which is why the audit re-runs weekly and why a leader needs 30+ round trips.
 
-| Wallet | Fetched | Round trips | Realized PnL | Win rate | Median hold | Note |
-|---|---:|---:|---:|---:|---:|---|
-| 9WhiKDT… | 130/300 | 65 | +9.4 SOL | 55% | 152 s | candidate; re-read with a keyed RPC |
-| 8deJ9xe… | 205/300 | 15 | +6.3 SOL | 67% | **6 s** | fast; the vendor's $53k day is not visible in what we could read |
-| 8yspHpQ… | 59/300 | 19 | −2.9 SOL | 26% | 39 s | losing in the slice read |
-| EC2f5Dn… | 158/300 | 0 | — | — | — | **no decodable swap** in the transactions read: its activity is transfers or a venue we do not decode. The vendor's $62k/day is unverified; needs a keyed RPC and a look at the raw transactions |
-| 9qgh1ed… | 130/300 | 0 | — | — | — | same |
-
-**Reading.** The three real traders make roughly **$10–16k per day in the slices we read**, trading 5–9 hours a day with 35 s–4 min holds and 85–182 round trips per window. That is a strong result and it is an order of magnitude below the $100k/day figure. The six-figure vendor numbers belong to an arbitrage bot, to holders selling, and to two wallets whose trades we could not even decode from the public endpoint. The honest statement is: **a good human-scale trader on this market makes low five figures a day with hundreds of trades; nothing we can verify makes $100k/day by trading.**
+**Reading.** The verifiable pace of the best copyable trader on the list is about **+87 SOL/day ($9.7k)**, earned with 230 round trips at a 42 s median hold. The most profitable wallets overall (+40 to +89 SOL/day) are 3–6 s snipers that no follower can copy. The six-figure vendor numbers remain unverified: the wallets behind them are a bot, a holder, or show no trades of their own in the window. **Nothing we can verify trades its way to $100k/day; one copyable trader does about $10k/day on a good day.**
 
 ### 2.5 Consequences
-- Drop the twelve bots and snipers from any leader list. Following them is paying their exit. Only early biddy, mofo chad and skarraOG go in, with 9WhiK pending a complete read.
-- Even those three are **fast**: 35 s–4 min median holds. On a 1–6 s feed we land inside their hold window; a 35 s hold with a 3 s delay is already 10% of the trade gone. Copying them needs the paid feed (WO-3/WO-5), and the pre-arrival framing (learn their setups, be there earlier) matters more than the copy itself.
+- Drop the bots and snipers from any leader list. Following them is paying their exit. This week's leaders, written by the audit to `config/leaders.local.toml`: **mofo chad, kol-CkPFG, kol-4Ddrf and 9WhiK**; skarraOG, kol-CCUcj and kol-AEeJU on watch.
+- Even the leaders are **fast**: 31 s–3 min median holds. On a 1–6 s feed we land inside their hold window; a 35 s hold with a 3 s delay is already 10% of the trade gone. Copying them needs the paid feed (WO-3/WO-5), and the pre-arrival framing (learn their setups, be there earlier) matters more than the copy itself.
 - A leaderboard (kolscan, GMGN) is a *candidate source*, never a leader list: every wallet goes through the classifier and the on-chain PnL check first, and again every week (strategies decay). Vendor PnL figures are not evidence until our decoder reproduces them.
-- The "$100k/day" target is not supported by anything we can verify; **$10–16k/day by three traders with hundreds of fast trades is.** An engine that reproduces *that* on several wallets' worth of setups, with size scaled by pool depth, is the realistic version of the goal; the rest is compounding.
+- The "$100k/day" target is not supported by anything we can verify; **about $10k/day by one trader with 230 fast round trips is.** An engine that reproduces *that* on several wallets' worth of setups, with size scaled by pool depth, is the realistic version of the goal; the rest is compounding.
 - The capital question answers itself from the tier the real earners trade in: curve coins and freshly migrated coins for the fast traders (small positions, many trades), and migrated coins with $100k–$5M liquidity for the hours-scale holders ($5–50k positions). The curve tier is where the bots live and where $10k cannot even be deployed (the whole curve is $9.5k of SOL).
 
 ---
@@ -260,7 +254,22 @@ Each has an output, a gate and a cost. Nothing after WO-2 starts until WO-1/WO-2
 | **WO-5** | **Live at minimum size.** 0.1–1 SOL on the trending tier and the best wallets, Helius Sender/Jito tips, server near the leaders, landing-rate and realized-vs-shadow reconciliation. | 200 live round trips | landed ≥ 90%; realized within tolerance of shadow; positive after all costs including infrastructure | 1 week + run time | Tier B/C |
 | **WO-6** | **Learned models and scaling.** Per-state entry models trained on our labels (meta-labels on the rules), champion/challenger in shadow, size scaled by pool depth and posterior, wallet rotation automated. | model registry + promotion log | out-of-sample lift over the rules; 8 weeks of leader-free shadow ≥ copy returns (roadmap graduation gate) | ongoing | — |
 
-WO-1 and WO-2 run in parallel and need no money. WO-3 is the first step that needs a paid feed, and it is also the one that decides whether the launch tier is worth entering at all; if its gate fails, the engine lives in the trending and wallet tiers only.
+Work orders run **one at a time on the $0 tier** (decided 2026-10-08). WO-1 and WO-2 need no money. WO-3 is the first step that needs a paid feed, and it is also the one that decides whether the launch tier is worth entering at all; if its gate fails, the engine lives in the trending and wallet tiers only.
+
+### WO-1 result (closed 2026-10-08)
+
+Delivered: `copybot wallet-audit` (classifier, own-transaction read with retries, verdicts with reasons and the best and worst trips as evidence, JSON + table), `leaders_file` in the engine config, the weekly `wallet-audit` workflow (list from the `AUDIT_WALLETS` secret), RUNBOOK section. Found and fixed on the way: two decoder bugs (coin-priced curves; histories flooded by other people's transactions), both pinned by tests on real transactions.
+
+Gate: "≥ 5 wallets classed trader with positive on-chain PnL and median hold ≥ 60 s".
+
+| Check | Result |
+|---|---|
+| Traders with positive PnL and hold ≥ 60 s | 5 (kol-CkPFG, 9WhiK, skarraOG, kol-CCUcj, kol-AEeJU) → **passes on its literal terms** |
+| Of those, full leaders (30+ trips, profit factor ≥ 1.5) | 2 (kol-CkPFG, 9WhiK) |
+| Leaders in total | 4 (adds mofo chad and kol-4Ddrf, both under 60 s holds) |
+| Window | ~20 h per wallet (1,000 own transactions on a free RPC), not 30 days |
+
+Honest reading: the gate passes, narrowly. The window is a day, not a month, so the leader list is provisional and the weekly re-run is what makes it trustworthy. Activating that weekly run needs the workflow file on the default branch (same one-file step as paper-run). The leader count is the limiting factor for signal volume; adding candidates (KOLscan, GMGN lists) and auditing them is a cheap repeatable step.
 
 ---
 
@@ -279,7 +288,7 @@ WO-1 and WO-2 run in parallel and need no money. WO-3 is the first step that nee
 ## 9. Honest expectations
 
 - Nothing recorded so far shows an edge: attempt 1 has two paper trades (+0.23 SOL, noise). The published copy-trading study found copier returns negative on average; our first live validation showed why (we land 1–6 s after the leader on the free feed).
-- The "$100k/day" evidence is vendor-reported PnL for wallets we either identified as bots and holders or could not decode. What we *can* verify is three traders at $10–16k/day in one-day slices, with 35 s–4 min holds. The trending tier is the only one where $10–100k of capital fits, so the plan puts the first shadow money there, keeps the launch tier small and fast, and uses copies as a signal.
+- The "$100k/day" evidence is vendor-reported PnL for wallets we either identified as bots and holders or could not decode. What we *can* verify is one trader at about $10k/day and three more at $0.6–4k/day in one-day slices, with 31 s–3 min holds. The trending tier is the only one where $10–100k of capital fits, so the plan puts the first shadow money there, keeps the launch tier small and fast, and uses copies as a signal.
 - Each work order has a gate designed to kill it cheaply. If WO-3's early-signal lift does not reproduce, the launch tier is dropped. If WO-4's shadow expectancy is not positive on future data, no live phase starts.
 - The durable asset is the tape: every launch, every snapshot, every decision and its outcome, timestamped at receipt. Vendors sell the same feeds to everyone; nobody sells this.
 
@@ -289,7 +298,7 @@ WO-1 and WO-2 run in parallel and need no money. WO-3 is the first step that nee
 
 1. **Budget tier for the next 4–6 weeks.** A ($0: census + trending at 5-min resolution + wallet copies 1–6 s late), **B (≈ $60–120/mo: slot-level launch data and a 24/7 census; recommended)**, or C (≈ $600–1,500/mo: latency-competitive execution, only after WO-4 passes).
 2. **Where the census runs 24/7.** GitHub Actions (free, 5-minute granularity, interruptions) or a small VPS (recommended, $5–15/mo; I set it up from `deploy/`). Your Windows machine works for the console and research, not for the recorder.
-3. **Leader list.** Drop the twelve bots and snipers; start from early biddy, mofo chad and skarraOG, add 9WhiK after a complete read, and re-read EC2f5 / 8deJ9 / 9qgh1 with a keyed RPC before believing the vendor's numbers; all subject to WO-1's weekly verdict.
+3. **Leader list.** Settled by WO-1: the weekly `wallet-audit` writes it (this week mofo chad, kol-CkPFG, kol-4Ddrf, 9WhiK).
 4. **Capital framing.** Agree that the engine's size lives in the trending/migrated tier (positions ≤ 1% of pool, $1–10k each) and that the curve tier is for 0.1–1 SOL probes. This changes which gates get built first (trending rules before launch sniping).
 
 ---
