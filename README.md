@@ -34,6 +34,7 @@ cp config/poc.example.toml config/copybot.toml              # then add wallets u
 | [07 — Roadmap](docs/07-roadmap.md) | Phases, go/no-go gates, unit economics, decisions needed |
 | [08 — Feature parity](docs/08-feature-parity.md) | What GMGN / Axiom / BasedBot / Proxima do vs what copybot has today |
 | [09 — Proxima & BasedBot deep dive](docs/09-proxima-basedbot-deep-dive.md) | Their full documented feature sets, mapped to copybot; what we won't build and why |
+| [10 — Engine v2 plan](docs/10-engine-v2-plan.md) | Audit of attempt 1 and of the wallet list, the coin lifecycle state machine (wallets + launches + trending as features), data/census plan, work orders with gates and costs, decisions needed |
 | [RUNBOOK](RUNBOOK.md) | **Start here.** Path A: free proof of concept. Path B: server, providers, install, check, simulate, shadow, live |
 
 ## Layout
