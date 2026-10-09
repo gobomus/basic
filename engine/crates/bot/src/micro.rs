@@ -18,17 +18,32 @@
 //!   down during the coin's life, so incomplete coins can be left out.
 //! * `trades-<hour>.jsonl.gz`: the decoded events themselves (see [`TradesMode`]).
 //!
+//! The coins that go far do so after graduation, on PumpSwap, so a second stream
+//! follows the pump AMM program and every graduated coin's pool for a day:
+//! `graduations` rows (the pool, the creator, the market cap it landed at), `candles`
+//! rows (one per minute: open/high/low/close market cap, buy and sell SOL, buyers,
+//! sellers, the creator's sells), `amm_outcomes` rows at 1, 6 and 24 h after
+//! graduation (peak multiple and when, deepest drawdown, the creator's selling), and
+//! the pool's trades on the trade tape (`ev: "amm"`).
+//!
+//! Every row carries `sol_usd` (the SOL price at the time, from `sol_price` rows the
+//! census writes each minute) so market caps can be read in dollars, the unit traders
+//! see.
+//!
 //! Holdings come from curve trades only. Tokens moved by plain transfers are not seen;
 //! in a coin's first minutes they are rare, and a balance that would go negative counts
 //! as zero.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use chain::consts::PUMP_PROGRAM;
+use chain::consts::WSOL_MINT;
+use chain::consts::{PUMP_AMM_PROGRAM, PUMP_PROGRAM};
+use chain::pda::pump_pool_for;
 use chain::pump::{CreateEvent, PumpEvent, TradeEvent};
+use chain::pump_amm::SwapEventData;
 use chain::solana_sdk::pubkey::Pubkey;
 use futures::{SinkExt, StreamExt};
 use reqwest_websocket::{Message, RequestBuilderExt};
@@ -54,6 +69,13 @@ const CURVE_FULL_SOL: f64 = 85.005;
 const SNIPER_SLOTS: u64 = 1;
 /// Per-second flow is kept for the first minute.
 const INFLOW_SECS: usize = 60;
+/// A graduated coin's pool is followed this long.
+const AMM_FOLLOW_SECS: i64 = 86_400;
+/// Seconds after graduation at which an `amm_outcomes` row is written.
+pub const AMM_OUTCOMES: [i64; 3] = [3600, 21_600, 86_400];
+/// Market regime windows: launches in the last 10 min, graduations in the last hour.
+const REGIME_LAUNCH_SECS: i64 = 600;
+const REGIME_GRAD_SECS: i64 = 3600;
 
 /// Which decoded events go to `trades-<hour>.jsonl.gz`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -196,7 +218,7 @@ impl Book {
 
     /// Snapshot `i`, rebuilt from the trades stamped at or before its moment, in chain
     /// order (slot, then position), whatever order they arrived in.
-    fn snapshot(&mut self, i: usize, gap_ms: i64) -> Value {
+    fn snapshot(&mut self, i: usize, gap_ms: i64, ctx: &Ctx) -> Value {
         let t = SNAPSHOTS[i];
         let cutoff = self.cutoff(i);
         let mut tr: Vec<&Trade> = self.trades.iter().filter(|x| x.ts <= cutoff).collect();
@@ -301,6 +323,10 @@ impl Book {
         if let Some(q) = self.quote {
             row["quote"] = json!(q.to_string());
         }
+        if let Some(p) = ctx.sol_usd {
+            row["sol_usd"] = json!(p);
+            row["mcap_usd"] = json!((mcap * p).round());
+        }
         if i == 0 {
             row["symbol"] = json!(self.symbol);
             row["name"] = json!(self.name);
@@ -309,6 +335,21 @@ impl Book {
             row["pump_suffix"] = json!(self.pump_suffix);
             row["mayhem"] = json!(self.mayhem);
             row["seen_delay_ms"] = json!(self.seen_ms - self.created_ts * 1000);
+            // the create transaction: what the creator bought, who else was in that slot
+            let in_slot: Vec<&&Trade> = tr.iter().filter(|x| x.slot == self.create_slot).collect();
+            let creator_sol: u64 = in_slot
+                .iter()
+                .filter(|x| x.buy && x.user == self.creator)
+                .map(|x| x.sol)
+                .sum();
+            let slot_sol: u64 = in_slot.iter().filter(|x| x.buy).map(|x| x.sol).sum();
+            row["create_buy_sol"] = json!(r3(creator_sol as f64 / 1e9));
+            row["create_slot_buys"] = json!(in_slot.iter().filter(|x| x.buy).count());
+            row["create_slot_sol"] = json!(r3(slot_sol as f64 / 1e9));
+            row["instant_grad"] = json!(self.graduated_ts == Some(self.created_ts));
+            // the market around the launch
+            row["launches_10m"] = json!(ctx.launches_10m);
+            row["grads_1h"] = json!(ctx.grads_1h);
         }
         if t == INFLOW_SECS as i64 {
             row["inflow_1s"] = json!(inflow
@@ -371,6 +412,8 @@ pub struct Out {
 
 #[derive(Default)]
 struct Minute {
+    amm_tx: u64,
+    amm_trades: u64,
     tx: u64,
     failed: u64,
     truncated: u64,
@@ -380,32 +423,90 @@ struct Minute {
     lags_ms: Vec<i64>,
 }
 
-/// The books of all coins in their first hour, and the stream's health.
+/// What a snapshot needs from outside its book: the SOL price and the market regime.
+#[derive(Clone, Copy, Default)]
+pub struct Ctx {
+    pub sol_usd: Option<f64>,
+    pub launches_10m: usize,
+    pub grads_1h: usize,
+}
+
+/// The books of all coins in their first hour, the pools of graduated coins for a
+/// day, and the streams' health.
 pub struct Micro {
     books: HashMap<Pubkey, Book>,
+    pools: HashMap<Pubkey, AmmBook>,
     mode: TradesMode,
     minute: Minute,
     minute_start: i64,
     down_since: Option<i64>,
+    amm_down_since: Option<i64>,
     pub disconnects: u64,
+    pub amm_disconnects: u64,
     seq: u64,
+    pub sol_usd: Option<f64>,
+    recent_creates: VecDeque<i64>,
+    recent_grads: VecDeque<i64>,
 }
 
 impl Micro {
     pub fn new(mode: TradesMode, now: i64) -> Self {
         Self {
             books: HashMap::new(),
+            pools: HashMap::new(),
             mode,
             minute: Minute::default(),
             minute_start: now,
             down_since: None,
+            amm_down_since: None,
             disconnects: 0,
+            amm_disconnects: 0,
             seq: 0,
+            sol_usd: None,
+            recent_creates: VecDeque::new(),
+            recent_grads: VecDeque::new(),
         }
     }
 
     pub fn coins(&self) -> usize {
         self.books.len()
+    }
+
+    pub fn pools(&self) -> usize {
+        self.pools.len()
+    }
+
+    fn ctx(&mut self, now_s: i64) -> Ctx {
+        while self
+            .recent_creates
+            .front()
+            .is_some_and(|t| *t < now_s - REGIME_LAUNCH_SECS)
+        {
+            self.recent_creates.pop_front();
+        }
+        while self
+            .recent_grads
+            .front()
+            .is_some_and(|t| *t < now_s - REGIME_GRAD_SECS)
+        {
+            self.recent_grads.pop_front();
+        }
+        Ctx {
+            sol_usd: self.sol_usd,
+            launches_10m: self.recent_creates.len(),
+            grads_1h: self.recent_grads.len(),
+        }
+    }
+
+    pub fn set_amm_down(&mut self, now: i64) {
+        if self.amm_down_since.is_none() {
+            self.amm_down_since = Some(now);
+            self.amm_disconnects += 1;
+        }
+    }
+
+    pub fn set_amm_up(&mut self) {
+        self.amm_down_since = None;
     }
 
     pub fn set_down(&mut self, now: i64) {
@@ -452,6 +553,7 @@ impl Micro {
                             "mayhem": e.is_mayhem_mode,
                         }));
                     }
+                    self.recent_creates.push_back(e.timestamp);
                     self.books
                         .entry(e.mint)
                         .or_insert_with(|| Book::new(&e, slot, recv_ms));
@@ -492,7 +594,81 @@ impl Micro {
                     if let Some(b) = self.books.get_mut(&e.mint) {
                         b.graduated_ts.get_or_insert(e.timestamp);
                     }
+                    self.recent_grads.push_back(e.timestamp);
+                    self.follow_pool(&e.mint, e.timestamp, out);
                 }
+            }
+        }
+    }
+
+    /// Follow a graduated coin's PumpSwap pool from now on. A curve priced in another
+    /// token (`quote` on its book) migrates into a pool quoted in that token; its prices
+    /// are not in SOL, so it is recorded but not followed. A coin whose create we missed
+    /// is taken as SOL-quoted (the great majority): if it was not, its pool never trades
+    /// and the follow stays empty.
+    fn follow_pool(&mut self, mint: &Pubkey, grad_ts: i64, out: &mut Out) {
+        let book = self.books.get(mint);
+        let quote = book.and_then(|b| b.quote).unwrap_or(WSOL_MINT);
+        let pool = pump_pool_for(mint, &quote);
+        if self.pools.contains_key(&pool) {
+            return;
+        }
+        let sol_quoted = quote == WSOL_MINT;
+        let mut row = json!({
+            "mint": mint.to_string(), "pool": pool.to_string(), "grad_ts": grad_ts,
+            "created_ts": book.map(|b| b.created_ts),
+            "creator": book.map(|b| b.creator.to_string()),
+            "symbol": book.map(|b| b.symbol.clone()),
+            "instant": book.is_some_and(|b| b.created_ts == grad_ts),
+            "followed": sol_quoted,
+            "sol_usd": self.sol_usd,
+        });
+        if !sol_quoted {
+            row["quote"] = json!(quote.to_string());
+        }
+        if let Some(b) = book {
+            row["curve_trades"] = json!(b.n_trades);
+            row["curve_holders"] = json!(b.end_bal.values().filter(|w| w.0 > 0).count());
+        }
+        out.rows.push(("graduations", row));
+        if sol_quoted {
+            self.pools
+                .insert(pool, AmmBook::new(*mint, grad_ts, book.map(|b| b.creator)));
+        }
+    }
+
+    /// One successful PumpSwap transaction from the AMM stream.
+    pub fn on_amm(
+        &mut self,
+        slot: u64,
+        sig: &str,
+        recv_ms: i64,
+        events: Vec<SwapEventData>,
+        out: &mut Out,
+    ) {
+        self.minute.amm_tx += 1;
+        for e in events {
+            let Some(b) = self.pools.get_mut(&e.pool) else {
+                continue;
+            };
+            self.minute.amm_trades += 1;
+            self.minute.lags_ms.push(recv_ms - e.timestamp * 1000);
+            if b.creator.is_none() && e.coin_creator != Pubkey::default() {
+                b.creator = Some(e.coin_creator);
+            }
+            let mcap = e.post_price(6, 9) * 1e9;
+            if self.mode != TradesMode::None {
+                out.tape.push(json!({
+                    "ev": "amm", "slot": slot, "ts": e.timestamp, "sig": sig,
+                    "mint": b.mint.to_string(), "pool": e.pool.to_string(), "user": e.user.to_string(),
+                    "buy": e.is_buy, "sol": e.user_flow(), "base": e.base_amount,
+                    "mcap_sol": (mcap * 1000.0).round() / 1000.0,
+                    "fee_bps": e.total_fee_bps(),
+                }));
+            }
+            let gap = self.amm_down_since.is_some();
+            for row in b.add(&e, mcap, gap, self.sol_usd) {
+                out.rows.push(("candles", row));
             }
         }
     }
@@ -501,10 +677,11 @@ impl Micro {
     pub fn tick(&mut self, now: i64, out: &mut Out) {
         let mut done = vec![];
         let down = self.down_since;
+        let ctx = self.ctx(now / 1000);
         for (mint, b) in self.books.iter_mut() {
             let gap = gap_of(b, down, now);
             while b.next < SNAPSHOTS.len() && now >= b.cutoff(b.next) * 1000 + GRACE_MS {
-                let mut row = b.snapshot(b.next, gap);
+                let mut row = b.snapshot(b.next, gap, &ctx);
                 row["mint"] = json!(mint.to_string());
                 out.rows.push(("micro", row));
                 b.next += 1;
@@ -517,6 +694,31 @@ impl Micro {
         }
         for m in done {
             self.books.remove(&m);
+        }
+        // pools: closed candles, outcomes, and the end of the follow
+        let amm_gap = self.amm_down_since.is_some();
+        let mut gone = vec![];
+        for (pool, b) in self.pools.iter_mut() {
+            out.rows.extend(
+                b.closed_candles(now, amm_gap, self.sol_usd)
+                    .into_iter()
+                    .map(|r| ("candles", r)),
+            );
+            while b.next_outcome < AMM_OUTCOMES.len()
+                && now >= (b.grad_ts + AMM_OUTCOMES[b.next_outcome]) * 1000 + GRACE_MS
+            {
+                out.rows.push((
+                    "amm_outcomes",
+                    b.outcome(AMM_OUTCOMES[b.next_outcome], true, self.sol_usd),
+                ));
+                b.next_outcome += 1;
+            }
+            if now >= (b.grad_ts + AMM_FOLLOW_SECS) * 1000 + GRACE_MS {
+                gone.push(*pool);
+            }
+        }
+        for p in gone {
+            self.pools.remove(&p);
         }
         if now - self.minute_start >= 60_000 {
             out.rows.push(("feed", self.feed_row(now)));
@@ -545,6 +747,12 @@ impl Micro {
             "connected": self.down_since.is_none(),
             "disconnects": self.disconnects,
             "coins": self.books.len(),
+            "amm_tx": m.amm_tx,
+            "amm_trades": m.amm_trades,
+            "amm_connected": self.amm_down_since.is_none(),
+            "amm_disconnects": self.amm_disconnects,
+            "pools": self.pools.len(),
+            "sol_usd": self.sol_usd,
         });
         self.minute_start = now;
         row
@@ -560,7 +768,206 @@ impl Micro {
             ));
         }
         self.books.clear();
+        for b in self.pools.values_mut() {
+            out.rows.extend(
+                b.flush_candle(self.sol_usd)
+                    .into_iter()
+                    .map(|r| ("candles", r)),
+            );
+            let at = (now / 1000 - b.grad_ts).max(0);
+            out.rows
+                .push(("amm_outcomes", b.outcome(at, false, self.sol_usd)));
+        }
+        self.pools.clear();
         out.rows.push(("feed", self.feed_row(now)));
+    }
+}
+
+// ------------------------------------------------------------------ after graduation
+
+/// One minute of a pool, in SOL market cap.
+struct Candle {
+    minute: i64,
+    o: f64,
+    h: f64,
+    l: f64,
+    c: f64,
+    buy_sol: u64,
+    sell_sol: u64,
+    buys: u32,
+    sells: u32,
+    buyers: HashSet<Pubkey>,
+    sellers: HashSet<Pubkey>,
+    creator_sold: u64,
+    creator_bought: u64,
+    gap: bool,
+}
+
+impl Candle {
+    fn row(&self, mint: &Pubkey, grad_ts: i64, sol_usd: Option<f64>) -> Value {
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+        json!({
+            "mint": mint.to_string(),
+            "minute": self.minute,
+            "age_min": (self.minute - grad_ts) / 60,
+            "o": r3(self.o), "h": r3(self.h), "l": r3(self.l), "c": r3(self.c),
+            "buy_sol": r3(self.buy_sol as f64 / 1e9),
+            "sell_sol": r3(self.sell_sol as f64 / 1e9),
+            "buys": self.buys,
+            "sells": self.sells,
+            "buyers": self.buyers.len(),
+            "sellers": self.sellers.len(),
+            "creator_sold_sol": r3(self.creator_sold as f64 / 1e9),
+            "creator_bought_sol": r3(self.creator_bought as f64 / 1e9),
+            "gap": self.gap,
+            "sol_usd": sol_usd,
+        })
+    }
+}
+
+/// A graduated coin's pool: candles as they close, and the path's extremes.
+struct AmmBook {
+    mint: Pubkey,
+    grad_ts: i64,
+    creator: Option<Pubkey>,
+    candle: Option<Candle>,
+    first: Option<f64>,
+    last: f64,
+    peak: f64,
+    peak_ts: i64,
+    /// lowest market cap since the peak
+    trough: f64,
+    /// deepest fall from any earlier high, as a share
+    max_dd: f64,
+    trades: u64,
+    buyers: HashSet<Pubkey>,
+    creator_sold: u64,
+    next_outcome: usize,
+}
+
+impl AmmBook {
+    fn new(mint: Pubkey, grad_ts: i64, creator: Option<Pubkey>) -> Self {
+        Self {
+            mint,
+            grad_ts,
+            creator,
+            candle: None,
+            first: None,
+            last: 0.0,
+            peak: 0.0,
+            peak_ts: grad_ts,
+            trough: f64::INFINITY,
+            max_dd: 0.0,
+            trades: 0,
+            buyers: HashSet::new(),
+            creator_sold: 0,
+            next_outcome: 0,
+        }
+    }
+
+    /// Apply one swap; returns the candle it closed, if any.
+    fn add(&mut self, e: &SwapEventData, mcap: f64, gap: bool, sol_usd: Option<f64>) -> Vec<Value> {
+        let mut out = vec![];
+        self.trades += 1;
+        self.first.get_or_insert(mcap);
+        self.last = mcap;
+        if mcap > self.peak {
+            self.peak = mcap;
+            self.peak_ts = e.timestamp;
+            self.trough = mcap;
+        } else {
+            self.trough = self.trough.min(mcap);
+            if self.peak > 0.0 {
+                self.max_dd = self.max_dd.max(1.0 - mcap / self.peak);
+            }
+        }
+        let flow = e.user_flow();
+        let by_creator = self.creator == Some(e.user);
+        if e.is_buy {
+            self.buyers.insert(e.user);
+        } else if by_creator {
+            self.creator_sold += flow;
+        }
+        let minute = e.timestamp.div_euclid(60) * 60;
+        if self.candle.as_ref().is_some_and(|c| c.minute != minute) {
+            out.extend(self.flush_candle(sol_usd));
+        }
+        let c = self.candle.get_or_insert_with(|| Candle {
+            minute,
+            o: mcap,
+            h: mcap,
+            l: mcap,
+            c: mcap,
+            buy_sol: 0,
+            sell_sol: 0,
+            buys: 0,
+            sells: 0,
+            buyers: HashSet::new(),
+            sellers: HashSet::new(),
+            creator_sold: 0,
+            creator_bought: 0,
+            gap: false,
+        });
+        c.h = c.h.max(mcap);
+        c.l = c.l.min(mcap);
+        c.c = mcap;
+        c.gap |= gap;
+        if e.is_buy {
+            c.buy_sol += flow;
+            c.buys += 1;
+            c.buyers.insert(e.user);
+            if by_creator {
+                c.creator_bought += flow;
+            }
+        } else {
+            c.sell_sol += flow;
+            c.sells += 1;
+            c.sellers.insert(e.user);
+            if by_creator {
+                c.creator_sold += flow;
+            }
+        }
+        out
+    }
+
+    fn flush_candle(&mut self, sol_usd: Option<f64>) -> Option<Value> {
+        self.candle
+            .take()
+            .map(|c| c.row(&self.mint, self.grad_ts, sol_usd))
+    }
+
+    /// The open candle once its minute is over (plus the grace for late trades).
+    fn closed_candles(&mut self, now_ms: i64, gap: bool, sol_usd: Option<f64>) -> Option<Value> {
+        if let Some(c) = self.candle.as_mut() {
+            c.gap |= gap;
+            if now_ms >= (c.minute + 60) * 1000 + GRACE_MS {
+                return self.flush_candle(sol_usd);
+            }
+        }
+        None
+    }
+
+    fn outcome(&self, at_secs: i64, full_window: bool, sol_usd: Option<f64>) -> Value {
+        let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+        let first = self.first.unwrap_or(0.0);
+        json!({
+            "mint": self.mint.to_string(),
+            "grad_ts": self.grad_ts,
+            "at": at_secs,
+            "creator": self.creator.map(|c| c.to_string()),
+            "first_mcap_sol": r3(first),
+            "peak_mcap_sol": r3(self.peak),
+            "peak_multiple": (first > 0.0).then(|| r3(self.peak / first)),
+            "peak_after_s": self.peak_ts - self.grad_ts,
+            "max_drawdown": r3(self.max_dd),
+            "trough_after_peak_sol": if self.trough.is_finite() { r3(self.trough) } else { 0.0 },
+            "last_mcap_sol": r3(self.last),
+            "trades": self.trades,
+            "buyers": self.buyers.len(),
+            "creator_sold_sol": r3(self.creator_sold as f64 / 1e9),
+            "full_window": full_window,
+            "sol_usd": sol_usd,
+        })
     }
 }
 
@@ -576,11 +983,11 @@ struct Params {
 }
 #[derive(Deserialize)]
 struct NotifResult {
-    context: Ctx,
+    context: NotifCtx,
     value: LogValue,
 }
 #[derive(Deserialize)]
-struct Ctx {
+struct NotifCtx {
     slot: u64,
 }
 #[derive(Deserialize)]
@@ -590,33 +997,45 @@ struct LogValue {
     logs: Vec<String>,
 }
 
-/// One transaction from the stream.
+/// One transaction from a stream.
 pub struct StreamTx {
     pub slot: u64,
     pub sig: String,
+    /// the program this stream follows (pump or pump AMM)
+    pub program: Pubkey,
     pub events: Vec<PumpEvent>,
+    pub amm: Vec<SwapEventData>,
     /// The node cut the logs short (events after the cut are missing).
     pub truncated: bool,
     pub failed: bool,
 }
 
-/// The pump events of one `logsNotification` (`None` for any other message).
-pub fn decode_notification(text: &str) -> Option<StreamTx> {
+/// The `program`'s events in one `logsNotification` (`None` for any other message).
+pub fn decode_notification(text: &str, program: &Pubkey) -> Option<StreamTx> {
     let n: Notification = serde_json::from_str(text).ok()?;
     let r = n.params?.result;
     let failed = r.value.err.is_some();
-    let events = if failed {
-        vec![]
-    } else {
-        chain::detect::program_data_in_logs(&r.value.logs, &PUMP_PROGRAM)
-            .iter()
-            .filter_map(|b| chain::pump::decode_event(b))
-            .collect()
-    };
+    let (mut events, mut amm) = (vec![], vec![]);
+    if !failed {
+        let data = chain::detect::program_data_in_logs(&r.value.logs, program);
+        if *program == PUMP_AMM_PROGRAM {
+            amm = data
+                .iter()
+                .filter_map(|b| chain::pump_amm::decode_event(b))
+                .collect();
+        } else {
+            events = data
+                .iter()
+                .filter_map(|b| chain::pump::decode_event(b))
+                .collect();
+        }
+    }
     Some(StreamTx {
         slot: r.context.slot,
         sig: r.value.signature,
+        program: *program,
         events,
+        amm,
         truncated: r.value.logs.iter().any(|l| l.starts_with("Log truncated")),
         failed,
     })
@@ -671,7 +1090,7 @@ enum Feed {
 /// One connection: subscribe, forward every notification, reconnect for ever. The
 /// public endpoint recycles connections every minute or so; a connection that was
 /// healthy reconnects at once, a failing one backs off.
-async fn reader(id: usize, url: String, tx: tokio::sync::mpsc::Sender<Feed>) {
+async fn reader(id: usize, url: String, program: Pubkey, tx: tokio::sync::mpsc::Sender<Feed>) {
     let mut backoff = 0u64;
     loop {
         let conn = async {
@@ -688,7 +1107,7 @@ async fn reader(id: usize, url: String, tx: tokio::sync::mpsc::Sender<Feed>) {
                 .await?;
             ws.send(Message::Text(
                 json!({"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-                       "params": [{"mentions": [PUMP_PROGRAM.to_string()]}, {"commitment": "processed"}]})
+                       "params": [{"mentions": [program.to_string()]}, {"commitment": "processed"}]})
                 .to_string(),
             ))
             .await?;
@@ -714,7 +1133,7 @@ async fn reader(id: usize, url: String, tx: tokio::sync::mpsc::Sender<Feed>) {
                         Ok(Some(Ok(_))) => continue,
                     };
                     let recv = now_ms();
-                    match decode_notification(&text) {
+                    match decode_notification(&text, &program) {
                         Some(t) => {
                             if tx.send(Feed::Tx(recv, t)).await.is_err() {
                                 return;
@@ -762,22 +1181,35 @@ pub async fn run(
     tape: Tape,
     dir: PathBuf,
     mode: TradesMode,
+    sol_usd: watch::Receiver<Option<f64>>,
     mut stop: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Feed>(50_000);
     let mut readers = vec![];
-    for (i, url) in urls
-        .iter()
-        .flat_map(|u| std::iter::repeat_n(u, conns.max(1)))
-        .enumerate()
-    {
-        readers.push(tokio::spawn(reader(i, url.clone(), tx.clone())));
+    let mut is_amm = vec![];
+    for program in [PUMP_PROGRAM, PUMP_AMM_PROGRAM] {
+        for url in urls
+            .iter()
+            .flat_map(|u| std::iter::repeat_n(u, conns.max(1)))
+        {
+            let id = readers.len();
+            readers.push(tokio::spawn(reader(id, url.clone(), program, tx.clone())));
+            is_amm.push(program == PUMP_AMM_PROGRAM);
+        }
     }
     drop(tx);
     let mut up = vec![false; readers.len()];
+    let live_of = |up: &[bool], amm: bool| {
+        up.iter()
+            .zip(&is_amm)
+            .filter(|(u, a)| **u && **a == amm)
+            .count()
+    };
     let mut micro = Micro::new(mode, now_ms());
     micro.set_down(now_ms());
+    micro.set_amm_down(now_ms());
     micro.disconnects = 0;
+    micro.amm_disconnects = 0;
     let mut trades = TradeTape { dir, buf: vec![] };
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     // signatures seen recently (hashed), to take each transaction once
@@ -824,14 +1256,16 @@ pub async fn run(
             _ = stop.changed() => break,
             f = rx.recv() => {
                 let Some(f) = f else { break };
-                let live = up.iter().filter(|u| **u).count();
+                let live = live_of(&up, false);
                 match f {
                     Feed::Up(i) => {
                         if !up[i] {
                             up[i] = true;
-                            if live == 0 {
+                            if is_amm[i] {
+                                if live_of(&up, true) == 1 { micro.set_amm_up(); eprintln!("pump AMM stream up"); }
+                            } else if live == 0 {
                                 micro.set_up(now_ms());
-                                eprintln!("pump stream up ({} connection(s) to {})", up.len(), urls.join(", "));
+                                eprintln!("pump stream up ({} connection(s) per program to {})", conns.max(1), urls.join(", "));
                             }
                         }
                     }
@@ -839,16 +1273,19 @@ pub async fn run(
                         if up[i] {
                             up[i] = false;
                             recycles += 1;
-                            if live == 1 {
+                            if is_amm[i] {
+                                if live_of(&up, true) == 0 { micro.set_amm_down(now_ms()); eprintln!("pump AMM stream: every connection down ({reason})"); }
+                            } else if live == 1 {
                                 micro.set_down(now_ms());
                                 eprintln!("pump stream: every connection down ({reason})");
                             }
                         } else if recycles == 0 || live == 0 {
-                            eprintln!("pump stream connection {i}: {reason}");
+                            eprintln!("stream connection {i}: {reason}");
                         }
                     }
                     Feed::Tx(recv, t) => {
-                        let h = sig_hash(&t.sig);
+                        // one transaction can touch both programs: each stream keeps its own events
+                        let h = sig_hash(&t.sig) ^ (t.program == PUMP_AMM_PROGRAM) as u64;
                         if seen.contains(&h) || seen_prev.contains(&h) {
                             dupes += 1;
                             continue;
@@ -862,14 +1299,19 @@ pub async fn run(
                             continue;
                         }
                         let mut out = Out::default();
-                        micro.on_tx(t.slot, &t.sig, recv, t.events, t.truncated, &mut out);
+                        if t.program == PUMP_AMM_PROGRAM {
+                            micro.on_amm(t.slot, &t.sig, recv, t.amm, &mut out);
+                        } else {
+                            micro.on_tx(t.slot, &t.sig, recv, t.events, t.truncated, &mut out);
+                        }
                         write(out, &mut totals, &mut trades, live, recycles, dupes)?;
                     }
                 }
             }
             _ = tick.tick() => {
                 let now = now_ms();
-                let live = up.iter().filter(|u| **u).count();
+                let live = live_of(&up, false);
+                micro.sol_usd = *sol_usd.borrow();
                 let mut out = Out::default();
                 micro.tick(now, &mut out);
                 write(out, &mut totals, &mut trades, live, recycles, dupes)?;
@@ -880,8 +1322,9 @@ pub async fn run(
                 if now - last_log >= 60_000 {
                     last_log = now;
                     eprintln!(
-                        "pump stream: {} creates, {} trades taped, {} outcomes, {} coins open · {live}/{} connections up, {recycles} recycled, {} gaps",
-                        totals.0, totals.1, totals.2, micro.coins(), up.len(), micro.disconnects
+                        "pump stream: {} creates, {} trades taped, {} outcomes, {} coins open, {} pools followed · {live}+{}/{} connections up, {recycles} recycled, {} gaps · SOL {}",
+                        totals.0, totals.1, totals.2, micro.coins(), micro.pools(), live_of(&up, true), up.len(), micro.disconnects,
+                        micro.sol_usd.map(|p| format!("${p:.2}")).unwrap_or_else(|| "?".into())
                     );
                 }
             }
@@ -890,7 +1333,7 @@ pub async fn run(
     for r in readers {
         r.abort();
     }
-    let live = up.iter().filter(|u| **u).count();
+    let live = live_of(&up, false);
     let mut out = Out::default();
     micro.finish(now_ms(), &mut out);
     write(out, &mut totals, &mut trades, live, recycles, dupes)?;
@@ -908,7 +1351,7 @@ mod tests {
 
     const T0: i64 = 1_791_500_000;
 
-    fn create(mint: Pubkey, creator: Pubkey) -> PumpEvent {
+    pub(super) fn create(mint: Pubkey, creator: Pubkey) -> PumpEvent {
         PumpEvent::Create(CreateEvent {
             name: "Test".into(),
             symbol: "TST".into(),
@@ -924,7 +1367,7 @@ mod tests {
     }
 
     /// A trade that leaves the curve at `vsol` SOL of virtual reserves (price grows with it).
-    fn trade(
+    pub(super) fn trade(
         mint: Pubkey,
         user: Pubkey,
         buy: bool,
@@ -1048,6 +1491,14 @@ mod tests {
         assert_eq!(s5["snipers_out"], 0);
         assert_eq!(s5["dev_pct"], 5.0);
         assert_eq!(s5["creator"], dev.to_string());
+        // the create transaction (slot 100): the dev's 1.5 SOL; the sniper came a slot later
+        assert_eq!(s5["create_buy_sol"], 1.5);
+        assert_eq!(s5["create_slot_buys"], 1);
+        assert_eq!(s5["create_slot_sol"], 1.5);
+        assert_eq!(s5["instant_grad"], false);
+        assert_eq!(s5["launches_10m"], 1);
+        assert_eq!(s5["grads_1h"], 0);
+        assert!(s5.get("sol_usd").is_none(), "no price known yet");
         // holdings 50/30/20 → HHI 0.25 + 0.09 + 0.04
         assert_eq!(s5["hhi"], 0.38);
         // market cap after the last trade in chain order (a's, slot 108), not the last to arrive
@@ -1220,7 +1671,7 @@ mod tests {
                           "logs": tx["meta"]["logMessages"]}}, "subscription": 7}})
             .to_string()
         };
-        let ok = decode_notification(&note(Value::Null)).unwrap();
+        let ok = decode_notification(&note(Value::Null), &PUMP_PROGRAM).unwrap();
         assert!(!ok.failed);
         assert_eq!(ok.slot, 452455845);
         let (mut creates, mut trades) = (vec![], vec![]);
@@ -1237,9 +1688,270 @@ mod tests {
             trades.iter().all(|m| *m == creates[0]),
             "the creator's first buy"
         );
-        let failed =
-            decode_notification(&note(json!({"InstructionError": [3, {"Custom": 6002}]}))).unwrap();
+        let failed = decode_notification(
+            &note(json!({"InstructionError": [3, {"Custom": 6002}]})),
+            &PUMP_PROGRAM,
+        )
+        .unwrap();
         assert!(failed.failed && failed.events.is_empty());
-        assert!(decode_notification(r#"{"jsonrpc":"2.0","result":7,"id":1}"#).is_none());
+        assert!(
+            decode_notification(r#"{"jsonrpc":"2.0","result":7,"id":1}"#, &PUMP_PROGRAM).is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod amm_tests {
+    use super::*;
+
+    const T0: i64 = 1_791_500_000;
+
+    /// A swap leaving the pool at `quote_sol` SOL against `base_tokens` million tokens.
+    fn swap(
+        pool: Pubkey,
+        user: Pubkey,
+        buy: bool,
+        sol: f64,
+        ts: i64,
+        base_m: f64,
+        quote_sol: f64,
+    ) -> SwapEventData {
+        // the event carries the reserves from before the swap; make "after" land where asked
+        let base_after = (base_m * 1e6 * 1e6) as u64;
+        let quote_after = (quote_sol * 1e9) as u64;
+        let amount = (sol * 1e9) as u64;
+        let base_amount = 1_000_000_000u64;
+        SwapEventData {
+            is_buy: buy,
+            timestamp: ts,
+            base_amount,
+            user_quote_amount: amount,
+            quote_amount: amount,
+            pool_quote_delta: amount,
+            pool_base_token_reserves: if buy {
+                base_after + base_amount
+            } else {
+                base_after - base_amount
+            },
+            pool_quote_token_reserves: if buy {
+                quote_after - amount
+            } else {
+                quote_after + amount
+            },
+            lp_fee_basis_points: 20,
+            protocol_fee_basis_points: 5,
+            pool,
+            user,
+            protocol_fee_recipient: Pubkey::default(),
+            coin_creator: Pubkey::default(),
+            coin_creator_fee_basis_points: 5,
+            buyback_fee_basis_points: 0,
+            virtual_quote_reserves: 0,
+        }
+    }
+
+    fn rows<'a>(out: &'a Out, kind: &str) -> Vec<&'a Value> {
+        out.rows
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    #[test]
+    fn a_graduation_opens_a_pool_book_with_candles_and_an_outcome() {
+        let (mint, dev, a, b) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mut m = Micro::new(TradesMode::FirstHour, T0 * 1000);
+        m.sol_usd = Some(100.0);
+        let mut out = Out::default();
+        // the create and the graduation of a coin whose curve we saw
+        let mut c = super::tests::create(mint, dev);
+        if let PumpEvent::Create(e) = &mut c {
+            e.timestamp = T0 - 300;
+        }
+        m.on_tx(1, "s0", (T0 - 300) * 1000, vec![c], false, &mut out);
+        m.on_tx(
+            2,
+            "s1",
+            T0 * 1000,
+            vec![PumpEvent::Complete(chain::pump::CompleteEvent {
+                user: a,
+                mint,
+                bonding_curve: Pubkey::new_unique(),
+                timestamp: T0,
+            })],
+            false,
+            &mut out,
+        );
+        let g = rows(&out, "graduations");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["mint"], mint.to_string());
+        assert_eq!(g[0]["creator"], dev.to_string());
+        assert_eq!(g[0]["instant"], false);
+        assert_eq!(g[0]["sol_usd"], 100.0);
+        assert_eq!(g[0]["followed"], true);
+        let pool: Pubkey = g[0]["pool"].as_str().unwrap().parse().unwrap();
+        assert_eq!(pool, pump_pool_for(&mint, &WSOL_MINT));
+        assert_eq!(m.pools(), 1);
+        // trades on the pool: 200M tokens against 80 SOL = 400 SOL market cap, then up, then the dev sells
+        let mut out = Out::default();
+        m.on_amm(
+            3,
+            "a1",
+            T0 * 1000 + 5000,
+            vec![swap(pool, a, true, 2.0, T0 + 5, 200.0, 80.0)],
+            &mut out,
+        );
+        m.on_amm(
+            4,
+            "a2",
+            T0 * 1000 + 30_000,
+            vec![swap(pool, b, true, 5.0, T0 + 30, 180.0, 90.0)],
+            &mut out,
+        );
+        m.on_amm(
+            5,
+            "a3",
+            T0 * 1000 + 70_000,
+            vec![swap(pool, dev, false, 20.0, T0 + 70, 220.0, 60.0)],
+            &mut out,
+        );
+        // a swap on a pool we do not follow is ignored
+        m.on_amm(
+            6,
+            "a4",
+            T0 * 1000 + 71_000,
+            vec![swap(
+                Pubkey::new_unique(),
+                a,
+                true,
+                1.0,
+                T0 + 71,
+                200.0,
+                80.0,
+            )],
+            &mut out,
+        );
+        let candles = rows(&out, "candles");
+        assert_eq!(
+            candles.len(),
+            1,
+            "the first minute closed when the third trade opened the next"
+        );
+        let c0 = candles[0];
+        assert_eq!(c0["mint"], mint.to_string());
+        assert_eq!(c0["minute"], T0.div_euclid(60) * 60);
+        assert_eq!(c0["o"], 400.0);
+        assert_eq!(c0["c"], 500.0);
+        assert_eq!(c0["h"], 500.0);
+        assert_eq!(c0["buys"], 2);
+        assert_eq!(c0["buyers"], 2);
+        assert_eq!(c0["buy_sol"], 7.0);
+        assert_eq!(c0["sol_usd"], 100.0);
+        assert_eq!(
+            out.tape.iter().filter(|r| r["ev"] == "amm").count(),
+            3,
+            "followed pools only"
+        );
+        // the open candle closes by the clock; the outcome at 1 h carries peak and drawdown
+        let mut later = Out::default();
+        m.tick((T0 + 3600) * 1000 + GRACE_MS, &mut later);
+        let c1 = rows(&later, "candles");
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0]["creator_sold_sol"], 20.0);
+        assert_eq!(c1[0]["sellers"], 1);
+        let o = rows(&later, "amm_outcomes");
+        assert_eq!(o.len(), 1);
+        let o = o[0];
+        assert_eq!(o["at"], 3600);
+        assert_eq!(o["first_mcap_sol"], 400.0);
+        assert_eq!(o["peak_mcap_sol"], 500.0);
+        assert_eq!(o["peak_multiple"], 1.25);
+        assert_eq!(o["peak_after_s"], 30);
+        // 500 → 272.7 (60 SOL / 220M tokens)
+        let dd = o["max_drawdown"].as_f64().unwrap();
+        assert!((dd - (1.0 - 272.727 / 500.0)).abs() < 0.002, "{dd}");
+        assert_eq!(o["creator_sold_sol"], 20.0);
+        assert_eq!(o["buyers"], 2);
+        assert_eq!(o["full_window"], true);
+        // the follow ends after a day
+        let mut end = Out::default();
+        m.tick((T0 + AMM_FOLLOW_SECS) * 1000 + GRACE_MS, &mut end);
+        assert_eq!(rows(&end, "amm_outcomes").len(), 2, "6 h and 24 h");
+        assert_eq!(m.pools(), 0);
+    }
+
+    #[test]
+    fn a_coin_priced_in_another_token_is_recorded_but_not_followed() {
+        let (mint, dev, quote) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mut m = Micro::new(TradesMode::None, T0 * 1000);
+        let mut out = Out::default();
+        m.on_tx(
+            1,
+            "s0",
+            T0 * 1000,
+            vec![super::tests::create(mint, dev)],
+            false,
+            &mut out,
+        );
+        let mut t = super::tests::trade(mint, dev, true, 1_000_000_000_000, 1.0, T0, 31.0);
+        if let PumpEvent::Trade(e) = &mut t {
+            e.quote_mint = Some(quote);
+        }
+        m.on_tx(1, "s1", T0 * 1000, vec![t], false, &mut out);
+        m.on_tx(
+            2,
+            "s2",
+            (T0 + 60) * 1000,
+            vec![PumpEvent::Complete(chain::pump::CompleteEvent {
+                user: dev,
+                mint,
+                bonding_curve: Pubkey::new_unique(),
+                timestamp: T0 + 60,
+            })],
+            false,
+            &mut out,
+        );
+        let g = rows(&out, "graduations");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["followed"], false);
+        assert_eq!(g[0]["quote"], quote.to_string());
+        assert_eq!(g[0]["pool"], pump_pool_for(&mint, &quote).to_string());
+        assert_eq!(m.pools(), 0);
+    }
+
+    #[test]
+    fn a_pumpswap_notification_decodes_on_the_amm_stream_only() {
+        let tx: Value =
+            serde_json::from_str(include_str!("../../chain/tests/fixtures/pumpswap_0.json"))
+                .unwrap();
+        let tx = if tx.get("result").is_some() {
+            &tx["result"]
+        } else {
+            &tx
+        };
+        let note = json!({"jsonrpc": "2.0", "method": "logsNotification", "params": {"result": {
+            "context": {"slot": tx["slot"]},
+            "value": {"signature": tx["transaction"]["signatures"][0], "err": null, "logs": tx["meta"]["logMessages"]}},
+            "subscription": 9}})
+        .to_string();
+        let amm = decode_notification(&note, &PUMP_AMM_PROGRAM).unwrap();
+        assert_eq!(amm.program, PUMP_AMM_PROGRAM);
+        assert!(!amm.amm.is_empty(), "a swap");
+        assert!(amm.events.is_empty());
+        let pump = decode_notification(&note, &PUMP_PROGRAM).unwrap();
+        assert!(
+            pump.amm.is_empty(),
+            "the pump stream never decodes AMM events"
+        );
     }
 }

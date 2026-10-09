@@ -367,6 +367,22 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
         .collect();
     o.push_str(&micro_section(&outcomes, &snaps, &feed, pp));
 
+    // ---- after graduation (PumpSwap candles)
+    let grads = read_kind_where(dir, "graduations", |r| {
+        r["grad_ts"].as_i64().map(|t| day_of(t * 1000)).as_deref() == Some(day)
+    });
+    let amm_out = read_kind_where(dir, "amm_outcomes", |r| {
+        r["grad_ts"].as_i64().map(|t| day_of(t * 1000)).as_deref() == Some(day)
+    });
+    let grad_mints: HashSet<String> = grads
+        .iter()
+        .filter_map(|r| r["mint"].as_str().map(String::from))
+        .collect();
+    let candles = read_kind_where(dir, "candles", |r| {
+        r["mint"].as_str().is_some_and(|m| grad_mints.contains(m))
+    });
+    o.push_str(&post_graduation_section(&grads, &amm_out, &candles));
+
     // ---- top 10 launches
     // a launch is a coin from a launchpad that real wallets hold: new pools of old tokens
     // and one-holder tokens with a made-up market cap are left out
@@ -811,6 +827,185 @@ fn micro_section(
         } else {
             format!(" _(needs {GATE_MIN_COINS}+ usable coins and 30+ in each tested bucket of the later half; have {n}, {} and {})_", h30.late.0, hhi8.late.0)
         }
+    );
+    o
+}
+
+/// What happens after graduation: the pre-funded and the organic graduates, how far
+/// they go within the hour, when they peak, how deep they fall on the way, and when the
+/// creator sells. From the PumpSwap candles and the 1 h outcomes.
+fn post_graduation_section(grads: &[Value], outcomes: &[Value], candles: &[Value]) -> String {
+    let mut o = String::new();
+    let _ = writeln!(o, "\n## After graduation (PumpSwap, from every pool trade)");
+    if grads.is_empty() {
+        let _ = writeln!(o, "_No graduations on the tape for this day yet._");
+        return o;
+    }
+    let instant = grads.iter().filter(|g| g["instant"] == true).count();
+    let _ = writeln!(
+        o,
+        "- graduations followed: **{}** · pre-funded (curve filled in the create transaction): {} ({:.0}%) · organic: {}",
+        grads.len(),
+        instant,
+        100.0 * instant as f64 / grads.len() as f64,
+        grads.len() - instant
+    );
+    let instant_mints: HashSet<&str> = grads
+        .iter()
+        .filter(|g| g["instant"] == true)
+        .filter_map(|g| g["mint"].as_str())
+        .collect();
+    // the 1 h outcome of each coin, full windows with trades only (a pool that never
+    // traded is one we derived wrongly or one quoted in another token)
+    let hour: Vec<&Value> = outcomes
+        .iter()
+        .filter(|r| {
+            r["at"] == 3600 && r["full_window"] == true && r["trades"].as_u64().unwrap_or(0) > 0
+        })
+        .collect();
+    if hour.is_empty() {
+        let _ = writeln!(
+            o,
+            "_No full 1 h outcomes yet (they are written an hour after each graduation)._"
+        );
+        return o;
+    }
+    // deepest fall before the peak, per coin, from the candles (lows and highs by minute)
+    let mut by_mint: HashMap<&str, Vec<&Value>> = HashMap::new();
+    for c in candles {
+        if let Some(m) = c["mint"].as_str() {
+            by_mint.entry(m).or_default().push(c);
+        }
+    }
+    let dd_before_peak = |mint: &str, peak_after_s: i64, grad_ts: i64| -> Option<f64> {
+        let mut cs = by_mint.get(mint)?.clone();
+        cs.sort_by_key(|c| c["minute"].as_i64().unwrap_or(0));
+        let peak_minute = (grad_ts + peak_after_s).div_euclid(60) * 60;
+        let (mut high, mut worst) = (0f64, 0f64);
+        for c in cs {
+            let minute = c["minute"].as_i64()?;
+            if minute > peak_minute {
+                break;
+            }
+            let (h, l) = (c["h"].as_f64()?, c["l"].as_f64()?);
+            if high > 0.0 {
+                worst = worst.max(1.0 - l / high);
+            }
+            high = high.max(h);
+        }
+        Some(worst)
+    };
+    let q = |v: &mut Vec<f64>, p: f64| -> String {
+        if v.is_empty() {
+            return "-".into();
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        format!(
+            "{:.0}%",
+            100.0 * v[((v.len() - 1) as f64 * p).round() as usize]
+        )
+    };
+    let _ = writeln!(
+        o,
+        "\n| within 1 h of landing | coins | ≥ 2× | ≥ 2.2× (≈ $100k) | ≥ 5× | ≥ 10× | time to peak (median) | creator sold | first creator sell (median min) | deepest fall before the peak, 2×+ coins (median / p75) |"
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (label, pre) in [
+        ("pre-funded", true),
+        ("organic", false),
+        ("all", true),
+        ("all", false),
+    ] {
+        let rows: Vec<&&Value> = hour
+            .iter()
+            .filter(|r| {
+                label == "all"
+                    || r["mint"]
+                        .as_str()
+                        .is_some_and(|m| instant_mints.contains(m))
+                        == pre
+            })
+            .collect();
+        if label == "all" && !pre {
+            continue;
+        }
+        let rows: Vec<&&Value> = if label == "all" {
+            hour.iter().collect()
+        } else {
+            rows
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let n = rows.len() as f64;
+        let share = |k: f64| {
+            format!(
+                "{:.0}%",
+                100.0
+                    * rows
+                        .iter()
+                        .filter(|r| r["peak_multiple"].as_f64().unwrap_or(0.0) >= k)
+                        .count() as f64
+                    / n
+            )
+        };
+        let mut peaks: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| r["peak_after_s"].as_f64())
+            .collect();
+        peaks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let sold = rows
+            .iter()
+            .filter(|r| r["creator_sold_sol"].as_f64().unwrap_or(0.0) > 0.0)
+            .count();
+        let mut first_sell: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| {
+                let m = r["mint"].as_str()?;
+                let mut cs = by_mint.get(m)?.clone();
+                cs.sort_by_key(|c| c["minute"].as_i64().unwrap_or(0));
+                cs.iter()
+                    .find(|c| c["creator_sold_sol"].as_f64().unwrap_or(0.0) > 0.0)
+                    .and_then(|c| c["age_min"].as_f64())
+            })
+            .collect();
+        first_sell.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut dds: Vec<f64> = rows
+            .iter()
+            .filter(|r| r["peak_multiple"].as_f64().unwrap_or(0.0) >= 2.0)
+            .filter_map(|r| {
+                dd_before_peak(
+                    r["mint"].as_str()?,
+                    r["peak_after_s"].as_i64()?,
+                    r["grad_ts"].as_i64()?,
+                )
+            })
+            .collect();
+        let _ = writeln!(
+            o,
+            "| {label} | {} | {} | {} | {} | {} | {} | {} ({:.0}%) | {} | {} / {} |",
+            rows.len(),
+            share(2.0),
+            share(2.2),
+            share(5.0),
+            share(10.0),
+            peaks
+                .get(peaks.len() / 2)
+                .map(|s| format!("{:.0} min", s / 60.0))
+                .unwrap_or_else(|| "-".into()),
+            sold,
+            100.0 * sold as f64 / n,
+            first_sell
+                .get(first_sell.len() / 2)
+                .map(|m| format!("{m:.0}"))
+                .unwrap_or_else(|| "-".into()),
+            q(&mut dds.clone(), 0.5),
+            q(&mut dds, 0.75),
+        );
+    }
+    let _ = writeln!(
+        o,
+        "_Peak multiple is from the first pool trade; a pre-funded coin lands at ≈ $45k, so 2.2× ≈ $100k. 'Deepest fall before the peak' is the retracement a holder had to sit through to see the peak; it sets the trailing stop. Full 1 h windows only._"
     );
     o
 }

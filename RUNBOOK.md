@@ -106,6 +106,9 @@ What it records, timestamped when it arrives:
   - `curve_outcomes.jsonl`, written one hour after creation: the market cap at each snapshot and the highest one after it, graduation and when;
   - `feed.jsonl` each minute: transactions, failures, trades, creates, delay behind the chain, connections up. A coin whose first seconds fall in a moment with every connection down carries `gap_ms` and is left out of the tables;
   - `trades-<hour>.jsonl.gz`: the decoded events (`--trades first-hour`, the default: creates, graduations and the trades of coins in their first hour, about 1 GB a day; `--trades all`: every pump trade; `--trades none`). `--trades-ws` picks other endpoints (comma-separated), `--trades-ws off` turns the stream off.
+- **Every graduated coin's PumpSwap pool for 24 hours**, from a second log stream on the pump AMM program (the coins that go to $100k and beyond do it there, not on the curve): `graduations.jsonl` (the pool, the creator, whether the curve was filled in the create transaction = pre-funded), `candles.jsonl` (one row per minute: open/high/low/close market cap in SOL, buy and sell SOL, buys, sells, buyers, sellers, the creator's buys and sells), `amm_outcomes.jsonl` at 1, 6 and 24 h after graduation (peak multiple and when, deepest drawdown, the creator's selling), and the pool's trades on the trade tape (`"ev":"amm"`).
+- **The SOL price** every minute (`sol_price.jsonl`), and `sol_usd` / `mcap_usd` on every book row and candle, so market caps read in dollars.
+- On every coin's first book row (`t: 5`): what the creator bought in the create transaction (`create_buy_sol`), how many others bought in that slot and how much (`create_slot_buys`, `create_slot_sol`: a bundle), `instant_grad`, and the market around the launch (`launches_10m`, `grads_1h`).
 - **Raw responses** in `raw-<hour>.jsonl.gz` with a SHA-256 that each row points to, so any number can be re-derived. `--raw lists` (default) keeps everything except the per-coin batch lookups, `--raw all` keeps those too, `--raw none` keeps nothing.
 
 Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/census/state.json` every 5 min and on stop, so the next run continues where this one left off.
@@ -114,6 +117,7 @@ Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/cen
 - **coverage** (launches seen per source, checkpoints on time) and **base rates** (how many coins graduate, double, or die);
 - the **early-signal table**: coins grouped by their holder count at 60 s, and how often each group doubled afterwards (using only later checkpoints, so no hindsight);
 - the **trade-stream tables** (exact books): holders at 15 s, holder concentration at 15 s, dev and sniper behaviour, each against the chance the market cap doubles within the hour, for all the day's coins and separately for its earlier and later half, plus the WO-3 verdict judged on the later half only;
+- **after graduation**: pre-funded vs organic graduates; how many went 2× / 2.2× (≈ $100k) / 5× / 10× within the hour, the median time to the peak, how many creators sold and when, and the deepest fall a holder sat through before the peak (what a trailing stop must survive); see `docs/11-trading-decisions-data.md` for what each number decides;
 - the **top 10 launches** of the day, with how they looked at 15 s, 60 s and 5 min;
 - the **top 20 trending** coins, with when they first entered the list and whether we had recorded their launch.
 

@@ -45,6 +45,10 @@ const NOT_NEW_MS: i64 = 600_000;
 /// Coins tracked at once (oldest dropped beyond this).
 const MAX_TRACKED: usize = 60_000;
 const JUP: &str = "https://lite-api.jup.ag/tokens/v2";
+/// The SOL price in dollars, polled every minute (Jupiter's free price API).
+const SOL_PRICE_URL: &str =
+    "https://lite-api.jup.ag/price/v3?ids=So11111111111111111111111111111111111111112";
+const SOL_PRICE_SECS: i64 = 60;
 const PUMPPORTAL: &str = "wss://pumpportal.fun/api/data";
 
 pub fn now_ms() -> i64 {
@@ -266,6 +270,13 @@ fn ts_of(v: &Value) -> Option<i64> {
     v.as_str()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.timestamp_millis())
+}
+
+/// The SOL price in a Jupiter price v3 response.
+pub fn sol_usd_of(v: &Value) -> Option<f64> {
+    v["So11111111111111111111111111111111111111112"]["usdPrice"]
+        .as_f64()
+        .filter(|p| *p > 0.0)
 }
 
 /// Jupiter dates this token well before our launch time: not a new coin.
@@ -550,6 +561,7 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
     let pp = tokio::spawn(pumpportal(pp_tx));
     // every create and trade on the pump program, for the first-minute books
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (sol_tx, sol_rx) = tokio::sync::watch::channel::<Option<f64>>(None);
     let stream = (!args.trades_ws.is_empty()).then(|| {
         tokio::spawn(crate::micro::run(
             args.trades_ws.clone(),
@@ -557,9 +569,11 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
             tape.clone(),
             args.out.clone(),
             args.trades,
+            sol_rx,
             stop_rx,
         ))
     });
+    let mut last_sol = 0i64;
     let deadline = args
         .minutes
         .map(|m| tokio::time::Instant::now() + Duration::from_secs(m * 60));
@@ -649,6 +663,20 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                             if seen_recent.len() > 200_000 { seen_recent.clear(); }
                         }
                         Err(e) => { c.errors += 1; tracing::debug!("jupiter recent: {e}"); }
+                    }
+                }
+                // the SOL price, so market caps can be read in dollars
+                if now - last_sol >= SOL_PRICE_SECS * 1000 {
+                    last_sol = now;
+                    match http.get(SOL_PRICE_URL).await {
+                        Ok(body) => {
+                            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                            if let Some(usd) = sol_usd_of(&v) {
+                                tape.row("sol_price", now, &json!({"ts": now, "usd": usd}))?;
+                                let _ = sol_tx.send(Some(usd));
+                            }
+                        }
+                        Err(e) => { c.errors += 1; tracing::debug!("sol price: {e}"); }
                     }
                 }
                 // checkpoints that can no longer be taken on time are reported as missed
@@ -853,6 +881,13 @@ mod tests {
         assert_eq!(missed.len(), CHECKPOINTS.len() - 4);
         assert!(s.coins.is_empty());
         assert_eq!(Schedule::tolerance_ms(86_400), 8_640_000);
+    }
+
+    #[test]
+    fn the_sol_price_is_read_from_jupiter() {
+        let v = json!({"So11111111111111111111111111111111111111112": {"usdPrice": 108.5, "decimals": 9}});
+        assert_eq!(sol_usd_of(&v), Some(108.5));
+        assert_eq!(sol_usd_of(&json!({})), None);
     }
 
     #[test]
