@@ -3,10 +3,11 @@ name: census
 # from 15 s to 24 h, the trending lists, and every Pump.fun trade in each new coin's
 # first hour from the public RPC log stream (see `copybot census`).
 #
-# Runs every 6 hours for 5 h 45 min. Each run continues the previous one's pending
-# checkpoints (state artifact), keeps its own recording as an artifact for 90 days,
-# and writes today's report (top 10 launches, top 20 trending, early-signal table)
-# over all of today's runs to its summary page.
+# Runs every 6 hours and records until 30 min before the job's 6-hour limit (about
+# 5 h 20 min). Each run continues the previous one's pending checkpoints (state
+# artifact), keeps its own recording as an artifact for 90 days, and writes today's
+# report (top 10 launches, top 20 trending, early-signal tables) over all of today's
+# runs to its summary page.
 #
 # Optional repository secret RPC_URL adds the exact Pump.fun curve state at each
 # checkpoint (the public Solana endpoint is used otherwise).
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       minutes:
-        description: "How long to record (max 345)"
+        description: "Minutes to record (it always stops in time to save its data)"
         required: false
         default: "345"
       ref:
@@ -37,6 +38,8 @@ jobs:
       contents: read
       actions: read   # to fetch the previous runs' state and recordings
     steps:
+      - name: Start time (the recording ends early enough to save its data)
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || 'claude/solana-copy-trading-bot-xlkuzm' }}
@@ -61,7 +64,10 @@ jobs:
         env:
           RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
         run: |
-          mins=$(python3 -c "print(min(int('${{ inputs.minutes || '345' }}'), 345))")
+          # stop 30 min before the job limit, whatever the build took, so the report and uploads run
+          used=$(( ($(date +%s) - JOB_START) / 60 ))
+          mins=$(python3 -c "print(max(1, min(int('${{ inputs.minutes || '345' }}'), 330 - $used)))")
+          echo "recording for $mins minutes (build and setup took $used)"
           ./engine/target/release/copybot census --out data/census --minutes "$mins" --raw lists
       - name: Today's report over all of today's runs
         if: always()
