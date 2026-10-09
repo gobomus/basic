@@ -67,6 +67,8 @@ pub struct Coin {
     pub dead_at: Option<i64>,
     /// an existing token reported as a create (Jupiter dates it long before)
     pub not_new: bool,
+    /// checkpoints that could not be taken on time (no row for them)
+    pub missed: usize,
 }
 
 /// A market cap counts only when the pool behind it holds at least this share of it in
@@ -150,6 +152,10 @@ pub fn coins_of_day(dir: &Path, day: &str) -> Vec<Coin> {
             continue;
         };
         if let Some(c) = coins.get_mut(mint) {
+            if r["missed"] == true {
+                c.missed += 1;
+                continue;
+            }
             if r["stop"] == "dead" {
                 c.dead_at = Some(cp);
             }
@@ -239,6 +245,7 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
         .filter(|r| r["found"] == false)
         .count();
     let rows: usize = tracked.iter().map(|c| c.cps.len()).sum();
+    let missed: usize = coins.iter().map(|c| c.missed).sum();
     let _ = writeln!(o, "## Coverage");
     let _ = writeln!(
         o,
@@ -261,8 +268,9 @@ pub fn report(dir: &Path, day: &str) -> (String, Vec<Value>) {
     );
     let _ = writeln!(
         o,
-        "- checkpoints: {rows} rows on {} coins; lateness median {} s, p90 {} s; {:.1}% not yet indexed by Jupiter when taken",
+        "- checkpoints: {rows} rows on {} coins, **{:.1}% complete** ({missed} missed: due while no recorder was running); lateness median {} s, p90 {} s; {:.1}% not yet indexed by Jupiter when taken",
         tracked.len(),
+        100.0 * rows as f64 / (rows + missed).max(1) as f64,
         opt(engine_core::stats::median(&lates).map(|x| (x / 1000.0).round())),
         opt(engine_core::stats::quantile(&lates, 0.9).map(|x| (x / 1000.0).round())),
         100.0 * not_found as f64 / rows.max(1) as f64
@@ -872,6 +880,8 @@ mod tests {
         // an existing token without the flag (recorded before it existed): caught by its holders
         t.row("launches", t0, &json!({"ts": t0, "source": "pumpportal", "mint": "pumpOLD2", "launchpad": "pump.fun", "symbol": "OLDTWO"})).unwrap();
         cp("pumpOLD2", 15, 1.2e8, 131_000, json!({}));
+        // a checkpoint the recorder could not take on time: counted, never used as data
+        t.row("checkpoints", t0 + 90_000, &json!({"ts": t0 + 90_000, "mint": "Apump", "cp": 30, "missed": true, "late_ms": 60_000})).unwrap();
         // a Meteora coin quoted at $5M on $200 of liquidity: not a top launch
         t.row("launches", t0, &json!({"ts": t0, "created_ms": t0, "source": "jupiter", "mint": "Junk", "launchpad": "met-dbc", "symbol": "JNK"})).unwrap();
         cp("Junk", 15, 5.0e6, 30, json!({"liquidity": 200.0}));
@@ -899,6 +909,10 @@ mod tests {
         assert!(
             !text.contains("JNK"),
             "price-only market caps do not rank: {text}"
+        );
+        assert!(
+            text.contains("(1 missed: due while no recorder was running)"),
+            "{text}"
         );
         let top = text.split("## Top 10 launches").nth(1).unwrap();
         let first = top.lines().find(|l| l.starts_with("| 1 |")).unwrap();

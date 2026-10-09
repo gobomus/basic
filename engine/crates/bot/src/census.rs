@@ -178,6 +178,38 @@ impl Schedule {
         CHECKPOINTS.get(t.next).map(|s| t.created_ms + s * 1000)
     }
 
+    /// How late a checkpoint may be taken and still stand for its moment: 10% of the
+    /// coin's age at that checkpoint, at least 10 s.
+    pub fn tolerance_ms(cp_secs: i64) -> i64 {
+        (cp_secs * 100).max(10_000)
+    }
+
+    /// Skip the checkpoints that can no longer be taken on time (the recorder was down,
+    /// or a previous run ended before them): they are reported as missed instead of
+    /// being recorded under a moment they do not describe. Returns (mint, checkpoint s,
+    /// how late) for each one skipped.
+    pub fn skip_missed(&mut self, now: i64) -> Vec<(String, i64, i64)> {
+        let mut out = vec![];
+        let mut done = vec![];
+        for (mint, t) in self.coins.iter_mut() {
+            while let Some(due) = Self::due_ms(t) {
+                let cp = CHECKPOINTS[t.next];
+                if now - due <= Self::tolerance_ms(cp) {
+                    break;
+                }
+                out.push((mint.clone(), cp, now - due));
+                t.next += 1;
+            }
+            if t.next >= CHECKPOINTS.len() {
+                done.push(mint.clone());
+            }
+        }
+        for m in done {
+            self.coins.remove(&m);
+        }
+        out
+    }
+
     /// Up to `max` coins whose next checkpoint is due at `now`, most overdue first.
     pub fn due(&self, now: i64, max: usize) -> Vec<(String, usize, i64)> {
         let mut v: Vec<(String, usize, i64)> = self
@@ -320,6 +352,7 @@ struct Counters {
     migrations: u64,
     checkpoints: u64,
     late_checkpoints: u64,
+    missed: u64,
     not_found: u64,
     not_new: u64,
     dead: u64,
@@ -618,6 +651,11 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                         Err(e) => { c.errors += 1; tracing::debug!("jupiter recent: {e}"); }
                     }
                 }
+                // checkpoints that can no longer be taken on time are reported as missed
+                for (mint, cp, late) in sched.skip_missed(now) {
+                    c.missed += 1;
+                    tape.row("checkpoints", now, &json!({"ts": now, "mint": mint, "cp": cp, "missed": true, "late_ms": late}))?;
+                }
                 // checkpoints due
                 let due = sched.due(now, 100);
                 if !due.is_empty() {
@@ -655,8 +693,8 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                 if now - last_log > 60_000 {
                     last_log = now;
                     eprintln!(
-                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} not indexed yet) · dead {} · not new {} · tracked {} · trending captures {} · errors {}",
-                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.not_found, c.dead, c.not_new, sched.coins.len(), c.trending_captures, c.errors
+                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} missed, {} not indexed yet) · dead {} · not new {} · tracked {} · trending captures {} · errors {}",
+                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.missed, c.not_found, c.dead, c.not_new, sched.coins.len(), c.trending_captures, c.errors
                     );
                 }
             }
@@ -796,6 +834,25 @@ mod tests {
             launchpad: "pump.fun".into(),
             pump_curve: true,
         }
+    }
+
+    #[test]
+    fn checkpoints_too_late_to_stand_for_their_moment_are_skipped() {
+        let mut s = Schedule::default();
+        s.add("A", tr(0));
+        // the recorder was down: at 20 s the 15 s checkpoint is still on time (10 s grace)
+        assert!(s.skip_missed(20_000).is_empty());
+        // at 5 min 20 s: 15 s … 120 s are missed, 300 s (30 s grace) is not
+        let missed = s.skip_missed(320_000);
+        let cps: Vec<i64> = missed.iter().map(|m| m.1).collect();
+        assert_eq!(cps, vec![15, 30, 60, 120]);
+        assert_eq!(missed[0].2, 305_000, "how late");
+        assert_eq!(s.due(320_000, 10), vec![("A".to_string(), 4, 300_000)]);
+        // a day later every checkpoint is gone and so is the coin
+        let missed = s.skip_missed(100_000_000);
+        assert_eq!(missed.len(), CHECKPOINTS.len() - 4);
+        assert!(s.coins.is_empty());
+        assert_eq!(Schedule::tolerance_ms(86_400), 8_640_000);
     }
 
     #[test]
