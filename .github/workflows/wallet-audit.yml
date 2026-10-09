@@ -1,0 +1,74 @@
+name: wallet-audit
+# Weekly re-vetting of the wallets the engine may follow (free, no keys).
+#
+# Classifies every wallet as bot / sniper / trader / holder from its own on-chain
+# history and writes the ones that qualify as leaders. The summary page shows the
+# table; the artifact holds the full JSON and `leaders.local.toml` for the engine
+# (load it with `leaders_file = "config/leaders.local.toml"`).
+#
+# Wallet list: repository secret AUDIT_WALLETS, one wallet per line
+# (`name: address`), so your list stays private in a public repository. Without it
+# the starter list in config/starter-leaders.example.toml is audited.
+# Optional repository secret RPC_URL: a free Helius key reads histories faster;
+# otherwise PublicNode's free endpoint is used.
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Own transactions to read per wallet"
+        required: false
+        default: "1000"
+      ref:
+        # lets this file live on the default branch while the code is on the development branch
+        description: "Branch with the code to run (leave as it is)"
+        required: false
+        default: "claude/solana-copy-trading-bot-xlkuzm"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'claude/solana-copy-trading-bot-xlkuzm' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build
+        run: cargo build --release -p bot
+        working-directory: engine
+      - name: Wallet list
+        env:
+          AUDIT_WALLETS: ${{ secrets.AUDIT_WALLETS }}
+        run: |
+          if [ -n "$AUDIT_WALLETS" ]; then
+            printf '%s\n' "$AUDIT_WALLETS" > wallets.txt
+          else
+            python3 -c "import re; s=open('config/starter-leaders.example.toml').read(); [print(f'{l}: {a}') for a,l in re.findall(r'address\s*=\s*\"([^\"]+)\"\s*\nlabel\s*=\s*\"([^\"]+)\"', s)]" > wallets.txt
+          fi
+          echo "wallets: $(grep -c . wallets.txt)"
+      - name: Audit
+        env:
+          RPC_URL: ${{ secrets.RPC_URL || 'https://solana-rpc.publicnode.com' }}
+        run: |
+          mkdir -p audit
+          ./engine/target/release/copybot wallet-audit --file wallets.txt \
+            --limit "${{ inputs.limit || '1000' }}" --out audit \
+            --leaders-out audit/leaders.local.toml | tee audit/summary.txt
+      - name: Summary
+        if: always()
+        run: |
+          { echo '```'; cat audit/summary.txt 2>/dev/null || echo "no results"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-audit
+          path: audit
+          retention-days: 90

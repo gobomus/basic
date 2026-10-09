@@ -1,0 +1,113 @@
+name: census
+# The tape, free and around the clock: every launch, each coin's state at checkpoints
+# from 15 s to 24 h, the trending lists, and every Pump.fun trade in each new coin's
+# first hour from the public RPC log stream (see `copybot census`).
+#
+# Runs every 6 hours and records until 30 min before the job's 6-hour limit (about
+# 5 h 20 min). Each run continues the previous one's pending checkpoints (state
+# artifact), keeps its own recording as an artifact for 90 days, and writes today's
+# report (top 10 launches, top 20 trending, early-signal tables) over all of today's
+# runs to its summary page.
+#
+# Optional repository secret RPC_URL adds the exact Pump.fun curve state at each
+# checkpoint (the public Solana endpoint is used otherwise).
+on:
+  schedule:
+    - cron: "7 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes to record (it always stops in time to save its data)"
+        required: false
+        default: "345"
+      ref:
+        # lets this file live on the default branch while the code is on the development branch
+        description: "Branch with the code to run (leave as it is)"
+        required: false
+        default: "claude/solana-copy-trading-bot-xlkuzm"
+
+concurrency:
+  group: census
+  cancel-in-progress: false
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read   # to fetch the previous runs' state and recordings
+    steps:
+      - name: Start time (the recording ends early enough to save its data)
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'claude/solana-copy-trading-bot-xlkuzm' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      - name: Build
+        run: cargo build --release -p bot
+        working-directory: engine
+      - name: Pending checkpoints from the previous run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/census
+          id=$(gh run list --workflow census.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          if [ -n "$id" ]; then
+            gh run download "$id" --name census-state --dir data/census && echo "resuming from run $id"
+          fi
+      - name: Record
+        env:
+          RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+        run: |
+          # stop 30 min before the job limit, whatever the build took, so the report and uploads run
+          used=$(( ($(date +%s) - JOB_START) / 60 ))
+          mins=$(python3 -c "print(max(1, min(int('${{ inputs.minutes || '345' }}'), 330 - $used)))")
+          echo "recording for $mins minutes (build and setup took $used)"
+          ./engine/target/release/copybot census --out data/census --minutes "$mins" --raw lists
+      - name: Today's report over all of today's runs
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/all
+          mkdir -p data/all/this-run
+          rsync -a --exclude 'trades-*' data/census/ data/all/this-run/
+          for id in $(gh run list --workflow census.yml --status success --limit 8 --json databaseId --jq '.[].databaseId'); do
+            gh run download "$id" --name census-tape --dir "data/all/$id" 2>/dev/null || true
+          done
+          for day in $(date -u -d yesterday +%F) $(date -u +%F); do
+            ./engine/target/release/copybot census-report --dir data/all --day "$day" > "report-$day.md" || true
+          done
+          { cat "report-$(date -u +%F).md"; echo; echo "---"; cat "report-$(date -u -d yesterday +%F).md"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the pending checkpoints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-state
+          path: data/census/state.json
+          retention-days: 7
+      - name: Keep the recording
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-tape
+          path: |
+            data/census
+            !data/census/state.json
+            !data/census/**/trades-*.jsonl.gz
+          retention-days: 90
+      - name: Keep the trade tape (decoded creates, trades, graduations)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census-trades
+          path: data/census/**/trades-*.jsonl.gz
+          retention-days: 14     # ~1 GB a day; the micro rows and outcomes in census-tape are kept 90 days
+          compression-level: 0   # already gzip
+          if-no-files-found: ignore
