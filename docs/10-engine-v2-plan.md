@@ -302,6 +302,10 @@ Delivered, inside `copybot census` (no new command):
 
 What the free stream does not give: sub-second speed (gRPC's job, only relevant once the launch tier is proven), and PumpSwap trades after graduation (a second subscription on the AMM program when MIGRATED_FRESH is built). Holdings are from curve trades only; plain token transfers are not seen.
 
+### What the data says about the target (2026-10-09)
+
+The first look at 1,934 launches is in [11-trading-decisions-data.md](11-trading-decisions-data.md): every coin that reached $100k was pre-funded (the curve filled in the create transaction, creator holding 79%, landing at $45k), so the $100k population is a PumpSwap timing trade against a known seller, not a curve pick; round numbers show no support or resistance on the curve; the early-breadth features point the right way on a tiny sample. The recorder now follows every graduated coin's pool for a day (candles, outcomes, the creator's sells), records the SOL price, the create transaction and the market regime, and the daily report has an after-graduation table. The hypotheses and the data each needs are listed there; `MIGRATED_FRESH` in §4.1 splits into factory coins and organic graduations.
+
 ### WO-4 progress (2026-10-09): the replay engine
 
 The first piece of WO-4 is built: `copybot replay` tests entry rules and exits on the trade tape before any money is at risk (RUNBOOK A6). Exact curve fills for our size, the recorded fee, our transaction landing `delay` after each decision and exit trigger, our own buy kept in the curve until we sell. 480 entry rules × 90 exits are scored; one is chosen walk-forward (picked on earlier 6 h blocks, scored on the next block only), the newest 20% of coins stay locked until a single `--final` run, and the report states how many pairs were tried and refuses per-day figures under 6 h of data.
