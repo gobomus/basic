@@ -468,7 +468,8 @@ impl Micro {
                             "mint": e.mint.to_string(), "user": e.user.to_string(), "buy": e.is_buy,
                             "sol": e.sol_amount, "tok": e.token_amount,
                             "vsol": e.virtual_sol_reserves, "vtok": e.virtual_token_reserves,
-                            "rsol": e.real_sol_reserves,
+                            "rsol": e.real_sol_reserves, "rtok": e.real_token_reserves,
+                            "fee_bps": e.total_fee_bps(),
                         });
                         if let Some(q) = e.quote_mint {
                             row["quote"] = json!(q.to_string());

@@ -302,6 +302,14 @@ Delivered, inside `copybot census` (no new command):
 
 What the free stream does not give: sub-second speed (gRPC's job, only relevant once the launch tier is proven), and PumpSwap trades after graduation (a second subscription on the AMM program when MIGRATED_FRESH is built). Holdings are from curve trades only; plain token transfers are not seen.
 
+### WO-4 progress (2026-10-09): the replay engine
+
+The first piece of WO-4 is built: `copybot replay` tests entry rules and exits on the trade tape before any money is at risk (RUNBOOK A6). Exact curve fills for our size, the recorded fee, our transaction landing `delay` after each decision and exit trigger, our own buy kept in the curve until we sell. 480 entry rules × 90 exits are scored; one is chosen walk-forward (picked on earlier 6 h blocks, scored on the next block only), the newest 20% of coins stay locked until a single `--final` run, and the report states how many pairs were tried and refuses per-day figures under 6 h of data.
+
+First run (25 minutes of tape, 1,174 coins): the best in-sample pairs show +7 to +9% per trade, but none is positive at 95% confidence, and the walk-forward trades swung from -13% to +10% per trade as four trades were added. That is the expected picture for this little data; it is why the protocol exists. The answer needs days of recording, which the Actions census now provides.
+
+Data problems found and fixed on the way: a checkpoint taken late (after a pause) was recorded under its original moment, so a "5 min" row could describe a coin 20 hours later; it is now recorded as missed. Each trade on the tape now carries the curve's fee rate and real token reserves.
+
 ---
 
 ## 8. KPIs
@@ -320,6 +328,7 @@ What the free stream does not give: sub-second speed (gRPC's job, only relevant 
 
 - Nothing recorded so far shows an edge: attempt 1 has two paper trades (+0.23 SOL, noise). The published copy-trading study found copier returns negative on average; our first live validation showed why (we land 1–6 s after the leader on the free feed).
 - The "$100k/day" evidence is vendor-reported PnL for wallets we either identified as bots and holders or could not decode. What we *can* verify is one trader at about $10k/day and three more at $0.6–4k/day in one-day slices, with 31 s–3 min holds. The trending tier is the only one where $10–100k of capital fits, so the plan puts the first shadow money there, keeps the launch tier small and fast, and uses copies as a signal.
+- **What $10k/day takes** (asked 2026-10-09: "1 SOL to $10k/day soon?"). $10k/day is about 90 SOL of profit a day at $111/SOL; on a 1 SOL bankroll that is 90× a day. The best trader we verified did +87 SOL in 20 h, with 1.5–10 SOL positions and most of the profit from a few trades after graduation (one went 1.5 → 9 SOL); his bankroll is tens of SOL. So the route is: an edge proven out of sample at small size, the bankroll grown to ~20–50 SOL at a bet size that survives losing streaks (weeks to months if the edge holds), and only then his position sizes, in the tiers where they fit (post-graduation and trending, not the curve). Results are never tuned to reach a target: a backtest fitted to show $10k/day says nothing about tomorrow and loses the bankroll.
 - Each work order has a gate designed to kill it cheaply. If WO-3's early-signal lift does not reproduce, the launch tier is dropped. If WO-4's shadow expectancy is not positive on future data, no live phase starts.
 - The durable asset is the tape: every launch, every snapshot, every decision and its outcome, timestamped at receipt. Vendors sell the same feeds to everyone; nobody sells this.
 

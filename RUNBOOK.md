@@ -119,6 +119,27 @@ Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/cen
 
 **Running it around the clock for free:** the `census` workflow (`.github/workflows/census.yml`) records for 5 h 45 min every 6 hours, carries the pending checkpoints from run to run, keeps each run's recording for 90 days, and puts the day's report on each run's summary page; the trade tape is kept 14 days as a separate artifact (`census-trades`). Like the other workflows, it runs on schedule only once the file is on the default branch. GitHub's scheduled runs can start late or be skipped when GitHub is busy, so expect small gaps; a $5–15/month server running `copybot census` as a service has none. Size per day: about 0.5 GB uncompressed for the checkpoints, lists and books (a quarter of that zipped) plus about 1 GB of trade tape. Coins created in the last hour of a run get no complete outcome (the stream is not carried between runs), so about one in six is left out of the trade-stream tables on Actions; a server loses none.
 
+## A6. Test strategies on the tape (replay)
+Every coin's first hour is on the tape trade by trade, so a buying rule can be tested on it before any money is at risk:
+```bash
+copybot replay --dir data/census                          # 0.25 SOL a trade, our transactions land 4 s late
+copybot replay --dir data/census --size 1 --delay 2       # other size / speed
+copybot replay --dir data/census --from 2026-10-10 --to 2026-10-16
+```
+What it does:
+- **Entry rules** read each coin's book at 15, 30 or 60 s (holders, holder concentration, whether the dev sold, the snipers' share, how far along the curve is). When a rule passes, our buy lands `--delay` seconds later and fills on the curve as it was then, with the exact Pump.fun formula and fee, so a bigger buy gets a worse price.
+- **Exits:** take profit, stop loss, trailing stop, time limit, checked on every later trade; the sell also lands `--delay` late. A coin that graduates is sold at its final price.
+- **Costs:** the curve fee as recorded (1.25% a side when missing) and `--tx-cost` SOL per transaction.
+
+How it keeps itself honest (and how to read it):
+- It tries every entry rule with every exit (43,200 pairs). **The best pair on the data it was picked from always looks good; that table is for orientation only.**
+- **Walk-forward:** time is cut into blocks (6 h); for each block the pair is picked on all earlier blocks and only its trades in the new block count. "Out of sample" is the number that matters, with its 95% lower bound.
+- **Holdout:** the newest 20% of coins are locked away. Change rules and settings as much as you like; once you stop, run `--final` **once**. If you keep tuning after looking at the holdout, it is no longer a holdout.
+- Per-day figures appear only with 6+ hours of data behind them; below 30 out-of-sample trades the report says it cannot conclude anything.
+- The bankroll section replays the out-of-sample trades from 1 SOL (`--bankroll`), betting `--bet` of it per trade with at most `--max-open` positions.
+
+The `census` workflow runs the replay over its last runs and adds it to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
+
 ## RPC options (all free)
 | | Limits | Notes |
 |---|---|---|

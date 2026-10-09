@@ -50,41 +50,29 @@ jobs:
       - name: Build
         run: cargo build --release -p bot
         working-directory: engine
+      # the steps live in scripts/census-ci.sh on the code branch, so this file stays as it is
       - name: Pending checkpoints from the previous run
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p data/census
-          id=$(gh run list --workflow census.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
-          if [ -n "$id" ]; then
-            gh run download "$id" --name census-state --dir data/census && echo "resuming from run $id"
-          fi
+        run: bash scripts/census-ci.sh resume
       - name: Record
         env:
           RPC_URL: ${{ secrets.RPC_URL || 'https://api.mainnet-beta.solana.com' }}
-        run: |
-          # stop 30 min before the job limit, whatever the build took, so the report and uploads run
-          used=$(( ($(date +%s) - JOB_START) / 60 ))
-          mins=$(python3 -c "print(max(1, min(int('${{ inputs.minutes || '345' }}'), 330 - $used)))")
-          echo "recording for $mins minutes (build and setup took $used)"
-          ./engine/target/release/copybot census --out data/census --minutes "$mins" --raw lists
+          CENSUS_MINUTES: ${{ inputs.minutes || '345' }}
+        run: bash scripts/census-ci.sh record
       - name: Today's report over all of today's runs
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p data/all
-          mkdir -p data/all/this-run
-          rsync -a --exclude 'trades-*' data/census/ data/all/this-run/
-          for id in $(gh run list --workflow census.yml --status success --limit 8 --json databaseId --jq '.[].databaseId'); do
-            gh run download "$id" --name census-tape --dir "data/all/$id" 2>/dev/null || true
-          done
-          for day in $(date -u -d yesterday +%F) $(date -u +%F); do
-            ./engine/target/release/copybot census-report --dir data/all --day "$day" > "report-$day.md" || true
-          done
-          { cat "report-$(date -u +%F).md"; echo; echo "---"; cat "report-$(date -u -d yesterday +%F).md"; } >> "$GITHUB_STEP_SUMMARY"
+        run: bash scripts/census-ci.sh report
+      - name: Strategy replay over the same runs (walk-forward, newest 20% locked)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/census-ci.sh replay
       - name: Keep the pending checkpoints
         if: always()
         uses: actions/upload-artifact@v4
