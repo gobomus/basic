@@ -632,8 +632,19 @@ impl Micro {
         }
         out.rows.push(("graduations", row));
         if sol_quoted {
-            self.pools
-                .insert(pool, AmmBook::new(*mint, grad_ts, book.map(|b| b.creator)));
+            let holders: HashSet<Pubkey> = book
+                .map(|b| {
+                    b.end_bal
+                        .iter()
+                        .filter(|(_, w)| w.0 > 0)
+                        .map(|(k, _)| *k)
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.pools.insert(
+                pool,
+                AmmBook::new(*mint, grad_ts, book.map(|b| b.creator), holders),
+            );
         }
     }
 
@@ -657,17 +668,20 @@ impl Micro {
                 b.creator = Some(e.coin_creator);
             }
             let mcap = e.post_price(6, 9) * 1e9;
+            let before = e.price(6, 9) * 1e9;
+            let liq = e.post_reserves().1.min(u64::MAX as u128) as u64;
             if self.mode != TradesMode::None {
                 out.tape.push(json!({
                     "ev": "amm", "slot": slot, "ts": e.timestamp, "sig": sig,
                     "mint": b.mint.to_string(), "pool": e.pool.to_string(), "user": e.user.to_string(),
                     "buy": e.is_buy, "sol": e.user_flow(), "base": e.base_amount,
                     "mcap_sol": (mcap * 1000.0).round() / 1000.0,
+                    "liq": liq,
                     "fee_bps": e.total_fee_bps(),
                 }));
             }
             let gap = self.amm_down_since.is_some();
-            for row in b.add(&e, mcap, gap, self.sol_usd) {
+            for row in b.add(&e, slot, before, mcap, liq, gap, self.sol_usd) {
                 out.rows.push(("candles", row));
             }
         }
@@ -800,6 +814,11 @@ struct Candle {
     sellers: HashSet<Pubkey>,
     creator_sold: u64,
     creator_bought: u64,
+    /// sells by wallets that never bought on the curve or the pool (airdrops, insiders)
+    unbought_sold: u64,
+    unbought_sellers: HashSet<Pubkey>,
+    /// SOL in the pool at the end of the minute
+    liq: u64,
     gap: bool,
 }
 
@@ -819,6 +838,9 @@ impl Candle {
             "sellers": self.sellers.len(),
             "creator_sold_sol": r3(self.creator_sold as f64 / 1e9),
             "creator_bought_sol": r3(self.creator_bought as f64 / 1e9),
+            "unbought_sell_sol": r3(self.unbought_sold as f64 / 1e9),
+            "unbought_sellers": self.unbought_sellers.len(),
+            "liq_sol": r3(self.liq as f64 / 1e9),
             "gap": self.gap,
             "sol_usd": sol_usd,
         })
@@ -843,10 +865,27 @@ struct AmmBook {
     buyers: HashSet<Pubkey>,
     creator_sold: u64,
     next_outcome: usize,
+    /// the pool's price before its first swap: what a buyer at landing paid
+    landing: Option<f64>,
+    /// SOL in the pool after the last swap
+    liq: u64,
+    /// the pool's first slot, and what was bought in it (the creator and his bundle
+    /// taking the float: a fabricated market cap)
+    grad_slot: Option<u64>,
+    grad_slot_base: u64,
+    grad_slot_sol: u64,
+    /// wallets that held the coin when it graduated (curve holders)
+    curve_holders: HashSet<Pubkey>,
+    unbought_sold: u64,
 }
 
 impl AmmBook {
-    fn new(mint: Pubkey, grad_ts: i64, creator: Option<Pubkey>) -> Self {
+    fn new(
+        mint: Pubkey,
+        grad_ts: i64,
+        creator: Option<Pubkey>,
+        curve_holders: HashSet<Pubkey>,
+    ) -> Self {
         Self {
             mint,
             grad_ts,
@@ -862,14 +901,39 @@ impl AmmBook {
             buyers: HashSet::new(),
             creator_sold: 0,
             next_outcome: 0,
+            landing: None,
+            liq: 0,
+            grad_slot: None,
+            grad_slot_base: 0,
+            grad_slot_sol: 0,
+            curve_holders,
+            unbought_sold: 0,
         }
     }
 
-    /// Apply one swap; returns the candle it closed, if any.
-    fn add(&mut self, e: &SwapEventData, mcap: f64, gap: bool, sol_usd: Option<f64>) -> Vec<Value> {
+    /// Apply one swap (`before`: the price it met, `mcap`: the price it left, `liq`: the
+    /// pool's SOL after it); returns the candle it closed, if any.
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        e: &SwapEventData,
+        slot: u64,
+        before: f64,
+        mcap: f64,
+        liq: u64,
+        gap: bool,
+        sol_usd: Option<f64>,
+    ) -> Vec<Value> {
         let mut out = vec![];
         self.trades += 1;
         self.first.get_or_insert(mcap);
+        self.landing.get_or_insert(before);
+        self.liq = liq;
+        let grad_slot = *self.grad_slot.get_or_insert(slot);
+        if e.is_buy && slot == grad_slot {
+            self.grad_slot_base += e.base_amount;
+            self.grad_slot_sol += e.user_flow();
+        }
         self.last = mcap;
         if mcap > self.peak {
             self.peak = mcap;
@@ -883,10 +947,15 @@ impl AmmBook {
         }
         let flow = e.user_flow();
         let by_creator = self.creator == Some(e.user);
+        let unbought =
+            !e.is_buy && !self.buyers.contains(&e.user) && !self.curve_holders.contains(&e.user);
         if e.is_buy {
             self.buyers.insert(e.user);
         } else if by_creator {
             self.creator_sold += flow;
+        }
+        if unbought {
+            self.unbought_sold += flow;
         }
         let minute = e.timestamp.div_euclid(60) * 60;
         if self.candle.as_ref().is_some_and(|c| c.minute != minute) {
@@ -906,11 +975,15 @@ impl AmmBook {
             sellers: HashSet::new(),
             creator_sold: 0,
             creator_bought: 0,
+            unbought_sold: 0,
+            unbought_sellers: HashSet::new(),
+            liq,
             gap: false,
         });
         c.h = c.h.max(mcap);
         c.l = c.l.min(mcap);
         c.c = mcap;
+        c.liq = liq;
         c.gap |= gap;
         if e.is_buy {
             c.buy_sol += flow;
@@ -925,6 +998,10 @@ impl AmmBook {
             c.sellers.insert(e.user);
             if by_creator {
                 c.creator_sold += flow;
+            }
+            if unbought {
+                c.unbought_sold += flow;
+                c.unbought_sellers.insert(e.user);
             }
         }
         out
@@ -950,14 +1027,21 @@ impl AmmBook {
     fn outcome(&self, at_secs: i64, full_window: bool, sol_usd: Option<f64>) -> Value {
         let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
         let first = self.first.unwrap_or(0.0);
+        let landing = self.landing.unwrap_or(0.0);
         json!({
             "mint": self.mint.to_string(),
             "grad_ts": self.grad_ts,
             "at": at_secs,
             "creator": self.creator.map(|c| c.to_string()),
+            "landing_mcap_sol": r3(landing),
             "first_mcap_sol": r3(first),
             "peak_mcap_sol": r3(self.peak),
-            "peak_multiple": (first > 0.0).then(|| r3(self.peak / first)),
+            "peak_multiple": (landing > 0.0).then(|| r3(self.peak / landing)),
+            "alive": landing > 0.0 && self.last >= 0.5 * landing,
+            "liq_sol": r3(self.liq as f64 / 1e9),
+            "insider_share": r3(self.grad_slot_base as f64 / SUPPLY),
+            "grad_slot_sol": r3(self.grad_slot_sol as f64 / 1e9),
+            "unbought_sell_sol": r3(self.unbought_sold as f64 / 1e9),
             "peak_after_s": self.peak_ts - self.grad_ts,
             "max_drawdown": r3(self.max_dd),
             "trough_after_peak_sol": if self.trough.is_finite() { r3(self.trough) } else { 0.0 },
@@ -1844,6 +1928,11 @@ mod amm_tests {
             "the first minute closed when the third trade opened the next"
         );
         let c0 = candles[0];
+        assert!(
+            (c0["liq_sol"].as_f64().unwrap() - 90.0).abs() < 1e-6,
+            "pool SOL after the last swap of the minute"
+        );
+        assert_eq!(c0["unbought_sell_sol"], 0.0);
         assert_eq!(c0["mint"], mint.to_string());
         assert_eq!(c0["minute"], T0.div_euclid(60) * 60);
         assert_eq!(c0["o"], 400.0);
@@ -1870,8 +1959,20 @@ mod amm_tests {
         let o = o[0];
         assert_eq!(o["at"], 3600);
         assert_eq!(o["first_mcap_sol"], 400.0);
+        // landing: the price the first swap met (its pre-swap reserves)
+        let e0 = swap(pool, a, true, 2.0, T0 + 5, 200.0, 80.0);
+        let landing = e0.price(6, 9) * 1e9;
+        assert!((o["landing_mcap_sol"].as_f64().unwrap() - landing).abs() < 0.01);
         assert_eq!(o["peak_mcap_sol"], 500.0);
-        assert_eq!(o["peak_multiple"], 1.25);
+        assert!((o["peak_multiple"].as_f64().unwrap() - 500.0 / landing).abs() < 0.01);
+        // the first slot's buys: 2 tokens-worth of base (1 token each) of 1 B supply
+        assert_eq!(o["insider_share"], 0.0);
+        assert_eq!(o["grad_slot_sol"], 2.0);
+        // the dev sold without buying on the pool and was not a curve holder in this test
+        assert_eq!(o["unbought_sell_sol"], 20.0);
+        // landing was 390 (78 SOL against 200 M tokens): 272 is above half of it
+        assert_eq!(o["alive"], true);
+        assert_eq!(c1[0]["unbought_sellers"], 1);
         assert_eq!(o["peak_after_s"], 30);
         // 500 → 272.7 (60 SOL / 220M tokens)
         let dd = o["max_drawdown"].as_f64().unwrap();

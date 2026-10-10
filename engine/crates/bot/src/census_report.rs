@@ -905,35 +905,32 @@ fn post_graduation_section(grads: &[Value], outcomes: &[Value], candles: &[Value
             100.0 * v[((v.len() - 1) as f64 * p).round() as usize]
         )
     };
+    let insider = |r: &Value| r["insider_share"].as_f64().unwrap_or(0.0) >= 0.1;
+    let is_pre = |r: &Value| {
+        r["mint"]
+            .as_str()
+            .is_some_and(|m| instant_mints.contains(m))
+    };
     let _ = writeln!(
         o,
-        "\n| within 1 h of landing | coins | ≥ 2× | ≥ 2.2× (≈ $100k) | ≥ 5× | ≥ 10× | time to peak (median) | creator sold | first creator sell (median min) | deepest fall before the peak, 2×+ coins (median / p75) |"
+        "\n| within 1 h of landing | coins | alive at 1 h (≥ ½ landing) | ≥ 2× | ≥ 2.2× (≈ $100k) | ≥ 5× | ≥ 10× | time to peak (median) | creator sold | first creator sell (median min) | deepest fall before the peak, 2×+ coins (median / p75) |"
     );
-    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
-    for (label, pre) in [
-        ("pre-funded", true),
-        ("organic", false),
-        ("all", true),
-        ("all", false),
-    ] {
-        let rows: Vec<&&Value> = hour
-            .iter()
-            .filter(|r| {
-                label == "all"
-                    || r["mint"]
-                        .as_str()
-                        .is_some_and(|m| instant_mints.contains(m))
-                        == pre
-            })
-            .collect();
-        if label == "all" && !pre {
-            continue;
-        }
-        let rows: Vec<&&Value> = if label == "all" {
-            hour.iter().collect()
-        } else {
-            rows
-        };
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    type Pick<'a> = (&'a str, Box<dyn Fn(&Value) -> bool + 'a>);
+    let picks: Vec<Pick> = vec![
+        (
+            "pre-funded, insiders took ≥ 10% in the graduation slot (fabricated cap)",
+            Box::new(|r| is_pre(r) && insider(r)),
+        ),
+        (
+            "pre-funded, float left in the pool",
+            Box::new(|r| is_pre(r) && !insider(r)),
+        ),
+        ("organic", Box::new(|r| !is_pre(r))),
+        ("all", Box::new(|_| true)),
+    ];
+    for (label, pick) in &picks {
+        let rows: Vec<&&Value> = hour.iter().filter(|r| pick(r)).collect();
         if rows.is_empty() {
             continue;
         }
@@ -981,10 +978,13 @@ fn post_graduation_section(grads: &[Value], outcomes: &[Value], candles: &[Value
                 )
             })
             .collect();
+        let alive = rows.iter().filter(|r| r["alive"] == true).count();
         let _ = writeln!(
             o,
-            "| {label} | {} | {} | {} | {} | {} | {} | {} ({:.0}%) | {} | {} / {} |",
+            "| {label} | {} | {} ({:.0}%) | {} | {} | {} | {} | {} | {} ({:.0}%) | {} | {} / {} |",
             rows.len(),
+            alive,
+            100.0 * alive as f64 / n,
             share(2.0),
             share(2.2),
             share(5.0),
@@ -1005,7 +1005,7 @@ fn post_graduation_section(grads: &[Value], outcomes: &[Value], candles: &[Value
     }
     let _ = writeln!(
         o,
-        "_Peak multiple is from the first pool trade; a pre-funded coin lands at ≈ $45k, so 2.2× ≈ $100k. 'Deepest fall before the peak' is the retracement a holder had to sit through to see the peak; it sets the trailing stop. Full 1 h windows only._"
+        "_Peak multiple is against the landing price (what the first pool trade met); a pre-funded coin lands at ≈ $45k, so 2.2× ≈ $100k. 'Deepest fall before the peak' is the retracement a holder had to sit through to see the peak; it sets the trailing stop. Insider-held pools: the creator and his bundle bought 10%+ of the supply in the graduation slot, so the market cap has no float behind it. Full 1 h windows only._"
     );
     o
 }
