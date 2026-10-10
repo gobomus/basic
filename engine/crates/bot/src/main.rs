@@ -23,6 +23,7 @@ mod journal;
 mod keystore;
 mod micro;
 mod replay;
+mod replay_trend;
 mod report;
 mod tools;
 
@@ -178,6 +179,42 @@ enum Cmd {
         bet: f64,
         /// Most positions open at once
         #[arg(long, default_value_t = 10)]
+        max_open: usize,
+    },
+    /// Test entry and exit rules for the trending tier on the census's 5-minute captures
+    /// (fills moved by size against the pool's liquidity; walk-forward; newest coins locked)
+    ReplayTrending {
+        #[arg(long, default_value = "data/census")]
+        dir: String,
+        /// SOL per trade
+        #[arg(long, default_value_t = 5.0)]
+        size: f64,
+        /// SOL price in dollars (default: the census's own sol_price rows)
+        #[arg(long)]
+        sol_usd: Option<f64>,
+        /// Swap fee per side (0.005 = 0.5%)
+        #[arg(long, default_value_t = 0.005)]
+        fee: f64,
+        /// Network + priority fee per transaction, SOL
+        #[arg(long, default_value_t = 0.001)]
+        tx_cost: f64,
+        /// Loss assumed on a coin that leaves every list and never prices again
+        #[arg(long, default_value_t = 0.3)]
+        delist_haircut: f64,
+        #[arg(long, default_value_t = 6)]
+        block_hours: i64,
+        #[arg(long, default_value_t = 0.2)]
+        holdout: f64,
+        #[arg(long = "final")]
+        final_run: bool,
+        /// Trades a pair needs before it can be picked
+        #[arg(long, default_value_t = 30)]
+        min_trades: usize,
+        #[arg(long, default_value_t = 1.0)]
+        bankroll: f64,
+        #[arg(long, default_value_t = 0.1)]
+        bet: f64,
+        #[arg(long, default_value_t = 5)]
         max_open: usize,
     },
     /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<address>] | unblacklist <address>
@@ -380,6 +417,41 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Cmd::ReplayTrending {
+            dir,
+            size,
+            sol_usd,
+            fee,
+            tx_cost,
+            delist_haircut,
+            block_hours,
+            holdout,
+            final_run,
+            min_trades,
+            bankroll,
+            bet,
+            max_open,
+        } => {
+            print!(
+                "{}",
+                replay_trend::write(&replay_trend::Args {
+                    dir: dir.into(),
+                    size_sol: size,
+                    sol_usd,
+                    fee,
+                    tx_sol: tx_cost,
+                    delist_haircut,
+                    block_hours,
+                    holdout,
+                    final_run,
+                    min_trades,
+                    bankroll_sol: bankroll,
+                    bet_share: bet,
+                    max_open,
+                })?
+            );
+            Ok(())
+        }
         Cmd::CensusReport { dir, day } => {
             let day = day.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
             print!(
@@ -494,7 +566,8 @@ async fn main() -> anyhow::Result<()> {
                 | Cmd::WalletAudit { .. }
                 | Cmd::Census { .. }
                 | Cmd::CensusReport { .. }
-                | Cmd::Replay { .. } => unreachable!(),
+                | Cmd::Replay { .. }
+                | Cmd::ReplayTrending { .. } => unreachable!(),
             }
         }
     }

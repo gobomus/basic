@@ -46,7 +46,7 @@ const AMM_FEE_BPS: u64 = 30;
 /// The tape covers each coin's first hour.
 const WINDOW_SECS: i64 = 3600;
 /// A pair needs this many trades in its training blocks to be picked.
-const MIN_TRADES: usize = 30;
+pub(crate) const MIN_TRADES: usize = 30;
 const LAMPORTS: f64 = 1e9;
 
 // ------------------------------------------------------------------ the tape
@@ -574,12 +574,14 @@ pub struct Score {
 
 impl Score {
     fn add(&mut self, t: &Trade) {
-        let r = t.ret();
+        self.add_ret(t.ret(), t.pnl_sol());
+    }
+    /// One trade by its return and its SOL result.
+    pub(crate) fn add_ret(&mut self, r: f64, p: f64) {
         self.n += 1;
         self.wins += (r > 0.0) as usize;
         self.sum_ret += r;
         self.sum_ret2 += r * r;
-        let p = t.pnl_sol();
         self.pnl += p;
         if p > 0.0 {
             self.gross_win += p;
@@ -746,7 +748,7 @@ pub fn bankroll(
 const MIN_HOURS_FOR_DAILY: f64 = 6.0;
 
 /// SOL per day at the pace of `hours`, or why it is not stated.
-fn per_day(sol: f64, hours: f64) -> String {
+pub(crate) fn per_day(sol: f64, hours: f64) -> String {
     if hours < MIN_HOURS_FOR_DAILY {
         format!("n/a (only {hours:.1} h; needs {MIN_HOURS_FOR_DAILY:.0})")
     } else {
@@ -766,7 +768,7 @@ pub fn recorded_hours(mut created: Vec<i64>) -> f64 {
     (secs as f64 / 3600.0).max(1.0 / 60.0)
 }
 
-fn pct(x: f64) -> String {
+pub(crate) fn pct(x: f64) -> String {
     if x.is_finite() {
         format!("{:+.1}%", x * 100.0)
     } else {
@@ -774,7 +776,7 @@ fn pct(x: f64) -> String {
     }
 }
 
-fn hm(ts: i64) -> String {
+pub(crate) fn hm(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.format("%m-%d %H:%M").to_string())
         .unwrap_or_default()

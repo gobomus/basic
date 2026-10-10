@@ -100,7 +100,7 @@ copybot census-report --dir data/census          # today's tables; --day 2026-10
 What it records, timestamped when it arrives:
 - **Launches:** every Pump.fun creation as it happens (PumpPortal), and the newest coins of every launchpad (Jupiter, polled every 10 s), with the coin's first stats.
 - **Checkpoints:** each coin's holders, traders, buy/sell flow, market cap, liquidity, top-holder share and dev balance at 15 s, 30 s, 1, 2, 5, 15, 30 min, 1, 3, 6 and 24 h after creation, plus the exact SOL in its Pump.fun curve when `RPC_URL` is set. A coin with no traders and 3 holders or fewer from 5 min on counts as dead and is not checked again.
-- **Trending and attention lists** every 5 min: Jupiter trending (5 min / 1 h / 24 h), organic score, most traded; DexScreener boosts, profiles and community takeovers; Pump.fun live streams.
+- **Trending and attention lists** every 5 min: Jupiter trending (5 min / 1 h / 24 h), organic score, most traded; DexScreener boosts, profiles and community takeovers; Pump.fun live streams. A coin that was on a Jupiter list keeps being priced every 5 min for a day after it drops off (`list: "follow"` rows), so its path shows the fall, not just the rise.
 - **Every Pump.fun create, trade and graduation**, from the public RPC's log stream (`logsSubscribe` on the pump program; it runs 1–3 s behind the chain, up to ~9 s when the network is busy). Two connections are kept open at once and each transaction is taken from whichever delivers it first, because the public endpoint drops connections every minute or so. For each new coin this gives exact books:
   - `micro.jsonl`: the coin at 5, 15, 30, 60, 120, 300 and 900 s after its creation, counting only trades stamped at or before that moment, in chain order: holders, buyers, sellers, flow, market cap, curve progress, holder and buyer concentration (HHI), top-1 and top-10 share, dev holding and whether the dev sold, snipers (bought in the create slot or the next one), how many of them sold out, and the SOL flow second by second for the first minute;
   - `curve_outcomes.jsonl`, written one hour after creation: the market cap at each snapshot and the highest one after it, graduation and when;
@@ -142,7 +142,13 @@ How it keeps itself honest (and how to read it):
 - Per-day figures appear only with 6+ hours of data behind them; below 30 out-of-sample trades the report says it cannot conclude anything.
 - The bankroll section replays the out-of-sample trades from 1 SOL (`--bankroll`), betting `--bet` of it per trade with at most `--max-open` positions.
 
-The `census` workflow runs the replay over its last runs and adds it to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
+**The trending tier** has its own replay on the 5-minute captures (what a free-tier engine polling Jupiter every 5 minutes would see):
+```bash
+copybot replay-trending --dir data/census --size 5         # 5 SOL a trade; fills moved by size against the pool's liquidity
+```
+Entries trigger when a coin enters the 1 h trending or organic list (top 20 / top 100) or ranks in the 5-minute top 20, filtered on liquidity, age, organic score, holder concentration, net buyers and buy/sell flow; exits are the same take-profit / stop / trailing / time set, checked at every later capture. A coin's path continues after it leaves the lists (the recorder keeps pricing it for a day); one that still never prices again is sold at its last price less `--delist-haircut` (30%) and counted as `delisted`. The size table shows where the pool's depth caps a position. Same walk-forward and holdout rules as above.
+
+The `census` workflow runs both replays over its last runs and adds them to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
 
 ## RPC options (all free)
 | | Limits | Notes |

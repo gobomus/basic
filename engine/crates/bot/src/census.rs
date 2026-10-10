@@ -42,6 +42,11 @@ const DEAD_MAX_HOLDERS: u64 = 3;
 /// A "launch" whose token Jupiter dates this much earlier is not new (PumpPortal has
 /// reported existing tokens, the PUMP token among them, as creates).
 const NOT_NEW_MS: i64 = 600_000;
+/// A coin that was on a Jupiter list keeps being priced every capture for this long
+/// after it last appeared, so a trending coin's path does not stop when it drops off.
+const FOLLOW_MS: i64 = 24 * 3_600_000;
+/// Followed coins priced per capture at most (100 per search call).
+const FOLLOW_MAX: usize = 1_500;
 /// Coins tracked at once (oldest dropped beyond this).
 const MAX_TRACKED: usize = 60_000;
 const JUP: &str = "https://lite-api.jup.ag/tokens/v2";
@@ -113,7 +118,7 @@ impl Tape {
         let sha = sha256_hex(body.as_bytes());
         let keep = match self.raw {
             RawMode::All => true,
-            RawMode::Lists => source != "jup_search",
+            RawMode::Lists => source != "jup_search" && source != "jup_follow",
             RawMode::None => false,
         };
         if !keep {
@@ -368,6 +373,7 @@ struct Counters {
     not_new: u64,
     dead: u64,
     trending_captures: u64,
+    follow_rows: u64,
     errors: u64,
 }
 
@@ -518,6 +524,36 @@ pub fn trending_sources() -> Vec<(&'static str, String, &'static str)> {
     v
 }
 
+/// Coins seen on a Jupiter list recently: when a capture does not show one, it is
+/// looked up anyway, so its path continues after it leaves the lists.
+#[derive(Default)]
+pub struct Follow {
+    last_listed: HashMap<String, i64>,
+}
+
+impl Follow {
+    pub fn listed(&mut self, mint: &str, ts: i64) {
+        self.last_listed.insert(mint.to_string(), ts);
+    }
+    /// The coins to look up now: seen on a list within the follow window and not in
+    /// this capture. Coins past the window are forgotten.
+    pub fn due(&mut self, listed_now: &HashSet<String>, now: i64) -> Vec<String> {
+        self.last_listed.retain(|_, t| now - *t <= FOLLOW_MS);
+        let mut v: Vec<(i64, String)> = self
+            .last_listed
+            .iter()
+            .filter(|(m, _)| !listed_now.contains(*m))
+            .map(|(m, t)| (*t, m.clone()))
+            .collect();
+        v.sort_by_key(|x| std::cmp::Reverse(x.0));
+        v.truncate(FOLLOW_MAX);
+        v.into_iter().map(|x| x.1).collect()
+    }
+    fn len(&self) -> usize {
+        self.last_listed.len()
+    }
+}
+
 /// One trending/attention row: rank in its list plus the metrics the list carries.
 pub fn trending_row(list: &str, rank: usize, item: &Value, key: &str) -> Option<Value> {
     let mint = item[key].as_str()?.to_string();
@@ -574,6 +610,7 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
         ))
     });
     let mut last_sol = 0i64;
+    let mut follow = Follow::default();
     let deadline = args
         .minutes
         .map(|m| tokio::time::Instant::now() + Duration::from_secs(m * 60));
@@ -695,6 +732,7 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                 // trending and attention lists
                 if now - last_trending >= args.trending_secs as i64 * 1000 {
                     last_trending = now;
+                    let mut listed_now: HashSet<String> = HashSet::new();
                     for (name, url, key) in trending_sources() {
                         match http.get(&url).await {
                             Ok(body) => {
@@ -706,11 +744,38 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                                         row["ts"] = json!(ts);
                                         row["raw_sha256"] = json!(sha);
                                         tape.row("trending", ts, &row)?;
+                                        if name.starts_with("jup_") {
+                                            if let Some(m) = row["mint"].as_str() {
+                                                listed_now.insert(m.to_string());
+                                                follow.listed(m, ts);
+                                            }
+                                        }
                                     }
                                 }
                                 c.trending_captures += 1;
                             }
                             Err(e) => { c.errors += 1; tracing::debug!("{name}: {e}"); }
+                        }
+                    }
+                    // coins that left the lists: priced anyway, so their paths go on
+                    for chunk in follow.due(&listed_now, now).chunks(100) {
+                        match http.get(&format!("{JUP}/search?query={}", chunk.join(","))).await {
+                            Ok(body) => {
+                                let ts = now_ms();
+                                let sha = tape.raw(ts, "jup_follow", &body)?;
+                                let toks: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
+                                for tok in &toks {
+                                    if let Some(mut row) = trending_row("jup_follow", 0, tok, "id") {
+                                        row["list"] = json!("follow");
+                                        row["rank"] = Value::Null;
+                                        row["ts"] = json!(ts);
+                                        row["raw_sha256"] = json!(sha);
+                                        tape.row("trending", ts, &row)?;
+                                        c.follow_rows += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => { c.errors += 1; tracing::debug!("follow: {e}"); }
                         }
                     }
                 }
@@ -721,8 +786,8 @@ pub async fn run(args: CensusArgs) -> anyhow::Result<()> {
                 if now - last_log > 60_000 {
                     last_log = now;
                     eprintln!(
-                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} missed, {} not indexed yet) · dead {} · not new {} · tracked {} · trending captures {} · errors {}",
-                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.missed, c.not_found, c.dead, c.not_new, sched.coins.len(), c.trending_captures, c.errors
+                        "launches {} pumpportal + {} jupiter · migrations {} · checkpoints {} ({} late, {} missed, {} not indexed yet) · dead {} · not new {} · tracked {} · trending captures {} · followed {} ({} rows) · errors {}",
+                        c.launches_pp, c.launches_jup, c.migrations, c.checkpoints, c.late_checkpoints, c.missed, c.not_found, c.dead, c.not_new, sched.coins.len(), c.trending_captures, follow.len(), c.follow_rows, c.errors
                     );
                 }
             }
@@ -881,6 +946,35 @@ mod tests {
         assert_eq!(missed.len(), CHECKPOINTS.len() - 4);
         assert!(s.coins.is_empty());
         assert_eq!(Schedule::tolerance_ms(86_400), 8_640_000);
+    }
+
+    #[test]
+    fn coins_that_left_the_lists_are_followed_for_a_day() {
+        let mut f = Follow::default();
+        f.listed("A", 1_000);
+        f.listed("B", 1_000);
+        f.listed("A", 2_000);
+        let now: HashSet<String> = ["A".to_string()].into_iter().collect();
+        assert_eq!(
+            f.due(&now, 3_000),
+            vec!["B".to_string()],
+            "B left the lists"
+        );
+        assert_eq!(
+            f.due(&HashSet::new(), 3_000).len(),
+            2,
+            "both when neither is listed"
+        );
+        // past the window, forgotten: B (listed at 1_000) first, then A
+        assert_eq!(
+            f.due(&HashSet::new(), 2_000 + FOLLOW_MS),
+            vec!["A".to_string()]
+        );
+        assert_eq!(
+            f.due(&HashSet::new(), 2_000 + 2 * FOLLOW_MS),
+            Vec::<String>::new()
+        );
+        assert_eq!(f.len(), 0);
     }
 
     #[test]

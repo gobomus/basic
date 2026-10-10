@@ -67,6 +67,9 @@ replay)
     done
     "$bin" replay --dir data/replay > replay.md || true
     { echo; echo "---"; cat replay.md; } >> "$summary"
+    # the trending tier: the 5-minute captures and checkpoints of the same runs
+    "$bin" replay-trending --dir data/all > replay-trending.md || true
+    { echo; echo "---"; cat replay-trending.md; } >> "$summary"
     ;;
 *)
     echo "usage: $0 resume|record|report|replay" >&2

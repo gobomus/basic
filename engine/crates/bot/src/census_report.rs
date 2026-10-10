@@ -22,7 +22,7 @@ fn read_kind(dir: &Path, kind: &str) -> Vec<Value> {
 }
 
 /// Rows of `kind` for which `keep` is true (parsed one line at a time).
-fn read_kind_where(dir: &Path, kind: &str, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+pub(crate) fn read_kind_where(dir: &Path, kind: &str, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
     let mut out = vec![];
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -201,7 +201,7 @@ fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
-fn age(ms: i64) -> String {
+pub(crate) fn age(ms: i64) -> String {
     let s = ms / 1000;
     if s < 120 {
         format!("{s}s")
