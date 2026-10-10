@@ -123,41 +123,24 @@ Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/cen
 
 **Running it around the clock for free:** the `census` workflow (`.github/workflows/census.yml`) records for 5 h 45 min every 6 hours, carries the pending checkpoints from run to run, keeps each run's recording for 90 days, and puts the day's report on each run's summary page; the trade tape is kept 14 days as a separate artifact (`census-trades`). Like the other workflows, it runs on schedule only once the file is on the default branch. GitHub's scheduled runs can start late or be skipped when GitHub is busy, so expect small gaps; a $5–15/month server running `copybot census` as a service has none. Size per day: about 0.5 GB uncompressed for the checkpoints, lists and books (a quarter of that zipped) plus about 1 GB of trade tape. Coins created in the last hour of a run get no complete outcome (the stream is not carried between runs), so about one in six is left out of the trade-stream tables on Actions; a server loses none.
 
-## A6. Test strategies on the tape (replay)
+## A6. Work backwards from the winners (`copybot winners`)
 
-**Start with the winners.** Before any rule search, see who the day's winners were, what singled them out in their first seconds, how far ahead of the trending lists that signal is, and what entering at it would have paid:
+No grids. The questions are asked in the order that matters here: who were the day's winners, what singled them out in their first seconds, how far ahead of the trending lists is that signal, and what happens after it.
 ```bash
 copybot winners --dir data/census                          # books, checkpoints, lists and trades under one folder
 copybot winners --dir data/all --trades data/replay        # tape folders split the way the Actions census keeps them
 copybot winners --dir data/census --leaders config/leaders.local.toml --size 0.5 --delay 4
 ```
-It prints, for standard coins (Mayhem-mode coins separately; pre-funded and insider-held ones left out): the base rates (reached $30k, $100k in liquidity-backed market cap); each day's top 10 by peak with when the signal first held, when the coin first listed and its 15 s book; the winners' fingerprint against all coins at 5, 15 and 60 s; a detector table (fixed rules × moments: fires per day, recall, precision with its interval, lift, the winners' peak from that moment, and every fire held to 1 h, 6 h and 24 h); which wallets were in the first minute of several winners and whether that repeats on the second half of the tape; and the signal-as-entry replay (the exact second each signal first held on the trade tape, our fill `--delay` later, hold the hour / ladder / trail / stop, with intervals and the smallest edge the sample can see). Every fire is a trade; nothing is picked, so there is no holdout. The report is also written to `<dir>/winners/report.md`.
+For standard coins (Mayhem-mode coins separately; pre-funded and insider-held ones left out) it prints:
+- the base rates: reached $30k, $100k, $250k, $1M in liquidity-backed market cap;
+- each day's top 10 by peak: when the signal first held, when the coin first listed, its 15 s book;
+- the winners' fingerprint against all coins at 5, 15 and 60 s (p10 / median / p90, the ≥ $100k and the $30k–$100k coins apart);
+- the detector: fixed rules × moments, each with fires per day, recall, precision with its interval, lift, the winners' peak from that moment, and every fire held to 1 h, 6 h and 24 h;
+- the lead: when the signal first holds against when the coin first reads above $30k and when it first shows on a trending list;
+- who was in the first minute of several winners, and whether the selective ones repeat on the second half of the tape (and the leaders file, if given);
+- after the signal: the exact second each signal first held on the trade tape, our fill `--delay` later with our size in the curve, and what the position is worth at the end of the hour, at its peak, and at the 6 h and 24 h checkpoints. No exit is searched or picked; the riding policy is designed from that table.
 
-Every coin's first hour is on the tape trade by trade, so a buying rule can be tested on it before any money is at risk:
-```bash
-copybot replay --dir data/census                          # 0.25 SOL a trade, our transactions land 4 s late
-copybot replay --dir data/census --size 1 --delay 2       # other size / speed
-copybot replay --dir data/census --from 2026-10-10 --to 2026-10-16
-```
-What it does:
-- **Entry rules** read each coin's book at 15, 30 or 60 s (holders, holder concentration, whether the dev sold, the snipers' share, how far along the curve is). When a rule passes, our buy lands `--delay` seconds later and fills on the curve as it was then, with the exact Pump.fun formula and fee, so a bigger buy gets a worse price.
-- **Exits:** take profit, stop loss, trailing stop, time limit, checked on every later trade; the sell also lands `--delay` late. A coin that graduates is sold at its final price.
-- **Costs:** the curve fee as recorded (1.25% a side when missing) and `--tx-cost` SOL per transaction.
-
-How it keeps itself honest (and how to read it):
-- It tries every entry rule with every exit (43,200 pairs). **The best pair on the data it was picked from always looks good; that table is for orientation only.**
-- **Walk-forward:** time is cut into blocks (6 h); for each block the pair is picked on all earlier blocks and only its trades in the new block count. "Out of sample" is the number that matters, with its 95% lower bound.
-- **Holdout:** the newest 20% of coins are locked away. Change rules and settings as much as you like; once you stop, run `--final` **once**. If you keep tuning after looking at the holdout, it is no longer a holdout.
-- Per-day figures appear only with 6+ hours of data behind them; below 30 out-of-sample trades the report says it cannot conclude anything.
-- The bankroll section replays the out-of-sample trades from 1 SOL (`--bankroll`), betting `--bet` of it per trade with at most `--max-open` positions.
-
-**The trending tier** has its own replay on the 5-minute captures (what a free-tier engine polling Jupiter every 5 minutes would see):
-```bash
-copybot replay-trending --dir data/census --size 5         # 5 SOL a trade; fills moved by size against the pool's liquidity
-```
-Entries trigger when a coin enters the 1 h trending or organic list (top 20 / top 100) or ranks in the 5-minute top 20, filtered on liquidity, age, organic score, holder concentration, net buyers and buy/sell flow; exits are the same take-profit / stop / trailing / time set, checked at every later capture. A coin's path continues after it leaves the lists (the recorder keeps pricing it for a day); one that still never prices again is sold at its last price less `--delist-haircut` (30%) and counted as `delisted`. The size table shows where the pool's depth caps a position. Same walk-forward and holdout rules as above.
-
-The `census` workflow runs `winners` and both replays over its last runs and adds them to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
+Nothing is picked, so there is no holdout; the detector's intervals and the chronological halves say whether a number holds. The report is also written to `<dir>/winners/report.md`. The `census` workflow runs it over its last runs and adds it to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
 
 ## RPC options (all free)
 | | Limits | Notes |

@@ -23,7 +23,6 @@ mod journal;
 mod keystore;
 mod micro;
 mod replay;
-mod replay_trend;
 mod report;
 mod tools;
 mod winners;
@@ -143,45 +142,6 @@ enum Cmd {
         #[arg(long)]
         day: Option<String>,
     },
-    /// Test entry and exit rules on the recorded trade tape: exact curve fills, fees and
-    /// our delay; pairs picked walk-forward; newest data locked until --final
-    Replay {
-        #[arg(long, default_value = "data/census")]
-        dir: String,
-        /// First UTC day of coins to use (YYYY-MM-DD)
-        #[arg(long)]
-        from: Option<String>,
-        /// Last UTC day of coins to use
-        #[arg(long)]
-        to: Option<String>,
-        /// SOL per trade
-        #[arg(long, default_value_t = 0.25)]
-        size: f64,
-        /// Seconds from a decision (or an exit trigger) until our transaction lands
-        #[arg(long, default_value_t = 4.0)]
-        delay: f64,
-        /// Network + priority fee per transaction, SOL
-        #[arg(long, default_value_t = 0.001)]
-        tx_cost: f64,
-        /// Walk-forward block length
-        #[arg(long, default_value_t = 6)]
-        block_hours: i64,
-        /// Share of the newest coins locked away until --final
-        #[arg(long, default_value_t = 0.2)]
-        holdout: f64,
-        /// Include the locked holdout: the one-time final test
-        #[arg(long = "final")]
-        final_run: bool,
-        /// Starting bankroll for the bankroll run, SOL
-        #[arg(long, default_value_t = 1.0)]
-        bankroll: f64,
-        /// Share of the bankroll per trade
-        #[arg(long, default_value_t = 0.1)]
-        bet: f64,
-        /// Most positions open at once
-        #[arg(long, default_value_t = 10)]
-        max_open: usize,
-    },
     /// Work backwards from the winners: what singles out the coins that reach $30k and
     /// $100k at 5-300 s, how early, and what entering at that signal pays on the tape
     Winners {
@@ -206,42 +166,6 @@ enum Cmd {
         /// then tested as a signal too
         #[arg(long)]
         leaders: Option<String>,
-    },
-    /// Test entry and exit rules for the trending tier on the census's 5-minute captures
-    /// (fills moved by size against the pool's liquidity; walk-forward; newest coins locked)
-    ReplayTrending {
-        #[arg(long, default_value = "data/census")]
-        dir: String,
-        /// SOL per trade
-        #[arg(long, default_value_t = 5.0)]
-        size: f64,
-        /// SOL price in dollars (default: the census's own sol_price rows)
-        #[arg(long)]
-        sol_usd: Option<f64>,
-        /// Swap fee per side (0.005 = 0.5%)
-        #[arg(long, default_value_t = 0.005)]
-        fee: f64,
-        /// Network + priority fee per transaction, SOL
-        #[arg(long, default_value_t = 0.001)]
-        tx_cost: f64,
-        /// Loss assumed on a coin that leaves every list and never prices again
-        #[arg(long, default_value_t = 0.3)]
-        delist_haircut: f64,
-        #[arg(long, default_value_t = 6)]
-        block_hours: i64,
-        #[arg(long, default_value_t = 0.2)]
-        holdout: f64,
-        #[arg(long = "final")]
-        final_run: bool,
-        /// Trades a pair needs before it can be picked
-        #[arg(long, default_value_t = 30)]
-        min_trades: usize,
-        #[arg(long, default_value_t = 1.0)]
-        bankroll: f64,
-        #[arg(long, default_value_t = 0.1)]
-        bet: f64,
-        #[arg(long, default_value_t = 5)]
-        max_open: usize,
     },
     /// Control the running engine: status | positions | leaders | pause | resume | kill | flatten | stop | blacklist [<address>] | unblacklist <address>
     Ctl {
@@ -410,39 +334,6 @@ async fn main() -> anyhow::Result<()> {
             })
             .await
         }
-        Cmd::Replay {
-            dir,
-            from,
-            to,
-            size,
-            delay,
-            tx_cost,
-            block_hours,
-            holdout,
-            final_run,
-            bankroll,
-            bet,
-            max_open,
-        } => {
-            print!(
-                "{}",
-                replay::write(&replay::ReplayArgs {
-                    dir: dir.into(),
-                    from,
-                    to,
-                    size_sol: size,
-                    delay_s: delay,
-                    tx_cost_sol: tx_cost,
-                    block_hours,
-                    holdout,
-                    final_run,
-                    bankroll_sol: bankroll,
-                    bet_share: bet,
-                    max_open,
-                })?
-            );
-            Ok(())
-        }
         Cmd::Winners {
             dir,
             trades,
@@ -462,41 +353,6 @@ async fn main() -> anyhow::Result<()> {
                     delay_s: delay,
                     tx_cost_sol: tx_cost,
                     leaders_file: leaders.map(Into::into),
-                })?
-            );
-            Ok(())
-        }
-        Cmd::ReplayTrending {
-            dir,
-            size,
-            sol_usd,
-            fee,
-            tx_cost,
-            delist_haircut,
-            block_hours,
-            holdout,
-            final_run,
-            min_trades,
-            bankroll,
-            bet,
-            max_open,
-        } => {
-            print!(
-                "{}",
-                replay_trend::write(&replay_trend::Args {
-                    dir: dir.into(),
-                    size_sol: size,
-                    sol_usd,
-                    fee,
-                    tx_sol: tx_cost,
-                    delist_haircut,
-                    block_hours,
-                    holdout,
-                    final_run,
-                    min_trades,
-                    bankroll_sol: bankroll,
-                    bet_share: bet,
-                    max_open,
                 })?
             );
             Ok(())
@@ -615,8 +471,6 @@ async fn main() -> anyhow::Result<()> {
                 | Cmd::WalletAudit { .. }
                 | Cmd::Census { .. }
                 | Cmd::CensusReport { .. }
-                | Cmd::Replay { .. }
-                | Cmd::ReplayTrending { .. }
                 | Cmd::Winners { .. } => unreachable!(),
             }
         }

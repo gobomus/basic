@@ -200,7 +200,7 @@ The selection layer cannot tell a 5× from a 100× at entry, so the gap between 
 - **Re-entry on the retracement** (buy the dip to the level that held) is only worth testing if H5 finds levels that hold; otherwise it is adding to a position that is being distributed.
 - **The creator's sell as a hard exit** for pre-funded coins: the first candle with `creator_sold_sol > 0` is the signal; the test is how much is left to lose after it.
 
-All of this runs in the replay (`copybot replay`) once it reads the AMM path, with the same walk-forward and holdout rules as the curve rules.
+All of this is measured by `copybot winners`'s after-the-signal table once it reads the AMM path (the pool candles after graduation): what the position is worth at each horizon after the signal, no exit grid, nothing picked.
 
 ## 7. How much data, and when
 
@@ -213,5 +213,5 @@ All of this runs in the replay (`copybot replay`) once it reads the AMM path, wi
 
 1. **Treat pre-funded launches as their own tier.** They are where the $100k coins are, and the trade is a post-graduation timing trade against a known seller. The plan's `MIGRATED_FRESH` state becomes two: factory coins and organic graduations.
 2. **Keep "entry under $20k" as a goal for ordinary coins only, with the honest base rates**, and measure the organic-runner rate over 24 h before deciding whether that tier can carry size.
-3. **No tuning to a target.** Buckets are fixed here; the report shows both halves; the replay keeps its holdout. If the data says the edge is 15% hit rate at 5×, that is what the sizing uses.
+3. **No tuning to a target.** Buckets are fixed here; the report shows both halves; `copybot winners` picks nothing, so it needs no holdout. If the data says the edge is 15% hit rate at 5×, that is what the sizing uses.
 4. **Next builds, in order**: creator index; post-graduation replay; wallet table. Each is a day or two and each unlocks a hypothesis above.

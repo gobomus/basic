@@ -14,14 +14,13 @@
 //!   what holding every fire to the hour would have paid;
 //! * lead: when the signal first holds against when the coin first shows on a trending
 //!   list and when it first reads above the label;
-//! * the signal as the entry: on the trade tape, the exact second each signal first
-//!   holds, our fill `delay` later with our size in the curve, and the hold-the-hour,
-//!   ladder and trailing exits from there, with intervals and the smallest edge the
-//!   sample can see.
+//! * after the signal: on the trade tape, the exact second each signal first holds,
+//!   our fill `delay` later with our size in the curve, and what the position is worth
+//!   at the end of the hour, at its peak, and at the 6 h and 24 h checkpoints.
 //!
-//! The rules are fixed before looking (a short list, stated), not searched; there is no
-//! holdout because nothing is picked, and the chronological halves show whether a
-//! number holds over time.
+//! No grid. The rules are fixed before looking (a short list, stated), not searched;
+//! no exit is picked, so there is no holdout; the chronological halves of the detector
+//! tables show whether a number holds over time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -31,7 +30,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::census_report::age;
-use crate::replay::{self, hm, pct, per_day, recorded_hours, Costs, Exit, Score, Signal, Why};
+use crate::replay::{self, hm, pct, recorded_hours, Costs, Signal};
 
 /// Book moments looked at (seconds after creation).
 pub const T: [i64; 6] = [5, 15, 30, 60, 120, 300];
@@ -115,12 +114,14 @@ impl Coin {
     fn first_above(&self, usd: f64) -> Option<i64> {
         self.cps.iter().filter(|c| c.1 >= usd).map(|c| c.0).min()
     }
-    /// Liquidity-backed market cap at checkpoint `cp` over the market cap at `t` (0 when
-    /// no pool backs it any more); `None` without that checkpoint.
+    /// Liquidity-backed market cap in dollars at checkpoint `cp` (0 when no pool backs it
+    /// any more); `None` without that checkpoint.
+    fn cp_usd(&self, cp: i64) -> Option<f64> {
+        self.cps.iter().find(|c| c.0 == cp).map(|c| c.1)
+    }
+    /// `cp_usd` over the market cap at `t`.
     fn cp_multiple(&self, t: i64, cp: i64) -> Option<f64> {
-        let entry = self.mcap_usd(t)?;
-        let row = self.cps.iter().find(|c| c.0 == cp)?;
-        Some(row.1 / entry)
+        Some(self.cp_usd(cp)? / self.mcap_usd(t)?)
     }
     pub fn mcap_usd(&self, t: i64) -> Option<f64> {
         let b = self.books.get(&t)?;
@@ -331,8 +332,6 @@ fn money(v: f64) -> String {
 
 type Rule = (String, Box<dyn Fn(&Book) -> bool>);
 type Feature = (&'static str, fn(&Book) -> f64);
-/// (entry ts, exit ts, return, SOL result)
-type Fill = (i64, i64, f64, f64);
 /// A wallet signal to test: label, wallets, how many must have bought, the coins it is
 /// tested on, and the create time from which the entry replay may use it.
 type WalletCase<'a> = (&'a str, &'a HashSet<u64>, usize, &'a [usize], i64);
@@ -625,62 +624,6 @@ pub fn signals() -> Vec<Signal> {
     ]
 }
 
-/// How to get out, from the signal entry.
-#[derive(Clone, Debug)]
-enum Out {
-    Hold,
-    Ladder(&'static str, Vec<(f64, f64)>),
-    Exit(&'static str, Exit),
-}
-
-fn outs() -> Vec<Out> {
-    let hour = |trail: Option<f64>, sl: Option<f64>| Exit {
-        tp: None,
-        sl,
-        trail,
-        max_hold: 3600,
-    };
-    vec![
-        Out::Hold,
-        Out::Ladder(
-            "ladder ⅓ at 2×, ⅓ at 4×, rest at 1 h",
-            vec![(2.0, 1.0 / 3.0), (4.0, 1.0 / 3.0)],
-        ),
-        Out::Ladder(
-            "ladder ½ at 2×, ¼ at 4×, rest at 1 h",
-            vec![(2.0, 0.5), (4.0, 0.25)],
-        ),
-        Out::Exit("trail 50% from the peak, no stop", hour(Some(0.5), None)),
-        Out::Exit("stop −50%, hold to 1 h", hour(None, Some(0.5))),
-    ]
-}
-
-impl Out {
-    fn label(&self) -> &'static str {
-        match self {
-            Out::Hold => "hold to 1 h, no stop",
-            Out::Ladder(l, _) | Out::Exit(l, _) => l,
-        }
-    }
-    fn trade(&self, c: &replay::Coin, entry_ts: i64, k: &Costs) -> Option<replay::Trade> {
-        match self {
-            Out::Hold => replay::simulate_from(
-                c,
-                entry_ts,
-                &Exit {
-                    tp: None,
-                    sl: None,
-                    trail: None,
-                    max_hold: 3600,
-                },
-                k,
-            ),
-            Out::Ladder(_, legs) => replay::ladder_from(c, entry_ts, legs, 3600, k),
-            Out::Exit(_, e) => replay::simulate_from(c, entry_ts, e, k),
-        }
-    }
-}
-
 struct Fire {
     coin: usize,
     signal_ts: i64,
@@ -847,18 +790,24 @@ fn wallet_section(
     out
 }
 
+/// What happens after the signal. Every fire is a trade: our fill `delay` after the
+/// signal's trade with our size in the curve, valued at the end of the first hour (a
+/// coin that graduates is sold into the pool at its final curve price), at its peak on
+/// the way, and at the 6 h and 24 h checkpoints (liquidity-backed market cap over the
+/// market cap we entered at, 0 once no pool backs it, both curve fees taken). No exit
+/// is searched or picked: the riding policy is designed from this table.
 fn entry_replay(
     o: &mut String,
     tape: &[replay::Coin],
-    standard: &HashSet<&str>,
+    coins: &HashMap<&str, &Coin>,
     k: &Costs,
     sol_usd: f64,
     hours: f64,
     extra: &[(Signal, i64)],
 ) {
-    let _ = writeln!(o, "\n## The signal as the entry (trade tape)\n");
+    let _ = writeln!(o, "\n## After the signal (trade tape)\n");
     let idx: Vec<usize> = (0..tape.len())
-        .filter(|&i| standard.contains(tape[i].mint.as_str()))
+        .filter(|&i| coins.contains_key(tape[i].mint.as_str()))
         .collect();
     if idx.is_empty() {
         let _ = writeln!(o, "_No trade tape for these coins (pass `--trades`)._");
@@ -869,28 +818,21 @@ fn entry_replay(
         .map(|s| (s, 0))
         .chain(extra.iter().cloned())
         .collect();
-    let outs = outs();
     let _ = writeln!(
         o,
-        "- {} standard coins with their trades on tape ({} trades); our buy lands {} s after the signal's trade with {} SOL in the curve; fees as recorded; {} SOL per transaction; {} signals × {} exits = {} pairs, all fixed in advance",
+        "- {} standard coins with their trades on tape ({} trades); our buy lands {} s after the signal's trade with {} SOL in the curve; fees as recorded; {} SOL per transaction; {} signals, fixed in advance; every fire is a trade",
         idx.len(),
         idx.iter().map(|&i| tape[i].trades()).sum::<usize>(),
         k.delay_s,
         k.size_lamports as f64 / 1e9,
         k.tx_lamports as f64 / 1e9,
-        sigs.len(),
-        outs.len(),
-        sigs.len() * outs.len()
+        sigs.len()
     );
     let _ = writeln!(
         o,
-        "\n| signal | fires | /day | at (median s) | entry mcap (median) | exit | win | ≥ 2× | mean (95% interval) | smallest visible edge | median | SOL/day at size | 1st half | 2nd half |"
+        "\n| signal | fires | /day | at (median s) | entry mcap (median) | at 1 h: mean (±), median, ≥ 2×, ≤ 0.1× | peak in the hour: median, ≥ 2×, ≥ 5× | at 6 h (n) | at 24 h (n) |"
     );
-    let _ = writeln!(
-        o,
-        "|---|---:|---:|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|"
-    );
-    let mut best: Option<(String, Vec<Fill>)> = None;
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---|---|---|---|");
     for (s, from_ts) in &sigs {
         let pool: Vec<usize> = idx
             .iter()
@@ -910,90 +852,80 @@ fn entry_replay(
                     .map(|signal_ts| Fire { coin: i, signal_ts })
             })
             .collect();
-        if fires.len() < MIN_FIRES {
+        let (mut at, mut mcap, mut r1h, mut peak, mut h6, mut h24) =
+            (vec![], vec![], vec![], vec![], vec![], vec![]);
+        for f in &fires {
+            let c = &tape[f.coin];
+            let entry_ts = f.signal_ts + k.delay_s;
+            let Some((last, pk)) = replay::path_from(c, entry_ts, k) else {
+                continue;
+            };
+            r1h.push(last);
+            peak.push(pk);
+            at.push((f.signal_ts - c.created_ts) as f64);
+            let m = c.mcap_sol_at(entry_ts) * sol_usd;
+            mcap.push(m);
+            if let Some(w) = coins.get(c.mint.as_str()).filter(|_| m > 0.0) {
+                let later = |cp: i64| {
+                    w.cp_usd(cp)
+                        .map(|v| v / m * (1.0 - FEE) * (1.0 - FEE) - 1.0)
+                };
+                h6.extend(later(21_600));
+                h24.extend(later(86_400));
+            }
+        }
+        if r1h.len() < MIN_FIRES {
             continue;
         }
-        let mut at: Vec<f64> = fires
-            .iter()
-            .map(|f| (f.signal_ts - tape[f.coin].created_ts) as f64)
-            .collect();
-        let mut mcap: Vec<f64> = fires
-            .iter()
-            .map(|f| tape[f.coin].mcap_sol_at(f.signal_ts + k.delay_s) * sol_usd)
-            .collect();
-        let half = fires.len() / 2;
-        for out in &outs {
-            let trades: Vec<Fill> = fires
-                .iter()
-                .filter_map(|f| {
-                    out.trade(&tape[f.coin], f.signal_ts + k.delay_s, k)
-                        .map(|t| (t.entry_ts, t.exit_ts, t.ret(), t.pnl_sol()))
-                })
-                .collect();
-            if trades.len() < MIN_FIRES {
-                continue;
-            }
-            let mut sc = Score::default();
-            let (mut first, mut second) = (Score::default(), Score::default());
-            let mut rets: Vec<f64> = vec![];
-            for (i, t) in trades.iter().enumerate() {
-                sc.add_ret(t.2, t.3);
-                if i < half {
-                    first.add_ret(t.2, t.3);
-                } else {
-                    second.add_ret(t.2, t.3);
-                }
-                rets.push(t.2);
-            }
-            let doubled = rets.iter().filter(|r| **r >= 1.0).count();
-            let _ = writeln!(
-                o,
-                "| {}{} | {} | {:.0} | {:.0} | {} | {} | {:.0}% | {:.0}% | **{}** ({} to {}) | ±{:.0}% | {} | {} | {} | {} |",
-                s.label(),
-                if *from_ts > 0 { " (2nd half)" } else { "" },
-                trades.len(),
-                trades.len() as f64 / hours * 24.0,
-                median(&mut at),
-                money(median(&mut mcap)),
-                out.label(),
-                100.0 * sc.wins as f64 / sc.n as f64,
-                100.0 * doubled as f64 / sc.n as f64,
-                pct(sc.mean()),
-                pct(sc.mean() - sc.mde()),
-                pct(sc.mean() + sc.mde()),
-                100.0 * sc.mde(),
-                pct(median(&mut rets)),
-                per_day(sc.pnl, hours),
-                pct(first.mean()),
-                pct(second.mean())
-            );
-            if best.as_ref().is_none_or(|b| sc.mean() > mean_of(&b.1)) {
-                best = Some((format!("{} · {}", s.label(), out.label()), trades));
-            }
-        }
+        let _ = writeln!(
+            o,
+            "| {}{} | {} | {:.0} | {:.0} | {} | {} | {} | {} | {} |",
+            s.label(),
+            if *from_ts > 0 { " (2nd half)" } else { "" },
+            r1h.len(),
+            r1h.len() as f64 / hours * 24.0,
+            median(&mut at),
+            money(median(&mut mcap)),
+            dist_cell(&mut r1h, &[("≥ 2×", 1.0)], Some(-0.9), false),
+            dist_cell(&mut peak, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, true),
+            dist_cell(&mut h6, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, false),
+            dist_cell(&mut h24, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, false)
+        );
     }
     let _ = writeln!(
         o,
-        "_Every fire is a trade: no selection by outcome. \"at\" is the second after creation when the signal first held; the entry market cap is ours after the delay. Halves are chronological. A coin that graduates during the hold is sold into the pool at its final curve price. The smallest visible edge is ±1.96 sd/√n: a mean inside it is not distinguishable from zero at this sample size, nothing more._"
+        "_\"at\" is the second after creation when the signal first held; the entry market cap is the curve's after our delay. Returns are on what we paid, after both fees and our own price impact on the curve (the checkpoint columns take the fees but not the impact). A coin that graduates within the hour is sold into the pool at its final curve price, so the hour's figures cap a runner at about its graduation price; the 6 h and 24 h columns are where the runners show, with (n) the fires old enough to have that checkpoint. Halves of the tape are not split here because nothing is picked; the detector tables above carry the intervals._"
     );
-    if let Some((label, trades)) = best {
-        let (cash, dd, taken) = replay::bankroll(
-            &trades.iter().map(|t| (t.0, t.1, t.2)).collect::<Vec<_>>(),
-            1.0,
-            0.1,
-            10,
-        );
-        let _ = writeln!(
-            o,
-            "\nBest mean above (picked from {} pairs, so optimistic): **{label}**. Bankroll run from 1 SOL, 10% a trade, at most 10 open, every trade in time order: **{cash:.2} SOL** after {taken} trades over {hours:.1} h, deepest drawdown {:.0}%. Reading: the bankroll is what the one-at-a-time means hide, since the fires come in clusters and the stake is a share of what is left.",
-            sigs.len() * outs.len(),
-            100.0 * dd
-        );
-    }
 }
 
-fn mean_of(trades: &[Fill]) -> f64 {
-    trades.iter().map(|t| t.2).sum::<f64>() / trades.len().max(1) as f64
+/// "mean (±ci), median, a% ≥ 2×, b% ≤ 0.1× (n)" for a list of returns; `median_only`
+/// leaves the mean out (a peak has no useful mean).
+fn dist_cell(
+    v: &mut [f64],
+    marks: &[(&str, f64)],
+    floor: Option<f64>,
+    median_only: bool,
+) -> String {
+    if v.is_empty() {
+        return "-".into();
+    }
+    let n = v.len();
+    let med = median(v);
+    let share =
+        |f: &dyn Fn(f64) -> bool| 100.0 * v.iter().filter(|r| f(**r)).count() as f64 / n as f64;
+    let mut parts = vec![];
+    if !median_only {
+        let (m, ci) = mean_ci(v);
+        parts.push(format!("{} (±{:.0}%)", pct(m), 100.0 * ci));
+    }
+    parts.push(format!("median {}", pct(med)));
+    for (label, at) in marks {
+        parts.push(format!("{label} {:.0}%", share(&|r| r >= *at)));
+    }
+    if let Some(f) = floor {
+        parts.push(format!("≤ {:.1}× {:.0}%", 1.0 + f, share(&|r| r <= f)));
+    }
+    format!("{} ({n})", parts.join(", "))
 }
 
 // ------------------------------------------------------------------ the report
@@ -1298,13 +1230,12 @@ pub fn report(
         delay_s: a.delay_s.ceil() as i64,
         tx_lamports: (a.tx_cost_sol * 1e9) as u64,
     };
-    let std_set: HashSet<&str> = standard.iter().map(|c| c.mint.as_str()).collect();
+    let by_mint: HashMap<&str, &Coin> = standard.iter().map(|c| (c.mint.as_str(), *c)).collect();
     let std_idx: Vec<usize> = (0..tape.len())
-        .filter(|&i| std_set.contains(tape[i].mint.as_str()))
+        .filter(|&i| by_mint.contains_key(tape[i].mint.as_str()))
         .collect();
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
-    entry_replay(&mut o, tape, &std_set, &k, sol_usd, hours, &extra);
-    let _ = Why::TapeEnd;
+    entry_replay(&mut o, tape, &by_mint, &k, sol_usd, hours, &extra);
     o
 }
 

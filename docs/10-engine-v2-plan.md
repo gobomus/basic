@@ -312,7 +312,9 @@ On 16,908 coins (two Actions runs, 11 h): holders ≥ 30 at 15 s makes a coin 3.
 
 ### WO-4 progress (2026-10-09): the replay engine
 
-The first piece of WO-4 is built: `copybot replay` tests entry rules and exits on the trade tape before any money is at risk (RUNBOOK A6). Exact curve fills for our size, the recorded fee, our transaction landing `delay` after each decision and exit trigger, our own buy kept in the curve until we sell. 480 entry rules × 90 exits are scored; one is chosen walk-forward (picked on earlier 6 h blocks, scored on the next block only), the newest 20% of coins stay locked until a single `--final` run, and the report states how many pairs were tried and refuses per-day figures under 6 h of data.
+*(Removed on 2026-10-10, late evening, with the trending-tier grid: the entry × exit search, the walk-forward and the holdout. What stays of it is the tape model that `copybot winners` uses: exact curve fills for our size, the recorded fee, our delay, the signal's first-crossing second. See [12 §5.4](12-replay-audit.md).)*
+
+The first piece of WO-4 was built: `copybot replay` tests entry rules and exits on the trade tape before any money is at risk (RUNBOOK A6). Exact curve fills for our size, the recorded fee, our transaction landing `delay` after each decision and exit trigger, our own buy kept in the curve until we sell. 480 entry rules × 90 exits are scored; one is chosen walk-forward (picked on earlier 6 h blocks, scored on the next block only), the newest 20% of coins stay locked until a single `--final` run, and the report states how many pairs were tried and refuses per-day figures under 6 h of data.
 
 First run (25 minutes of tape, 1,174 coins): the best in-sample pairs show +7 to +9% per trade, but none is positive at 95% confidence, and the walk-forward trades swung from -13% to +10% per trade as four trades were added. That is the expected picture for this little data; it is why the protocol exists. The answer needs days of recording, which the Actions census now provides.
 
