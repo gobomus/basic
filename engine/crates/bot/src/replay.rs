@@ -217,9 +217,39 @@ impl Coin {
         v.dedup();
         v
     }
-    /// Market cap in SOL at block time `ts`.
+    /// Market cap in SOL at block time `ts`, on the curve or, after graduation, in the pool.
     pub fn mcap_sol_at(&self, ts: i64) -> f64 {
+        let i = self.pool.partition_point(|x| x.ts <= ts);
+        if i > 0 && self.graduated_ts.is_some_and(|g| g <= ts) {
+            return self.pool[i - 1].mcap_sol;
+        }
         self.at(ts).mcap_sol()
+    }
+    /// The highest market cap in SOL on tape after block time `ts` (curve and pool).
+    pub fn peak_mcap_sol_after(&self, ts: i64) -> f64 {
+        let curve = self
+            .ticks
+            .iter()
+            .filter(|x| x.ts > ts)
+            .map(|x| x.mcap_sol())
+            .fold(0.0, f64::max);
+        let pool = self
+            .pool
+            .iter()
+            .filter(|x| x.ts > ts)
+            .map(|x| x.mcap_sol)
+            .fold(0.0, f64::max);
+        curve.max(pool)
+    }
+    /// Seconds after the create of the last trade on tape.
+    pub fn last_trade_age(&self) -> i64 {
+        self.ticks
+            .last()
+            .map(|x| x.ts)
+            .into_iter()
+            .chain(self.pool.last().map(|x| x.ts))
+            .max()
+            .map_or(0, |t| t - self.created_ts)
     }
     pub fn trades(&self) -> usize {
         self.ticks.len()
@@ -346,9 +376,17 @@ pub fn load_with_wallets(
                     }
                 }
                 "amm" => {
-                    let (Some(mcap_sol), Some(liq)) = (row.mcap_sol, row.liq) else {
+                    let Some(mcap_sol) = row.mcap_sol.filter(|m| *m > 0.0) else {
                         continue;
                     };
+                    // older tapes carry no pool SOL: a fresh pool holds about the curve's
+                    // SOL and, at constant product, its SOL grows with the square root
+                    // of the price
+                    let liq = row.liq.unwrap_or_else(|| {
+                        let landing = c.pool.first().map_or(mcap_sol, |p| p.mcap_sol);
+                        (LANDING_POOL_LAMPORTS as f64 * (mcap_sol / landing.max(1e-9)).sqrt())
+                            as u64
+                    });
                     let user = row.user.as_deref().map(wallet_hash).unwrap_or(0);
                     if let Some(u) = row.user.as_deref() {
                         wallets.entry(user).or_insert_with(|| u.to_string());
@@ -522,6 +560,9 @@ const SUPPLY_BASE_UNITS: f64 = 1e15;
 const FLOW_S: i64 = 60;
 /// Pool fee when the row does not carry it.
 const DEFAULT_POOL_FEE_BPS: u64 = 25;
+/// SOL a fresh PumpSwap pool holds when the row does not say (the curve's real SOL at
+/// graduation, less the migration fee).
+const LANDING_POOL_LAMPORTS: u64 = 84_000_000_000;
 
 /// The live state of a coin as the tape unfolds: what an engine holding it would see.
 #[derive(Clone, Debug, Default)]
@@ -699,6 +740,16 @@ pub enum EntryRule {
         min_new_buyers_w: usize,
         within_s: i64,
     },
+    /// after an exit: money flowing back in (buys over sells in SOL over the last
+    /// minute by this ratio, at least 1 SOL bought), new buyers still coming, and SOL
+    /// in the curve or pool back at or above this share of its peak
+    Resume {
+        min_buy_ratio: f64,
+        min_new_buyers_w: usize,
+        min_sol_vs_peak: f64,
+    },
+    /// the first of several to hold
+    Any(Vec<EntryRule>),
 }
 
 impl EntryRule {
@@ -731,6 +782,19 @@ impl EntryRule {
                 min_new_buyers_w,
                 within_s
             ),
+            EntryRule::Resume {
+                min_buy_ratio,
+                min_new_buyers_w,
+                min_sol_vs_peak,
+            } => format!(
+                "resume: buys ≥ {min_buy_ratio}× sells over 60 s & new buyers 60 s ≥ {min_new_buyers_w} & SOL ≥ {:.0}% of its peak",
+                min_sol_vs_peak * 100.0
+            ),
+            EntryRule::Any(v) => v
+                .iter()
+                .map(|r| r.label())
+                .collect::<Vec<_>>()
+                .join("  OR  "),
         }
     }
     fn within(&self) -> i64 {
@@ -739,6 +803,8 @@ impl EntryRule {
             EntryRule::SecondWave { within_s, .. } | EntryRule::Organic { within_s, .. } => {
                 *within_s
             }
+            EntryRule::Resume { .. } => i64::MAX,
+            EntryRule::Any(v) => v.iter().map(|r| r.within()).max().unwrap_or(0),
         }
     }
     fn holds(&self, st: &State, snap: &Snap) -> bool {
@@ -767,6 +833,17 @@ impl EntryRule {
                     && st.holders >= *min_holders
                     && snap.new_buyers_w >= *min_new_buyers_w
             }
+            EntryRule::Resume {
+                min_buy_ratio,
+                min_new_buyers_w,
+                min_sol_vs_peak,
+            } => {
+                st.buy_w >= LAMPORTS as u64
+                    && st.buy_w as f64 >= min_buy_ratio * st.sell_w as f64
+                    && snap.new_buyers_w >= *min_new_buyers_w
+                    && snap.net_sol_vs_peak >= *min_sol_vs_peak
+            }
+            EntryRule::Any(v) => v.iter().any(|r| r.holds(st, snap)),
         }
     }
 }
@@ -775,8 +852,10 @@ impl Coin {
     /// Block time of the first trade after which the entry rule holds (curve only:
     /// an entry is a curve buy), within its window of the create.
     pub fn entry_ts(&self, rule: &EntryRule) -> Option<i64> {
-        if let EntryRule::Signal(s) = rule {
-            return self.signal_ts(s);
+        match rule {
+            EntryRule::Signal(s) => return self.signal_ts(s),
+            EntryRule::Any(v) => return v.iter().filter_map(|r| self.entry_ts(r)).min(),
+            _ => {}
         }
         let mut st = State::default();
         for x in &self.ticks {
@@ -811,6 +890,8 @@ pub enum ExitRule {
     Drawdown(f64),
     /// either of two
     Either(Box<ExitRule>, Box<ExitRule>),
+    /// both of two
+    All(Box<ExitRule>, Box<ExitRule>),
     /// never: ride to the end of the data
     None,
 }
@@ -828,6 +909,7 @@ impl ExitRule {
             ExitRule::SolLeaving(x) => format!("SOL in curve/pool ≤ {:.0}% of its peak", x * 100.0),
             ExitRule::Drawdown(x) => format!("price ≤ {:.0}% of the peak", x * 100.0),
             ExitRule::Either(a, b) => format!("{} | {}", a.label(), b.label()),
+            ExitRule::All(a, b) => format!("{} & {}", a.label(), b.label()),
             ExitRule::None => "ride to the end of the data".into(),
         }
     }
@@ -844,6 +926,9 @@ impl ExitRule {
             ExitRule::Drawdown(x) => value_vs_peak <= *x,
             ExitRule::Either(a, b) => {
                 a.holds(st, snap, value_vs_peak) || b.holds(st, snap, value_vs_peak)
+            }
+            ExitRule::All(a, b) => {
+                a.holds(st, snap, value_vs_peak) && b.holds(st, snap, value_vs_peak)
             }
             ExitRule::None => false,
         }
@@ -888,6 +973,168 @@ fn pool_value(x: &PoolTick, tokens: u64) -> u64 {
     (out * (1.0 - x.fee_bps as f64 / 10_000.0)) as u64
 }
 
+/// Our tokens from a buy of `size` lamports into the pool as it is after `x`.
+fn pool_buy(x: &PoolTick, size: u64) -> u64 {
+    if x.mcap_sol <= 0.0 || x.liq == 0 {
+        return 0;
+    }
+    let r_tok = x.liq as f64 / (x.mcap_sol / 1e6);
+    let sol_in = size as f64 * (1.0 - x.fee_bps as f64 / 10_000.0);
+    (r_tok * sol_in / (x.liq as f64 + sol_in)) as u64
+}
+
+/// A buy landing at `fill_ts`: on the curve before graduation, in the pool after it
+/// (at the pool as its last trade left it; none before the pool's first trade).
+fn open_at(c: &Coin, fill_ts: i64, k: &Costs) -> Option<Position> {
+    match c.graduated_ts {
+        Some(g) if g <= fill_ts => {
+            let i = c.pool.partition_point(|x| x.ts <= fill_ts);
+            if i == 0 {
+                return None;
+            }
+            let tokens = pool_buy(&c.pool[i - 1], k.size_lamports);
+            (tokens > 0).then_some(Position { input: 0, tokens })
+        }
+        _ => open(c, fill_ts, k),
+    }
+}
+
+/// Every trade of the coin in time order: (ts, in the pool, index).
+fn events_of(c: &Coin) -> Vec<(i64, bool, usize)> {
+    let mut events: Vec<(i64, bool, usize)> = Vec::with_capacity(c.ticks.len() + c.pool.len());
+    events.extend(c.ticks.iter().enumerate().map(|(i, x)| (x.ts, false, i)));
+    events.extend(c.pool.iter().enumerate().map(|(i, x)| (x.ts, true, i)));
+    events.sort_by_key(|e| (e.0, e.1));
+    events
+}
+
+/// The position's sell value after the trade `(is_pool, i)`.
+fn event_value(c: &Coin, pos: &Position, is_pool: bool, i: usize) -> u64 {
+    if is_pool {
+        pool_value(&c.pool[i], pos.tokens)
+    } else {
+        pos.value(&c.ticks[i])
+    }
+}
+
+/// A sell landing at `ts`: when it fills (the last trade at or before it), what it
+/// returns, and whether that was in the pool.
+fn value_with(
+    c: &Coin,
+    events: &[(i64, bool, usize)],
+    pos: &Position,
+    entry_ts: i64,
+    ts: i64,
+) -> (i64, u64, bool) {
+    let n = events.partition_point(|e| e.0 <= ts);
+    if n == 0 {
+        return (entry_ts, pos.value(&c.at(entry_ts)), false);
+    }
+    let (ets, is_pool, i) = events[n - 1];
+    if !is_pool && c.graduated_ts.is_some_and(|g| g <= ts) {
+        // graduated, no pool trade yet: the pool as the curve left it
+        let pool = pool_after_graduation(with_us(c.ticks[i].state(), pos.input, pos.tokens));
+        return (
+            ets,
+            sell_quote_for_tokens(&pool, pos.tokens, AMM_FEE_BPS),
+            true,
+        );
+    }
+    (ets.max(entry_ts), event_value(c, pos, is_pool, i), is_pool)
+}
+
+/// One leg of a ride with re-entry: a buy and the sell that closed it.
+#[derive(Clone, Copy, Debug)]
+pub struct Leg {
+    pub entry_ts: i64,
+    pub exit_ts: i64,
+    pub entry_mcap_sol: f64,
+    pub exit_mcap_sol: f64,
+    /// return on what we paid (size plus two transaction fees)
+    pub ret: f64,
+    /// closed by the exit rule (else the data ended with the position open)
+    pub by_rule: bool,
+}
+
+/// The state machine with re-entry: buy `delay` after the first trade at which `entry`
+/// holds, sell `delay` after the first later trade at which `exit` holds, buy again
+/// `delay` after `reentry` next holds, and so on to the end of the data; a position
+/// still open at the end is marked at the last trade. Every leg is returned.
+pub fn legs(
+    c: &Coin,
+    entry: &EntryRule,
+    reentry: &EntryRule,
+    exit: &ExitRule,
+    k: &Costs,
+) -> Vec<Leg> {
+    let Some(first) = c.entry_ts(entry) else {
+        return vec![];
+    };
+    let events = events_of(c);
+    let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
+    let mut st = State::default();
+    let mut out = vec![];
+    let mut next_buy: Option<i64> = Some(first + k.delay_s);
+    let mut next_sell: Option<i64> = None;
+    let mut open_pos: Option<(Position, i64, u64)> = None; // position, its entry, its peak value
+    let mut last_fill = first + k.delay_s;
+    let close = |pos: &Position, entry_ts: i64, sell_ts: i64, by_rule: bool, out: &mut Vec<Leg>| {
+        let (exit_ts, value, _) = value_with(c, &events, pos, entry_ts, sell_ts);
+        out.push(Leg {
+            entry_ts,
+            exit_ts,
+            entry_mcap_sol: c.mcap_sol_at(entry_ts),
+            exit_mcap_sol: c.mcap_sol_at(exit_ts),
+            ret: value as f64 / cost - 1.0,
+            by_rule,
+        });
+    };
+    for &(ts, is_pool, i) in &events {
+        if is_pool {
+            st.pool(c, &c.pool[i]);
+        } else {
+            st.curve(c, &c.ticks[i]);
+        }
+        // fills decided earlier land before this trade is seen
+        if let Some(t) = next_buy.filter(|t| ts > *t) {
+            next_buy = None;
+            if let Some(pos) = open_at(c, t, k) {
+                open_pos = Some((pos, t, 0));
+            }
+            last_fill = t;
+        }
+        if let Some(t) = next_sell.filter(|t| ts > *t) {
+            next_sell = None;
+            if let Some((pos, entry_ts, _)) = open_pos.take() {
+                close(&pos, entry_ts, t, true, &mut out);
+            }
+            last_fill = t;
+        }
+        if ts <= last_fill {
+            continue;
+        }
+        let snap = st.snap(c, ts);
+        match (&mut open_pos, next_sell, next_buy) {
+            (Some((pos, _, peak)), None, _) => {
+                let v = event_value(c, pos, is_pool, i);
+                *peak = (*peak).max(v);
+                if exit.holds(&st, &snap, v as f64 / (*peak).max(1) as f64) {
+                    next_sell = Some(ts + k.delay_s);
+                }
+            }
+            (None, _, None) if !out.is_empty() && reentry.holds(&st, &snap) => {
+                next_buy = Some(ts + k.delay_s);
+            }
+            _ => {}
+        }
+    }
+    if let Some((pos, entry_ts, _)) = open_pos.take() {
+        let sell_ts = next_sell.unwrap_or(i64::MAX);
+        close(&pos, entry_ts, sell_ts, next_sell.is_some(), &mut out);
+    }
+    out
+}
+
 /// Buy with a fill at `entry_ts`, then watch the live state on every later trade,
 /// curve and pool, and sell `k.delay_s` after the first trade at which each rule
 /// holds; a rule that never holds closes at the last trade on tape. One pass serves
@@ -900,36 +1147,10 @@ pub fn ride_all(
 ) -> Option<(Vec<Ride>, Trail)> {
     let pos = open(c, entry_ts, k)?;
     let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
-    // every trade in time order: (ts, curve index or pool index)
-    let mut events: Vec<(i64, bool, usize)> = Vec::with_capacity(c.ticks.len() + c.pool.len());
-    events.extend(c.ticks.iter().enumerate().map(|(i, x)| (x.ts, false, i)));
-    events.extend(c.pool.iter().enumerate().map(|(i, x)| (x.ts, true, i)));
-    events.sort_by_key(|e| (e.0, e.1));
-    let value_of = |is_pool: bool, i: usize| -> u64 {
-        if is_pool {
-            pool_value(&c.pool[i], pos.tokens)
-        } else {
-            pos.value(&c.ticks[i])
-        }
-    };
+    let events = events_of(c);
+    let value_of = |is_pool: bool, i: usize| -> u64 { event_value(c, &pos, is_pool, i) };
     // the value a sell landing at `ts` gets: the last trade at or before it
-    let value_at = |ts: i64| -> (i64, u64, bool) {
-        let n = events.partition_point(|e| e.0 <= ts);
-        if n == 0 {
-            return (entry_ts, pos.value(&c.at(entry_ts)), false);
-        }
-        let (ets, is_pool, i) = events[n - 1];
-        if !is_pool && c.graduated_ts.is_some_and(|g| g <= ts) {
-            // graduated, no pool trade yet: the pool as the curve left it
-            let pool = pool_after_graduation(with_us(c.ticks[i].state(), pos.input, pos.tokens));
-            return (
-                ets,
-                sell_quote_for_tokens(&pool, pos.tokens, AMM_FEE_BPS),
-                true,
-            );
-        }
-        (ets.max(entry_ts), value_of(is_pool, i), is_pool)
-    };
+    let value_at = |ts: i64| -> (i64, u64, bool) { value_with(c, &events, &pos, entry_ts, ts) };
     let mut st = State::default();
     let mut path = Trail::default();
     let mut fired: Vec<Option<i64>> = vec![None; rules.len()];

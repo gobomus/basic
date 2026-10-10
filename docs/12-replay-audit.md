@@ -165,3 +165,34 @@ The exits work on the winners: the SOL-leaving and bundle-out readings get out w
 ### 6.3 What this says
 
 Both sides are now metrics, both measured, and the launch tier on this tape is a round-trip cost on most fires with the upside on a quarter of them not covering it. The exit readings are right (they keep four-fifths of a winner's peak); the entry is what loses, because the first-minute book cannot tell the bundle that runs from the bundle that dumps. What the book does not show is who: 68% of the launches on this tape come from creators with two or more launches in 16 hours, 234 creators launched 20 or more, one launched 1,071. The creator index (prior launches and their outcomes per creator wallet, task #17) is the next entry reading, and the natural one: the same bundle from a creator whose last five coins ran is a different coin from the same bundle from a factory.
+
+## 7. The logged winners against the engine (2026-10-10, late night)
+
+*"If we run a backtest and compare to all the logged 100×, 1000× we have scanned for, how much of that does your metrics capture?"* Measured, every coin, on the trade tape (curve, then the pool for as long as it was followed; older tapes carry no pool SOL per trade, so for them the pool's SOL is taken as the curve's SOL at graduation scaled by the square root of the price, the constant-product relation). The state machine: entry = the first of the three entry readings to hold (20 SOL in the curve within 60 s; the second wave after the bundle has sold half; the organic coin with no real bundle), exit = a reading of the live state, re-entry = money flowing back in with new buyers and SOL back at its peak; 0.5 SOL a leg, fills 4 s after the deciding trade.
+
+The population: 27 standard coins reached $100k on 16.4 h of tape (the largest 132× from launch on tape, $1.21M at the checkpoints; none reached 1000×: a 1000× from a $3k launch is a $3M coin and there was none).
+
+| | result |
+|---|---|
+| the entry held on | **24 of 27** (89%), at 0–28 s on 21 of them, at a median $11k market cap |
+| never entered | 3: the slow burners (one 528× from launch) that show nothing inside the entries' 10-minute windows |
+| from the entry to the peak on tape | median **22×** (TM 67.8×, Altai 115×, Freddy 89.7×, Tschuna 108×) |
+| exit A, SOL in curve/pool ≤ 80% of its peak | 72 legs, median **32%** of each move kept, **+27.1 SOL** on the 24 |
+| exit B, money leaving or bundle out | 255 legs, 5% kept, +17.8 SOL |
+| exit C, holders falling or creator out | 190 legs, 22% kept, +11.8 SOL |
+| exit D, distribution: SOL leaving **and** money leaving **and** holders falling | 38 legs, median **78%** of each move kept, **+76.2 SOL** |
+
+("Kept" is log of the compounded multiple over log of the move from our entry to the tape peak.) Under D: TM 26.8× in two legs of a 67.8× move, Altai 13× of 115×, brigitte 17.4× of 27.3×, Jef 11× of 22.5×, Pepper 8.8× of 63×. The fast readings (A, B) sell every 20% pullback on the way up and buy back higher: ten legs on TM for 1.56×. A pullback and a distribution read the same on one metric; they read differently on three together, which is what the fingerprint in §6.1 showed (at the winners' −50% point all three had moved). The re-entries are not yet the multiplier you want: with D, 38 legs on 24 coins, most of the capture is the first leg; the resume reading comes back in late and gives some of it back.
+
+**The same rules on every coin the entry fires on** (1,572 coins, not only the 27):
+
+| exit | legs | coins net positive | SOL at 0.5 a leg | of which the 27 winners |
+|---|---:|---:|---:|---:|
+| A | 2,317 | 29% | **−45.3** | +27.1 |
+| B | 3,811 | 26% | −88.3 | +17.8 |
+| C | 3,259 | 28% | −77.9 | +11.8 |
+| D | 1,827 | 16% | **−143.2** | +76.2 |
+
+That is the engine's result, and the trade-off is now in numbers: the exit that keeps four-fifths of a runner's move holds the losers longest, and 1,548 coins at −0.14 SOL each outweigh 24 coins at +3.2 SOL each. To be positive with exit D the entry has to remove three of every four non-winners while keeping the winners; the first-minute book does not do that (§5), the first-minute wallet overlap does not (§5.3), and the creator index is the next reading to test.
+
+Everything above recomputes in every census run, on more tape each time.

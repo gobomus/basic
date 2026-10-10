@@ -825,6 +825,13 @@ fn exit_rules() -> Vec<ExitRule> {
             Box::new(ExitRule::MoneyLeaving(2.0)),
             Box::new(ExitRule::BundleOut(0.5)),
         ),
+        ExitRule::All(
+            Box::new(ExitRule::All(
+                Box::new(ExitRule::SolLeaving(0.8)),
+                Box::new(ExitRule::MoneyLeaving(2.0)),
+            )),
+            Box::new(ExitRule::HoldersFalling(0.9)),
+        ),
         ExitRule::Drawdown(0.5),
         ExitRule::None,
     ]
@@ -1054,6 +1061,239 @@ fn exit_section(
         o,
         "_Returns are on what we paid, after fees and our own impact on the curve (the pool sell is constant product against the pool's SOL at that trade, at the pool fee). \"Held\" is an outcome, not an input. \"Kept of the peak\" is the exit value over the best value seen before it, on rides that reached 2×. A ride the rule never closed is marked at the last trade on tape with the position still open._"
     );
+}
+
+/// The logged winners against the engine: for every standard coin that reached $100k,
+/// the full move on tape, the entry that fired and when, the move from there, and the
+/// state machine's legs with re-entry under two exit readings.
+fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Costs, sol_usd: f64) {
+    let _ = writeln!(
+        o,
+        "\n## The logged winners against the engine (every standard coin that reached $100k)\n"
+    );
+    let tape_ix: HashMap<&str, usize> = tape
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.mint.as_str(), i))
+        .collect();
+    let mut big: Vec<&Coin> = coins
+        .iter()
+        .copied()
+        .filter(|c| c.peak_usd() >= 100e3 && tape_ix.contains_key(c.mint.as_str()))
+        .collect();
+    big.sort_by(|a, b| b.peak_usd().total_cmp(&a.peak_usd()));
+    if big.is_empty() {
+        let _ = writeln!(o, "_No such coin with its trades on tape yet._");
+        return;
+    }
+    let entry = EntryRule::Any(vec![
+        EntryRule::Signal(Signal::simple(20.0, 0, 0, 60)),
+        EntryRule::SecondWave {
+            max_bundle_left: 0.5,
+            min_sol_vs_peak: 0.9,
+            min_new_buyers_w: 15,
+            min_net_sol: 15.0,
+            within_s: 600,
+        },
+        EntryRule::Organic {
+            max_bundle_share: 0.02,
+            min_holders: 30,
+            min_new_buyers_w: 10,
+            within_s: 600,
+        },
+    ]);
+    let reentry = EntryRule::Resume {
+        min_buy_ratio: 2.0,
+        min_new_buyers_w: 10,
+        min_sol_vs_peak: 0.9,
+    };
+    let exits = [
+        ExitRule::SolLeaving(0.8),
+        ExitRule::Either(
+            Box::new(ExitRule::MoneyLeaving(2.0)),
+            Box::new(ExitRule::BundleOut(0.5)),
+        ),
+        ExitRule::Either(
+            Box::new(ExitRule::HoldersFalling(0.9)),
+            Box::new(ExitRule::DevOut(0.5)),
+        ),
+        ExitRule::All(
+            Box::new(ExitRule::All(
+                Box::new(ExitRule::SolLeaving(0.8)),
+                Box::new(ExitRule::MoneyLeaving(2.0)),
+            )),
+            Box::new(ExitRule::HoldersFalling(0.9)),
+        ),
+    ];
+    let _ = writeln!(
+        o,
+        "- entry: the first of **{}** to hold; re-entry after an exit: **{}**; exits A: **{}**, B: **{}**, C: **{}**, D (distribution, all three readings together): **{}**; {} SOL a leg, fills {} s after the deciding trade; the path is the trade tape (curve, then the pool while it was followed), the checkpoint peak is Jupiter's liquidity-backed reading up to 24 h",
+        entry.label(),
+        reentry.label(),
+        exits[0].label(),
+        exits[1].label(),
+        exits[2].label(),
+        exits[3].label(),
+        k.size_lamports as f64 / 1e9,
+        k.delay_s
+    );
+    let _ = writeln!(
+        o,
+        "\n| coin | peak at checkpoints | path on tape | launch → tape peak | entry held at | entry mcap | entry → tape peak | ride to the end | A: legs, compounded, kept of the move | B | C | D |"
+    );
+    let _ = writeln!(
+        o,
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|"
+    );
+    let mut sums: Vec<(usize, f64, Vec<f64>)> = vec![(0, 0.0, vec![]); exits.len()]; // legs, SOL, kept shares
+    let mut entered = 0usize;
+    let mut to_peak: Vec<f64> = vec![];
+    let mut details: Vec<String> = vec![];
+    for (rank, w) in big.iter().enumerate() {
+        let c = &tape[tape_ix[w.mint.as_str()]];
+        let launch = c.mcap_sol_at(c.created_ts).max(1e-9);
+        let tape_peak = c.peak_mcap_sol_after(c.created_ts - 1);
+        let entry_ts = c.entry_ts(&entry);
+        let name = if w.symbol.is_empty() {
+            &w.mint[..6]
+        } else {
+            &w.symbol
+        };
+        let Some(t) = entry_ts else {
+            let _ = writeln!(
+                o,
+                "| {name} | {} | {} | {:.0}× | **never** | | | | | | | |",
+                money(w.peak_usd()),
+                age(c.last_trade_age() * 1000),
+                tape_peak / launch
+            );
+            continue;
+        };
+        entered += 1;
+        let fill = t + k.delay_s;
+        let entry_mcap = c.mcap_sol_at(fill);
+        let from_entry = c.peak_mcap_sol_after(fill) / entry_mcap.max(1e-9);
+        to_peak.push(from_entry);
+        let hold = replay::legs(c, &entry, &reentry, &ExitRule::None, k);
+        let hold_x = hold.first().map_or(f64::NAN, |l| 1.0 + l.ret);
+        let mut cells = vec![];
+        for (x, exit) in exits.iter().enumerate() {
+            let legs = replay::legs(c, &entry, &reentry, exit, k);
+            let compounded: f64 = legs.iter().map(|l| 1.0 + l.ret).product();
+            let kept = if from_entry > 1.0 && compounded > 0.0 {
+                (compounded.ln() / from_entry.ln()).max(0.0)
+            } else {
+                0.0
+            };
+            sums[x].0 += legs.len();
+            sums[x].1 += legs.iter().map(|l| l.ret).sum::<f64>() * k.size_lamports as f64 / 1e9;
+            sums[x].2.push(kept);
+            cells.push(format!(
+                "{} legs, **{:.2}×**, {:.0}%",
+                legs.len(),
+                compounded,
+                100.0 * kept
+            ));
+            if rank < 5 && x == 0 {
+                let mut d = format!("**{name}** (exit A): ");
+                for l in &legs {
+                    let _ = write!(
+                        d,
+                        "in {} @ {} → out {} @ {} ({}){} · ",
+                        age((l.entry_ts - c.created_ts) * 1000),
+                        money(l.entry_mcap_sol * sol_usd),
+                        age((l.exit_ts - c.created_ts) * 1000),
+                        money(l.exit_mcap_sol * sol_usd),
+                        pct(l.ret),
+                        if l.by_rule { "" } else { ", open at the end" }
+                    );
+                }
+                details.push(d.trim_end_matches(" · ").to_string());
+            }
+        }
+        let _ = writeln!(
+            o,
+            "| {name} | {} | {} | {:.0}× | {} | {} | **{:.1}×** | {:.2}× | {} | {} | {} | {} |",
+            money(w.peak_usd()),
+            age(c.last_trade_age() * 1000),
+            tape_peak / launch,
+            age((t - c.created_ts) * 1000),
+            money(entry_mcap * sol_usd),
+            from_entry,
+            hold_x,
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3]
+        );
+    }
+    let n = big.len();
+    let _ = writeln!(
+        o,
+        "\n- {n} coins; the entry held on **{entered}** ({:.0}%); from the entry to the tape peak: median **{:.1}×**",
+        100.0 * entered as f64 / n as f64,
+        median(&mut to_peak)
+    );
+    for x in 0..exits.len() {
+        let kept = median(&mut sums[x].2);
+        let _ = writeln!(
+            o,
+            "- exit {}: {} legs over the {entered} coins, **{:+.1} SOL** at {} SOL a leg, median share of each move kept **{:.0}%**",
+            ["A", "B", "C", "D"][x],
+            sums[x].0,
+            sums[x].1,
+            k.size_lamports as f64 / 1e9,
+            100.0 * kept
+        );
+    }
+    // the same rules on everything the entry fires on: the engine's result, not the winners'
+    let _ = writeln!(
+        o,
+        "\nThe same entry, re-entry and exits on **every** standard coin on tape, not only the winners (this is the engine's result; the ledger above is hindsight):\n"
+    );
+    let _ = writeln!(
+        o,
+        "| exit | coins entered | legs | coins net positive | SOL at {} a leg | of which the {n} winners above |",
+        k.size_lamports as f64 / 1e9
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|");
+    for (x, exit) in exits.iter().enumerate() {
+        let (mut coins_in, mut n_legs, mut positive, mut sol) = (0usize, 0usize, 0usize, 0.0f64);
+        for w in coins {
+            let Some(&i) = tape_ix.get(w.mint.as_str()) else {
+                continue;
+            };
+            let legs = replay::legs(&tape[i], &entry, &reentry, exit, k);
+            if legs.is_empty() {
+                continue;
+            }
+            coins_in += 1;
+            n_legs += legs.len();
+            let p: f64 = legs.iter().map(|l| l.ret).sum::<f64>() * k.size_lamports as f64 / 1e9;
+            positive += (p > 0.0) as usize;
+            sol += p;
+        }
+        let _ = writeln!(
+            o,
+            "| {} | {} | {} | {:.0}% | **{:+.1}** | {:+.1} |",
+            ["A", "B", "C", "D"][x],
+            coins_in,
+            n_legs,
+            100.0 * positive as f64 / coins_in.max(1) as f64,
+            sol,
+            sums[x].1
+        );
+    }
+    let _ = writeln!(
+        o,
+        "_\"Kept of the move\" is log(compounded) over log(entry → tape peak): 100% means the legs together caught the whole move from our entry to the peak, more than 100% means the re-entries caught more than one pass over it. The tape peak is what the engine could see; the checkpoint peak may be later than the tape._"
+    );
+    if !details.is_empty() {
+        let _ = writeln!(o, "\nThe five biggest, leg by leg:\n");
+        for d in details {
+            let _ = writeln!(o, "- {d}");
+        }
+    }
 }
 
 // ------------------------------------------------------------------ the report
@@ -1364,6 +1604,7 @@ pub fn report(
         .collect();
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
     exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
+    ledger_section(&mut o, tape, &standard, &k, sol_usd);
     o
 }
 
