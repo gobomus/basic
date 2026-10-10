@@ -36,7 +36,7 @@ cp config/poc.example.toml config/copybot.toml              # then add wallets u
 | [09 — Proxima & BasedBot deep dive](docs/09-proxima-basedbot-deep-dive.md) | Their full documented feature sets, mapped to copybot; what we won't build and why |
 | [10 — Engine v2 plan](docs/10-engine-v2-plan.md) | Audit of attempt 1 and of the wallet list, the coin lifecycle state machine (wallets + launches + trending as features), data/census plan, work orders with gates and costs, decisions needed |
 | [11 — What decides a trade](docs/11-trading-decisions-data.md) | What the first recorded launches say (pre-funded launches are the $100k coins; no round-number levels on the curve; early breadth), the feature catalogue by layer, the hypotheses and the data each needs, collection gaps, how runners are ridden |
-| [12 — Audit of the replays](docs/12-replay-audit.md) | What the replays test and cannot test, where the method was biased toward "no", the hold thesis measured directly, and what changes |
+| [12 — Audit of the replays](docs/12-replay-audit.md) | What the replays test and cannot test, where the method was biased toward "no", the hold thesis measured directly; §5 works backwards from the winners: the conventional practices discarded, the earliest signal (net SOL in the curve at 5 s, seven minutes before the lists), and what entering at it pays. The full `copybot winners` report: [reports/winners-2026-10-10.md](docs/reports/winners-2026-10-10.md) |
 | [RUNBOOK](RUNBOOK.md) | **Start here.** Path A: free proof of concept. Path B: server, providers, install, check, simulate, shadow, live |
 
 ## Layout

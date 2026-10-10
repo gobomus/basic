@@ -26,6 +26,7 @@ mod replay;
 mod replay_trend;
 mod report;
 mod tools;
+mod winners;
 
 use std::sync::Arc;
 
@@ -180,6 +181,31 @@ enum Cmd {
         /// Most positions open at once
         #[arg(long, default_value_t = 10)]
         max_open: usize,
+    },
+    /// Work backwards from the winners: what singles out the coins that reach $30k and
+    /// $100k at 5-300 s, how early, and what entering at that signal pays on the tape
+    Winners {
+        #[arg(long, default_value = "data/census")]
+        dir: String,
+        /// Where the trade tape (trades-*.jsonl.gz) is, if not under --dir
+        #[arg(long)]
+        trades: Option<String>,
+        /// Only coins created on this UTC day (YYYY-MM-DD)
+        #[arg(long)]
+        day: Option<String>,
+        /// SOL per trade in the signal-as-entry replay
+        #[arg(long, default_value_t = 0.5)]
+        size: f64,
+        /// Seconds from the signal until our transaction lands
+        #[arg(long, default_value_t = 4.0)]
+        delay: f64,
+        /// Network + priority fee per transaction, SOL
+        #[arg(long, default_value_t = 0.001)]
+        tx_cost: f64,
+        /// A leaders file (`[[leaders]] address = ...`): "a leader bought within 60 s" is
+        /// then tested as a signal too
+        #[arg(long)]
+        leaders: Option<String>,
     },
     /// Test entry and exit rules for the trending tier on the census's 5-minute captures
     /// (fills moved by size against the pool's liquidity; walk-forward; newest coins locked)
@@ -417,6 +443,29 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Cmd::Winners {
+            dir,
+            trades,
+            day,
+            size,
+            delay,
+            tx_cost,
+            leaders,
+        } => {
+            print!(
+                "{}",
+                winners::write(&winners::Args {
+                    dir: dir.into(),
+                    trades: trades.map(Into::into),
+                    day,
+                    size_sol: size,
+                    delay_s: delay,
+                    tx_cost_sol: tx_cost,
+                    leaders_file: leaders.map(Into::into),
+                })?
+            );
+            Ok(())
+        }
         Cmd::ReplayTrending {
             dir,
             size,
@@ -567,7 +616,8 @@ async fn main() -> anyhow::Result<()> {
                 | Cmd::Census { .. }
                 | Cmd::CensusReport { .. }
                 | Cmd::Replay { .. }
-                | Cmd::ReplayTrending { .. } => unreachable!(),
+                | Cmd::ReplayTrending { .. }
+                | Cmd::Winners { .. } => unreachable!(),
             }
         }
     }

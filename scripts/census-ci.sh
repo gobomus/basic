@@ -5,7 +5,7 @@
 #   census-ci.sh resume   pending checkpoints of the last successful run
 #   census-ci.sh record   record until 30 min before the job limit (CENSUS_MINUTES caps it)
 #   census-ci.sh report   the day's census report over this run and the last 8
-#   census-ci.sh replay   the strategy replay over the same runs' trades and books
+#   census-ci.sh replay   the winners analysis and the strategy replays over the same runs' trades and books
 #
 # resume, report and replay read earlier runs' artifacts with `gh` (GH_TOKEN).
 set -uo pipefail
@@ -65,6 +65,10 @@ replay)
         gh run download "$id" --name census-trades --dir "data/replay/$id" 2>/dev/null || true
         copy "data/all/$id" "data/replay/$id" -name micro.jsonl
     done
+    # working backwards from the winners: books, checkpoints and lists from data/all,
+    # the trade tape from data/replay
+    "$bin" winners --dir data/all --trades data/replay > winners.md || true
+    { echo; echo "---"; cat winners.md; } >> "$summary"
     "$bin" replay --dir data/replay > replay.md || true
     { echo; echo "---"; cat replay.md; } >> "$summary"
     # the trending tier: the 5-minute captures and checkpoints of the same runs

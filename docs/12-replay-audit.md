@@ -67,3 +67,63 @@ Next, in order:
 6. **Fewer, named hypotheses** instead of a 50,000-pair grid: each hypothesis in [11](11-trading-decisions-data.md) §4 gets its cohort table with intervals, and the grid search is kept for shape-finding only, with its multiple-comparison count printed next to every number it produces.
 
 What I will not change: the fees, the delay, the impact model and the no-lookahead rule. They are the reason a result here will survive contact with real money.
+
+## 5. Working backwards from the winners (2026-10-10, evening)
+
+Asked for after: *"The whole point of identifying trending and top runners each day is to find the metrics and data that singles them out at as early stage as possible, and THAT IS our entry. We should be in the coins within seconds of that signal. Now audit all the conventional junk we seem to have been contaminated with."*
+
+The order was wrong. The replays asked "which entry × exit pair makes money" before asking "who are the winners and what did they look like in their first seconds". That is the standard backtest template and it is the wrong order for this market, where a coin's future is decided in its first seconds by who shows up. `copybot winners` now does it in the right order, on the whole tape, every run: winners → fingerprint → earliest signal → what entering at that signal pays. The full report for the three Actions runs so far (33,378 coins, 16.4 h) is in [reports/winners-2026-10-10.md](reports/winners-2026-10-10.md).
+
+### 5.1 The conventional practices, named, and what replaces them
+
+| what was done | why it is wrong here | replaced by |
+|---|---|---|
+| Discovery by exit grid: 43,200 (curve) and 51,840 (trending) entry × exit pairs, the best lower bound wins | The exit grid cannot find a winner it never defined; it finds the exit that best fits noise | Winners defined first (liquidity-backed peak ≥ $30k, ≥ $100k), then fixed rules at 5–300 s with recall, precision (Wilson), lift and payoff. 17 rules, stated |
+| Decisions at fixed moments (15/30/60 s), fills 4 s later, holds ≤ 10 min | A signal does not wait for a snapshot; a runner is not held for ten minutes | The exact second a signal first holds on the trade tape, our fill `delay` later with our size in the curve, exits that hold the hour, ladder out, trail from the peak, no stop |
+| "Enters the trending top 20/100" as an entry | The list is where the crowd sees the coin; buying there is buying the pump | The lead is measured: the signal first holds at a median **2 s** after creation; the lists show the coin at a median **7 min** |
+| Verdicts at 95% confidence (§1) | A sample of 56 cannot see a 9% edge | Mean, interval, smallest visible edge, Wilson intervals on every proportion |
+| The label "doubles within the hour from the 15 s price" | A relative label on a collapsing price: 1,740 of the first pass's "winners" were Mayhem-mode coins whose market cap had fallen to 3 SOL by 60 s | Absolute, liquidity-backed labels; Mayhem-mode coins (28% of launches) segmented; pre-funded and insider-held coins left out |
+| Gates copied from papers ("lift ≥ 5× or the launch tier is dropped") | A gate on another study's label decides nothing about ours | No gates. A table per moment; the reader sees recall and precision and decides |
+| The wallet list taken as a signal | Never tested as one | Tested on the tape: the leaders buy a new coin within 60 s 19 times in 16 h, precision 5%. They are scalpers (31 s–3 min holds), not early buyers |
+| The best in-sample pair reported as a result | It is the best of 50,000 | Every table prints how many rules it chose from; the entry replay chooses nothing: every fire is a trade |
+
+### 5.2 What singles the winners out, and how early
+
+Standard coins (not Mayhem-mode, not pre-funded, not priced in another token): 21,592 with complete 5 s and 15 s books. 259 reached $30k (1.20%), 27 reached $100k (0.13%), 13 reached $250k, 1 reached $1M.
+
+The fingerprint at **5 s** (median, winners ≥ $30k against all coins): holders **24 vs 1**, buyers 30 vs 1, net SOL in the curve **21.8 vs 0.1**, new buyers in the last 5 s 18 vs 0, HHI 0.10 vs 0.38, market cap 83 SOL vs 28. The winners are visible in the first five seconds, and the thing that shows them is money: SOL in the curve.
+
+| moment | rule | fires/day | recall | precision ≥ $30k (95%) | lift | winners' median peak from there |
+|---|---|---:|---:|---|---:|---:|
+| 5 s | net SOL ≥ 20 | 718 | 54% | 28.7% [24.8–32.8] | 24× | 3.2× |
+| 5 s | net SOL ≥ 30 | 274 | 33% | **45.2%** [38.3–52.4] | 38× | 2.6× |
+| 15 s | net SOL ≥ 30 | 369 | 47% | 48.2% [42.1–54.4] | 40× | 2.6× |
+| 60 s | net SOL ≥ 30 | 384 | 54% | 53.6% [47.6–59.5] | 45× | 1.9× |
+| 300 s | net SOL ≥ 30 | 366 | 58% | 60.2% [54.0–66.0] | 50× | 1.6× |
+
+For 257 of the 259 winners the rule "net SOL ≥ 20" first holds at a median of **2 s** after creation. The first checkpoint reading ≥ $30k is at a median of 5 min; the first appearance on any trending list at a median of 7 min (and 41% of the winners never list at all). The engine's lead over the crowd is about seven minutes. That part of the thesis holds.
+
+Where it does not: the **$100k class**. The best first-minute rule reaches 4.8–5.7% precision for ≥ $100k (lift 38–45×, but 1 in 20). The ≥ $100k coins' fingerprint at 5 s is *weaker* than the $30k–$100k coins' (16 holders vs 24, 11 new buyers vs 18): the biggest winners are not the most explosive first seconds. A third of them show nothing in the first minute at all (3–6 holders at 15 s; net SOL ≥ 20 only at 2–30 min) and are first visible at the 5–30 min stage. No rule on the first-minute book gets near a 50/50 chance of $100k; the book alone does not give that target.
+
+### 5.3 What entering at the signal pays
+
+The entry replay: the exact second each signal first holds, our 0.5 SOL buy landing 4 s later, our size in the curve, fees as recorded, every fire a trade. 9 signals × 5 exits, fixed before looking.
+
+| signal | fires/day | entry | hold to 1 h, no stop | ladder ½ at 2×, ¼ at 4× | trail 50% from peak | stop −50% |
+|---|---:|---:|---|---|---|---|
+| net SOL ≥ 20 within 60 s (1,199 fires) | 1,750 | $9k | **−18.8%** (−25.3 to −12.3) | −15.7% (−20.5 to −10.8) | −14.3% (−19.5 to −9.2) | −16.7% |
+| net SOL ≥ 30 within 60 s (610 fires) | 890 | $13k | **−16.6%** (−25.3 to −8.0) | −14.7% (−21.8 to −7.6) | −14.4% (−21.2 to −7.7) | −15.9% |
+| net SOL ≥ 20 & holders ≥ 30 within 60 s (955) | 1,394 | $10k | −15.8% (−23.4 to −8.1) | −13.8% (−19.5 to −8.1) | **−11.4%** (−17.5 to −5.3) | −13.0% |
+
+All 60 pairs are negative, every interval excludes zero, both chronological halves agree, and a bankroll run from 1 SOL at 10% a trade goes to zero. The reason is in the detector table: the signal is already priced. Twenty to thirty SOL in the curve is a $9–13k coin; $30k is 2.6–3.2× away, and that is the winners' *median peak*, not their exit. The other 55–70% of fires sit at −70% an hour later (losers' median 0.2–0.3×). A 29–45% hit rate on a 2–3× peak does not pay for a 70% loss on the rest, with any exit inside the hour.
+
+**Beyond the hour**, which is where the thesis lives: the 6 h checkpoint column. For net SOL ≥ 20 at 5 s, the 67 fires old enough to have one average **+95% (±259%)**, median −72%, 9% at or above 2×. For net SOL ≥ 30: +240% (±540%) on 32. One coin (TM: $18k at 15 s, $1.2M peak) is most of each mean. The sample cannot tell +95% from −50%. What it says is that the hold-for-hours thesis stands or falls on how often a 50–100× coin comes, which 16 hours cannot measure and days can: the Actions census takes 6 h checkpoints across runs (the resume works) and 24 h ones from tomorrow, and the table recomputes every run with its interval.
+
+**Wallets**: early buyers of the first-half winners that are *selective* (≥ 2 winners, ≥ 25% of their early buys winners; the bots that buy every launch are excluded) give, on the second half, 9.5% [7.6–11.7] precision for ≥ $30k (lift 12×, recall 85%) and 1.0% for ≥ $100k. Weaker than SOL-in-curve alone, and negative in the entry replay (−10 to −17%). The leaders file: 19 fires, 5%. Who is behind the bundle is still the open discriminator, and the first-minute wallet overlap does not capture it; the creator index (prior launches per creator wallet) is the next test.
+
+### 5.4 What changes
+
+1. **The entry is a signal, not a list.** "Net SOL ≥ 20–30 within 60 s" is the launch-tier trigger the state machine watches: it holds at a median 2 s after creation, seven minutes before the trending lists, and 29–45% of its fires become $30k coins. Nothing else on the first-minute book adds to it.
+2. **The first-hour trade from that signal is a measured loser at every exit and is not traded**, shadow or live. Not "unproven": −11 to −19% per trade with intervals that exclude zero.
+3. **What stays open, free, and now measured every run:** (a) the multi-hour hold from the signal (the 6 h and 24 h columns, with intervals; it is tradeable the day the interval excludes zero on the upside, not before); (b) the slow-burners' stage at 5–30 min, before the lists (holders and net SOL rising while the market cap is still under $10k) — the trending tier's early trigger, change 5 of §4; (c) the creator index, task #17.
+4. `copybot winners` runs in every Actions census; the replays stay as shape-finders and are read as such.

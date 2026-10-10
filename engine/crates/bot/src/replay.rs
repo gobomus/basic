@@ -62,6 +62,11 @@ struct Tick {
     rsol: u64,
     rtok: u64,
     fee_bps: u64,
+    buy: bool,
+    /// hash of the trading wallet
+    user: u64,
+    /// tokens traded (base units)
+    tok: u64,
 }
 
 impl Tick {
@@ -75,7 +80,14 @@ impl Tick {
             rsol: 0,
             rtok: START_VTOK - VIRTUAL_TOKEN_OFFSET,
             fee_bps: DEFAULT_FEE_BPS,
+            buy: false,
+            user: 0,
+            tok: 0,
         }
+    }
+    /// Market cap in SOL (1e9 tokens of 1e6 units at the curve's spot price).
+    fn mcap_sol(&self) -> f64 {
+        self.vsol as f64 / self.vtok.max(1) as f64 * 1e6
     }
     fn state(&self) -> CurveState {
         CurveState {
@@ -151,7 +163,122 @@ pub struct Coin {
     pub feats: HashMap<i64, Feat>,
 }
 
+/// A live signal: the first trade after which every condition holds, within `within_s`
+/// of the create. Net SOL is the SOL in the curve (buys minus sells, fees aside);
+/// holders are wallets with a positive balance; buyers are distinct buying wallets.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signal {
+    pub min_net_sol: f64,
+    pub min_holders: usize,
+    pub min_buyers: usize,
+    pub within_s: i64,
+    /// wallets whose buys count toward `min_known` (hashes, see `wallet_hash`)
+    pub known: std::collections::HashSet<u64>,
+    pub min_known: usize,
+    /// what the known wallets are called in the report
+    pub known_label: String,
+}
+
+impl Signal {
+    pub fn simple(min_net_sol: f64, min_holders: usize, min_buyers: usize, within_s: i64) -> Self {
+        Self {
+            min_net_sol,
+            min_holders,
+            min_buyers,
+            within_s,
+            known: Default::default(),
+            min_known: 0,
+            known_label: String::new(),
+        }
+    }
+    /// At least `min_known` of the `known` wallets have bought within `within_s`.
+    pub fn wallets(
+        known: std::collections::HashSet<u64>,
+        min_known: usize,
+        within_s: i64,
+        label: &str,
+    ) -> Self {
+        Self {
+            known,
+            min_known,
+            known_label: label.to_string(),
+            ..Self::simple(0.0, 0, 0, within_s)
+        }
+    }
+    pub fn label(&self) -> String {
+        let mut v = vec![];
+        if self.min_net_sol > 0.0 {
+            v.push(format!("net SOL ≥ {}", self.min_net_sol));
+        }
+        if self.min_holders > 0 {
+            v.push(format!("holders ≥ {}", self.min_holders));
+        }
+        if self.min_buyers > 0 {
+            v.push(format!("buyers ≥ {}", self.min_buyers));
+        }
+        if self.min_known > 0 {
+            v.push(format!("{} ≥ {} bought", self.known_label, self.min_known));
+        }
+        format!("{} within {} s", v.join(" & "), self.within_s)
+    }
+}
+
 impl Coin {
+    /// Block time of the first trade after which `s` holds, if any within its window.
+    pub fn signal_ts(&self, s: &Signal) -> Option<i64> {
+        let mut bal: HashMap<u64, i128> = HashMap::new();
+        let mut buyers: std::collections::HashSet<u64> = Default::default();
+        let mut holders = 0usize;
+        let mut known: std::collections::HashSet<u64> = Default::default();
+        for x in &self.ticks {
+            if x.ts - self.created_ts > s.within_s {
+                return None;
+            }
+            if x.buy && s.min_known > 0 && s.known.contains(&x.user) {
+                known.insert(x.user);
+            }
+            let b = bal.entry(x.user).or_insert(0);
+            let before = *b > 0;
+            *b += if x.buy {
+                x.tok as i128
+            } else {
+                -(x.tok as i128)
+            };
+            let after = *b > 0;
+            holders = (holders + after as usize).saturating_sub(before as usize);
+            if x.buy {
+                buyers.insert(x.user);
+            }
+            if x.rsol as f64 / LAMPORTS >= s.min_net_sol
+                && holders >= s.min_holders
+                && buyers.len() >= s.min_buyers
+                && known.len() >= s.min_known
+            {
+                return Some(x.ts);
+            }
+        }
+        None
+    }
+    /// Distinct wallets that bought within `within_s` of the create (hashes).
+    pub fn early_buyers(&self, within_s: i64) -> Vec<u64> {
+        let mut v: Vec<u64> = self
+            .ticks
+            .iter()
+            .take_while(|x| x.ts - self.created_ts <= within_s)
+            .filter(|x| x.buy)
+            .map(|x| x.user)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    /// Market cap in SOL at block time `ts`.
+    pub fn mcap_sol_at(&self, ts: i64) -> f64 {
+        self.at(ts).mcap_sol()
+    }
+    pub fn trades(&self) -> usize {
+        self.ticks.len()
+    }
     /// The curve as it was at block time `ts` (after the last trade at or before it).
     fn at(&self, ts: i64) -> Tick {
         let i = self.ticks.partition_point(|t| t.ts <= ts);
@@ -177,6 +304,17 @@ struct TapeRow {
     rtok: Option<u64>,
     fee_bps: Option<u64>,
     quote: Option<String>,
+    buy: Option<bool>,
+    user: Option<String>,
+    tok: Option<u64>,
+}
+
+/// The tape keeps wallets as 64-bit hashes; the map from `load_with_wallets` names them.
+pub fn wallet_hash(user: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    user.hash(&mut h);
+    h.finish()
 }
 
 fn files(dir: &Path, keep: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
@@ -210,7 +348,17 @@ fn day_of_secs(ts: i64) -> String {
 /// Every coin whose create, trades and books are on the tape under `dir`, created on
 /// a day in `[from, to]` (UTC, inclusive; `None` = no bound).
 pub fn load(dir: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<Vec<Coin>> {
+    Ok(load_with_wallets(dir, from, to)?.0)
+}
+
+/// `load`, plus the wallets seen trading, by hash.
+pub fn load_with_wallets(
+    dir: &Path,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> anyhow::Result<(Vec<Coin>, HashMap<u64, String>)> {
     let mut coins: HashMap<String, Coin> = HashMap::new();
+    let mut wallets: HashMap<u64, String> = HashMap::new();
     let mut seq = 0u64;
     for p in files(dir, &|n| {
         n.starts_with("trades-") && n.ends_with(".jsonl.gz")
@@ -237,6 +385,10 @@ pub fn load(dir: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<
                         q != "So11111111111111111111111111111111111111112"
                             && q != "11111111111111111111111111111111"
                     });
+                    let user = row.user.as_deref().map(wallet_hash).unwrap_or(0);
+                    if let Some(u) = row.user.as_deref() {
+                        wallets.entry(user).or_insert_with(|| u.to_string());
+                    }
                     c.ticks.push(Tick {
                         ts: row.ts,
                         slot: row.slot,
@@ -248,6 +400,9 @@ pub fn load(dir: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<
                             .rtok
                             .unwrap_or(vtok.saturating_sub(VIRTUAL_TOKEN_OFFSET)),
                         fee_bps: row.fee_bps.unwrap_or(DEFAULT_FEE_BPS),
+                        buy: row.buy.unwrap_or(false),
+                        user,
+                        tok: row.tok.unwrap_or(0),
                     });
                 }
                 _ => {}
@@ -286,7 +441,7 @@ pub fn load(dir: &Path, from: Option<&str>, to: Option<&str>) -> anyhow::Result<
         })
         .collect();
     out.sort_by_key(|c| c.created_ts);
-    Ok(out)
+    Ok((out, wallets))
 }
 
 // ------------------------------------------------------------------ one trade
@@ -376,8 +531,18 @@ impl Trade {
 
 /// Buy at `t` s after creation (landing `delay` later) and sell by `exit`.
 pub fn simulate(c: &Coin, t: i64, exit: &Exit, k: &Costs) -> Option<Trade> {
+    simulate_from(c, c.created_ts + t + k.delay_s, exit, k)
+}
+
+/// Our position: `input` lamports in the curve, `tokens` out of it, bought at `entry_ts`.
+struct Position {
+    input: u64,
+    tokens: u64,
+    end: i64,
+}
+
+fn open(c: &Coin, entry_ts: i64, k: &Costs) -> Option<Position> {
     let end = c.created_ts + WINDOW_SECS;
-    let entry_ts = c.created_ts + t + k.delay_s;
     if entry_ts >= end || c.graduated_ts.is_some_and(|g| g <= entry_ts) {
         return None;
     }
@@ -386,9 +551,44 @@ pub fn simulate(c: &Coin, t: i64, exit: &Exit, k: &Costs) -> Option<Trade> {
     if tokens == 0 {
         return None;
     }
-    let input = curve_input(k.size_lamports, at_entry.fee_bps);
-    let value_at =
-        |x: &Tick| sell_quote_for_tokens(&with_us(x.state(), input, tokens), tokens, x.fee_bps);
+    Some(Position {
+        input: curve_input(k.size_lamports, at_entry.fee_bps),
+        tokens,
+        end,
+    })
+}
+
+impl Position {
+    /// What selling the whole position into the curve as it is at `x` would return.
+    fn value(&self, x: &Tick) -> u64 {
+        sell_quote_for_tokens(
+            &with_us(x.state(), self.input, self.tokens),
+            self.tokens,
+            x.fee_bps,
+        )
+    }
+    /// A sell landing at `fill_ts`: when it fills, what it returns, and whether the coin
+    /// had graduated by then (then it sells into the pool at the final curve price).
+    fn close(&self, c: &Coin, fill_ts: i64) -> (i64, u64, bool) {
+        let fill_ts = fill_ts.min(self.end);
+        match c.graduated_ts.filter(|g| *g <= fill_ts) {
+            Some(g) => {
+                let pool = pool_after_graduation(with_us(c.at(g).state(), self.input, self.tokens));
+                (
+                    g,
+                    sell_quote_for_tokens(&pool, self.tokens, AMM_FEE_BPS),
+                    true,
+                )
+            }
+            None => (fill_ts, self.value(&c.at(fill_ts)), false),
+        }
+    }
+}
+
+/// Buy with a fill at block time `entry_ts` and sell by `exit`.
+pub fn simulate_from(c: &Coin, entry_ts: i64, exit: &Exit, k: &Costs) -> Option<Trade> {
+    let pos = open(c, entry_ts, k)?;
+    let end = pos.end;
     let cost = (k.size_lamports + k.tx_lamports) as i64;
     let size = k.size_lamports as f64;
     let deadline = (entry_ts + exit.max_hold).min(end);
@@ -399,7 +599,7 @@ pub fn simulate(c: &Coin, t: i64, exit: &Exit, k: &Costs) -> Option<Trade> {
         if x.ts > deadline {
             break;
         }
-        let v = value_at(x) as f64;
+        let v = pos.value(x) as f64;
         peak = peak.max(v);
         let r = v / size - 1.0;
         let why = if exit.tp.is_some_and(|tp| r >= tp) {
@@ -421,20 +621,88 @@ pub fn simulate(c: &Coin, t: i64, exit: &Exit, k: &Costs) -> Option<Trade> {
     } else {
         (deadline, Why::Time)
     });
-    let fill_ts = (when + k.delay_s).min(end);
-    let (exit_ts, value) = match c.graduated_ts.filter(|g| *g <= fill_ts) {
-        Some(g) => {
-            why = Why::Graduated;
-            let pool = pool_after_graduation(with_us(c.at(g).state(), input, tokens));
-            (g, sell_quote_for_tokens(&pool, tokens, AMM_FEE_BPS))
-        }
-        None => (fill_ts, value_at(&c.at(fill_ts))),
-    };
+    let (exit_ts, value, graduated) = pos.close(c, when + k.delay_s);
+    if graduated {
+        why = Why::Graduated;
+    }
     Some(Trade {
         entry_ts,
         exit_ts,
         cost,
         proceeds: value as i64 - k.tx_lamports as i64,
+        why,
+    })
+}
+
+/// Buy with a fill at `entry_ts`; sell each leg (share of the position) the first time
+/// the position is worth its multiple of what we paid, the rest at `max_hold` or the
+/// end of the tape; no stop. Each partial sell is valued as that share of the whole
+/// position's sell value at its fill (exact for small sizes).
+pub fn ladder_from(
+    c: &Coin,
+    entry_ts: i64,
+    legs: &[(f64, f64)],
+    max_hold: i64,
+    k: &Costs,
+) -> Option<Trade> {
+    let pos = open(c, entry_ts, k)?;
+    let end = pos.end;
+    let size = k.size_lamports as f64;
+    let deadline = (entry_ts + max_hold).min(end);
+    let first = c.ticks.partition_point(|x| x.ts <= entry_ts);
+    let mut left = 1.0f64;
+    let mut sold = 0f64;
+    let mut sells = 0u64;
+    let mut done = vec![false; legs.len()];
+    let mut exit_ts = entry_ts;
+    let mut why = Why::Time;
+    'ticks: for x in &c.ticks[first..] {
+        if x.ts > deadline {
+            break;
+        }
+        let v = pos.value(x) as f64;
+        for (i, (mult, share)) in legs.iter().enumerate() {
+            if done[i] || v < mult * size {
+                continue;
+            }
+            done[i] = true;
+            let (ts, value, graduated) = pos.close(c, x.ts + k.delay_s);
+            let share = share.min(left);
+            sold += share * value as f64;
+            left -= share;
+            sells += 1;
+            exit_ts = ts;
+            if graduated {
+                // the pool takes everything we still hold at the final curve price
+                sold += left * value as f64;
+                left = 0.0;
+                why = Why::Graduated;
+                break 'ticks;
+            }
+            if left <= 1e-9 {
+                why = Why::TakeProfit;
+                break 'ticks;
+            }
+        }
+    }
+    if left > 1e-9 {
+        let (ts, value, graduated) = pos.close(c, deadline + k.delay_s);
+        sold += left * value as f64;
+        sells += 1;
+        exit_ts = ts;
+        why = if graduated {
+            Why::Graduated
+        } else if deadline >= end {
+            Why::TapeEnd
+        } else {
+            Why::Time
+        };
+    }
+    Some(Trade {
+        entry_ts,
+        exit_ts,
+        cost: (k.size_lamports + k.tx_lamports) as i64,
+        proceeds: sold as i64 - (sells * k.tx_lamports) as i64,
         why,
     })
 }
@@ -1169,6 +1437,9 @@ mod tests {
                 rsol: vsol - START_VSOL,
                 rtok: vtok - VIRTUAL_TOKEN_OFFSET,
                 fee_bps: 125,
+                buy: true,
+                user: 1,
+                tok: 0,
             });
         }
         c.feats.insert(

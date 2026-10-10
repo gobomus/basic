@@ -124,6 +124,15 @@ Files go to `data/census/<UTC day>/`. Pending checkpoints are saved to `data/cen
 **Running it around the clock for free:** the `census` workflow (`.github/workflows/census.yml`) records for 5 h 45 min every 6 hours, carries the pending checkpoints from run to run, keeps each run's recording for 90 days, and puts the day's report on each run's summary page; the trade tape is kept 14 days as a separate artifact (`census-trades`). Like the other workflows, it runs on schedule only once the file is on the default branch. GitHub's scheduled runs can start late or be skipped when GitHub is busy, so expect small gaps; a $5–15/month server running `copybot census` as a service has none. Size per day: about 0.5 GB uncompressed for the checkpoints, lists and books (a quarter of that zipped) plus about 1 GB of trade tape. Coins created in the last hour of a run get no complete outcome (the stream is not carried between runs), so about one in six is left out of the trade-stream tables on Actions; a server loses none.
 
 ## A6. Test strategies on the tape (replay)
+
+**Start with the winners.** Before any rule search, see who the day's winners were, what singled them out in their first seconds, how far ahead of the trending lists that signal is, and what entering at it would have paid:
+```bash
+copybot winners --dir data/census                          # books, checkpoints, lists and trades under one folder
+copybot winners --dir data/all --trades data/replay        # tape folders split the way the Actions census keeps them
+copybot winners --dir data/census --leaders config/leaders.local.toml --size 0.5 --delay 4
+```
+It prints, for standard coins (Mayhem-mode coins separately; pre-funded and insider-held ones left out): the base rates (reached $30k, $100k in liquidity-backed market cap); each day's top 10 by peak with when the signal first held, when the coin first listed and its 15 s book; the winners' fingerprint against all coins at 5, 15 and 60 s; a detector table (fixed rules × moments: fires per day, recall, precision with its interval, lift, the winners' peak from that moment, and every fire held to 1 h, 6 h and 24 h); which wallets were in the first minute of several winners and whether that repeats on the second half of the tape; and the signal-as-entry replay (the exact second each signal first held on the trade tape, our fill `--delay` later, hold the hour / ladder / trail / stop, with intervals and the smallest edge the sample can see). Every fire is a trade; nothing is picked, so there is no holdout. The report is also written to `<dir>/winners/report.md`.
+
 Every coin's first hour is on the tape trade by trade, so a buying rule can be tested on it before any money is at risk:
 ```bash
 copybot replay --dir data/census                          # 0.25 SOL a trade, our transactions land 4 s late
@@ -148,7 +157,7 @@ copybot replay-trending --dir data/census --size 5         # 5 SOL a trade; fill
 ```
 Entries trigger when a coin enters the 1 h trending or organic list (top 20 / top 100) or ranks in the 5-minute top 20, filtered on liquidity, age, organic score, holder concentration, net buyers and buy/sell flow; exits are the same take-profit / stop / trailing / time set, checked at every later capture. A coin's path continues after it leaves the lists (the recorder keeps pricing it for a day); one that still never prices again is sold at its last price less `--delist-haircut` (30%) and counted as `delisted`. The size table shows where the pool's depth caps a position. Same walk-forward and holdout rules as above.
 
-The `census` workflow runs both replays over its last runs and adds them to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
+The `census` workflow runs `winners` and both replays over its last runs and adds them to each summary page (the version of the workflow that calls `scripts/census-ci.sh`).
 
 ## RPC options (all free)
 | | Limits | Notes |
