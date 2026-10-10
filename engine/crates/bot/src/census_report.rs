@@ -653,6 +653,107 @@ fn lift_table(
     out
 }
 
+/// The hold thesis tested the direct way on the first hour: buy a cohort at the 15 s
+/// book, hold the hour with no stop, or ladder out (half at 2×, a quarter at 4×, the
+/// rest at the hour). No rule search; intervals shown. Fee 1.25% a side.
+fn hold_thesis(outcomes: &[Value], snaps: &HashMap<String, Value>) -> String {
+    const FEE: f64 = 0.0125;
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "\n### The hold thesis, first hour: buy at the {MICRO_T} s book, no stop, hold the hour or ladder out"
+    );
+    let _ = writeln!(
+        o,
+        "| cohort at {MICRO_T} s | coins | peak ≥ 2× | ≥ 3× | ≥ 5× | at 1 h ≥ entry | at 1 h ≤ −50% | hold the hour: mean | ladder (½ at 2×, ¼ at 4×, rest at 1 h): mean (95% interval) |"
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    // (snapshot, peak multiple, last multiple) per usable coin
+    let rows: Vec<(&Value, f64, f64)> = outcomes
+        .iter()
+        .filter(|r| r["full_window"] == true && r["quote"].is_null())
+        .filter_map(|r| {
+            let snap = snaps.get(r["mint"].as_str()?)?;
+            if snap["gap_ms"].as_i64() != Some(0) {
+                return None;
+            }
+            let at = r["mcap_at"][MICRO_I].as_f64().filter(|m| *m > 0.0)?;
+            let peak = r["peak_after"][MICRO_I].as_f64()?;
+            let last = r["final_mcap_sol"].as_f64().unwrap_or(0.0);
+            Some((snap, peak / at, last / at))
+        })
+        .collect();
+    let holders = |lo: u64, hi: u64| {
+        move |s: &Value| s["holders"].as_u64().is_some_and(|h| h >= lo && h < hi)
+    };
+    let (h10, h20, h30, h50) = (
+        holders(10, 20),
+        holders(20, 30),
+        holders(30, u64::MAX),
+        holders(50, u64::MAX),
+    );
+    let net5 = |s: &Value| s["net_sol"].as_f64().is_some_and(|x| x >= 5.0);
+    let all = |_: &Value| true;
+    let cohorts: Vec<Rule> = vec![
+        ("all coins", &all),
+        ("holders 10–19", &h10),
+        ("holders 20–29", &h20),
+        ("holders ≥ 30", &h30),
+        ("holders ≥ 50", &h50),
+        ("net SOL in ≥ 5", &net5),
+    ];
+    for (label, pick) in cohorts {
+        let c: Vec<&(&Value, f64, f64)> = rows.iter().filter(|r| pick(r.0)).collect();
+        let n = c.len();
+        if n == 0 {
+            continue;
+        }
+        let share = |f: &dyn Fn(&(&Value, f64, f64)) -> bool| {
+            100.0 * c.iter().filter(|r| f(r)).count() as f64 / n as f64
+        };
+        let after_fees = |x: f64| x * (1.0 - FEE) * (1.0 - FEE) - 1.0;
+        let hold: Vec<f64> = c.iter().map(|r| after_fees(r.2)).collect();
+        let ladder: Vec<f64> = c
+            .iter()
+            .map(|r| {
+                let (peak, last) = (r.1, r.2);
+                let (mut out, mut left) = (0.0, 1.0);
+                if peak >= 2.0 {
+                    out += 0.5 * 2.0;
+                    left -= 0.5;
+                }
+                if peak >= 4.0 {
+                    out += 0.25 * 4.0;
+                    left -= 0.25;
+                }
+                after_fees(out + left * last)
+            })
+            .collect();
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (lm, hm) = (mean(&ladder), mean(&hold));
+        let sd =
+            (ladder.iter().map(|x| (x - lm).powi(2)).sum::<f64>() / (n.max(2) - 1) as f64).sqrt();
+        let ci = 1.96 * sd / (n as f64).sqrt();
+        let _ = writeln!(
+            o,
+            "| {label} | {n} | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0}% | {:+.1}% | {:+.1}% (±{:.1}%) |",
+            share(&|r| r.1 >= 2.0),
+            share(&|r| r.1 >= 3.0),
+            share(&|r| r.1 >= 5.0),
+            share(&|r| r.2 >= 1.0),
+            share(&|r| r.2 <= 0.5),
+            100.0 * hm,
+            100.0 * lm,
+            100.0 * ci
+        );
+    }
+    let _ = writeln!(
+        o,
+        "_One entry, two exits, every coin in the cohort, the whole first hour: what the strategy earns before any rule search. Hour two onward is on the pool candles, not here._"
+    );
+    o
+}
+
 /// The early-signal tables from the trade stream (exact first-minute books) and the
 /// WO-3 gate: does holders@15 s lift ≥ 5x and HHI ≥ 0.8 → ≈ 0% hold on the later half
 /// of the day's coins (chronological split: nothing from the later half was looked at
@@ -801,6 +902,8 @@ fn micro_section(
         ],
         base,
     );
+    o.push_str(&hold_thesis(outcomes, snaps));
+
     // the gate, judged on the later half only
     let later_lift = |b: &Bucket| {
         (b.late.0 > 0 && base.2 > 0.0).then(|| (b.late.1 as f64 / b.late.0 as f64) / base.2)

@@ -605,6 +605,23 @@ impl Score {
     pub fn lower(&self) -> f64 {
         self.mean() - 1.645 * self.sd() / (self.n as f64).sqrt()
     }
+    /// Half-width of the two-sided 95% interval: the smallest mean this sample could
+    /// tell from zero.
+    pub fn mde(&self) -> f64 {
+        1.96 * self.sd() / (self.n as f64).sqrt()
+    }
+    /// "mean +x% per trade (95% interval −a% to +b%); n trades; smallest edge this
+    /// sample can see: ±m%".
+    pub fn sentence(&self) -> String {
+        format!(
+            "mean {} per trade (95% interval {} to {}) on {} trades; the smallest edge this sample can see is ±{:.1}% per trade",
+            pct(self.mean()),
+            pct(self.mean() - self.mde()),
+            pct(self.mean() + self.mde()),
+            self.n,
+            100.0 * self.mde()
+        )
+    }
     pub fn pf(&self) -> f64 {
         if self.gross_loss > 0.0 {
             self.gross_win / self.gross_loss
@@ -882,10 +899,11 @@ pub fn run_on(coins: Vec<Coin>, a: &ReplayArgs) -> String {
             o,
             "| _no pair has {MIN_TRADES}+ trades yet_ | | | | | | | |"
         );
-    } else if in_sample[0].2.lower() <= 0.0 {
+    } else {
         let _ = writeln!(
             o,
-            "\n_Not one of the {} pairs is profitable at 95% confidence even on the data it was picked on._",
+            "\nThe best pair above: {}. Picked from {} pairs, so its mean is optimistic; the interval is what it is worth so far.",
+            in_sample[0].2.sentence(),
             entries.len() * exits.len()
         );
     }
@@ -1010,6 +1028,9 @@ pub fn run_on(coins: Vec<Coin>, a: &ReplayArgs) -> String {
             pct(hold_score.lower()),
             hold_score.pnl
         );
+    }
+    if oos_score.n > 1 {
+        let _ = writeln!(o, "- out of sample, {}", oos_score.sentence());
     }
     if oos_score.n < MIN_TRADES {
         let _ = writeln!(o, "_Too few out-of-sample trades to conclude anything; the recorder needs to run longer._");

@@ -790,10 +790,11 @@ pub fn run(a: &Args) -> String {
             "| _no pair has {}+ trades yet_ | | | | | | | | |",
             a.min_trades
         );
-    } else if top[0].2.lower() <= 0.0 {
+    } else {
         let _ = writeln!(
             o,
-            "\n_Not one of the {} pairs is profitable at 95% confidence even on the data it was picked on._",
+            "\nThe best pair above: {}. Picked from {} pairs, so its mean is optimistic; the interval is what it is worth so far.",
+            top[0].2.sentence(),
             entries.len() * exits.len()
         );
     }
@@ -900,6 +901,9 @@ pub fn run(a: &Args) -> String {
             pct(hold.lower()),
             hold.pnl
         );
+    }
+    if oos.n > 1 {
+        let _ = writeln!(o, "- out of sample, {}", oos.sentence());
     }
     if oos.n < MIN_TRADES {
         let _ = writeln!(o, "_Too few out-of-sample trades to conclude anything; the recorder needs to run longer._");
