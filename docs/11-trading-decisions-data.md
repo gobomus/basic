@@ -139,6 +139,7 @@ Status: **R** recorded since 2026-10-08, **A** added 2026-10-09, **–** not yet
 | | liquidity, volume, organic flow | Jupiter checkpoints | `checkpoints` | R |
 | L4 who is in it | known profitable wallets buying by t | needs the wallet table from the tape | – | – (task: wallet discovery) |
 | | attention: pump.fun live, DexScreener boosts/profiles, trending ranks | lists every 5 min; join by mint | `trending` | R |
+| | X mentions of the contract address: posts per 5 min, distinct authors, engagement, keyword polarity, KOL authors | search by mint address for coins in the trending universe only (~100–200 a day); TwitterAPI.io ≈ $0.15 per 1,000 posts, so ≈ $1–3 a day; X's own API is pay-per-read | – (gated: after the trending baseline, and only with a paid key) |
 
 ## 4. Hypotheses and their tests
 
@@ -156,9 +157,18 @@ Each test runs in `census-report` (daily, on all days) once the data exists; the
 | H8 | the market regime moves every base rate | `launches_10m`, `grads_1h`, SOL trend | base rate by regime bucket | position size by regime, or pausing |
 | H9 | known profitable wallets buying in the first minutes raise the odds | wallet table + `trades` | lift of "≥ 1 tracked wallet by t" | the W-source feature of the plan |
 | H10 | runners retrace 50–80% before their peak, so a fixed stop loses most of them | `candles` | for coins with peak ≥ 2× (and ≥ 5×): deepest drawdown between landing and the peak, as a distribution | the trailing width and the ladder (§6) |
+| H12 | X mentions of a coin's address rise before it enters the trending list, and the rise (not the level) separates the ones that go 1.5×+ from the ones that fade; author diversity tells bot farms from real attention | X mentions per CA (above) joined to the 5-minute trending path | lift tables of mentions and authors in the 30 min before first appearance vs peak ≥ 1.5×, chronological halves; marginal lift over the trending baseline without social data | whether the trending entry gets a social gate, and whether ~$1–3/day of post reads is worth paying |
 | H11 | the ~$40k pre-graduation sell wall is tradable (sell into it, or buy the dip after it) | `trades` | P(reversal) at 85–90% progress and the depth of the dip, by population | an exit rule on the curve |
 
 The report never tunes thresholds on the data it scores: buckets are fixed in advance (the ones in this document), the two chronological halves are shown side by side, and anything with fewer than 30 coins in a bucket is shown greyed.
+
+### On pairing an X-sentiment tool (asked 2026-10-10: brainstormity/Jev-X-Sentiment-Analysis)
+
+What it is: an on-demand web terminal for majors (BTC, SOL, ETH). Per search it pulls Kraken spot and futures data (price, RSI-14 on 48 hourly candles, funding rate, open interest), 50–1,000 posts for `$SYM OR Name` from TwitterAPI.io (≈ $0.15 per 1,000), computes keyword polarity (18 fear / 17 greed words), author diversity and engagement, picks 50 posts, and asks a hosted LLM four typed questions, printing a Buy/Sell/Hold card with fixed levels (stop −3.8%, targets +4.5% / +8.5%). No backtest, no outcome tracking; without keys it runs on simulated posts and a hand-written rule table.
+
+Why the code does not pair: it is built for assets with a ticker, a perpetuals market and a news flow, none of which a 20-minute-old pump.fun coin has; `$FOMO OR FOMO` is noise, Kraken lists none of our universe, funding rates do not exist, and a 10-minute cache and a per-symbol request model cannot serve 50,000 launches a day. The LLM decision card is an untested signal; in this project every feature gets a lift table and a walk-forward replay before it touches a trade.
+
+What is worth taking: the *question*. For the trending/established tier, attention is the driver, and X mentions of the **contract address** (not the symbol) are a plausible leading indicator we do not record: posts per 5 minutes, distinct authors (bot farms post the same CA from many accounts), engagement, and whether known KOL accounts posted. The pieces of that repo that transfer are concepts (engagement velocity, author diversity, stratified sampling), a few dozen lines when written against our tape. It is H12 above, gated on two things: the trending replay must exist first, so the social feature is measured as *marginal* lift over what the free lists already give (DexScreener boosts, pump.fun live, organic score, holder growth), and it costs money (≈ $1–3 a day for the trending universe), which under the $0 rule waits for a proven baseline or an explicit decision.
 
 ## 5. Collection gaps
 
