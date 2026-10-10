@@ -127,3 +127,41 @@ All 60 pairs are negative, every interval excludes zero, both chronological halv
 2. **The first-hour trade from that signal is a measured loser at every exit and is not traded**, shadow or live. Not "unproven": −11 to −19% per trade with intervals that exclude zero.
 3. **What stays open, free, and now measured every run:** (a) the multi-hour hold from the signal (the 6 h and 24 h columns, with intervals; it is tradeable the day the interval excludes zero on the upside, not before); (b) the slow-burners' stage at 5–30 min, before the lists (holders and net SOL rising while the market cap is still under $10k) — the trending tier's early trigger, change 5 of §4; (c) the creator index, task #17.
 4. `copybot winners` runs in every Actions census. The grid replays (`copybot replay`, `copybot replay-trending`), the walk-forward and holdout machinery around them, and the daily report's lift tables and WO-3 gate are **removed** from the code (2026-10-10, late evening: "fuck grids and conventional junk"). What remains of the replay code is the tape model: exact curve fills for our size, the recorded fee, our delay, and the signal's first-crossing time. There is no exit grid anywhere: the report shows what the coins do after the signal, at 1 h, 6 h and 24 h, and the riding policy is designed from that, not searched.
+
+## 6. The exit is a reading too (2026-10-10, night)
+
+*"Why would we hold based on some arbitrary hold times? We exit the coins based on metrics just as metrics is the base for entry."* Right. The 1 h / 6 h / 24 h columns describe the coins; they are not a policy. The exit side is now built the same way as the entry side: a live state the engine reads on every trade, on the curve and then in the pool for a day after graduation (money flow in the last minute, what the bundle and the creator still hold, holders against their peak, new buyers, SOL in the curve or pool against its peak), exit rules that are readings of that state, and the fingerprint worked backwards from the winners' peak to see which reading moves first.
+
+### 6.1 What the winners' peak looks like
+
+Entry "net SOL ≥ 20 within 60 s", 1,199 fires; winners are the 319 rides worth 2× or more at some point, losers the 509 that never saw +20%:
+
+| reading (median) | winners at the peak | winners 60 s after | winners at −50% from the peak | losers at −50% |
+|---|---:|---:|---:|---:|
+| age, s | 231 | 244 | 224 | 47 |
+| sells / buys in SOL, last 60 s | 0.56 | 1.59 | 1.48 | 0.94 |
+| bundle (first-5 s buyers) still holds | 0.27 | 0.11 | 0.20 | 0.24 |
+| creator still holds | 1.00 | 1.00 | 1.00 | 0.43 |
+| holders vs their peak | 1.00 | 0.90 | 0.91 | 0.64 |
+| SOL in curve/pool vs its peak | 1.00 | 0.63 | 0.54 | 0.29 |
+
+The bundle has already sold most of its tokens by the time a winner peaks (0.27 left): the run is made by the buyers who come after the bundle. After the peak, the first thing that moves is the SOL in the curve (down 37% within a minute) and the flow (sells 1.6× buys), before holders fall. Half the peak is gone a median 56 s after it, and a winner never sold keeps 27% of its peak value. For the second-wave entry (after the bundle has sold at least half), the creator's selling marks the top: the creator holds 1.00 at the peak and 0.01 a minute later.
+
+### 6.2 Entry signal × exit signal
+
+Every fire a trade, our 0.5 SOL fill 4 s after the entry's trade, the sell 4 s after the first trade at which the exit rule holds, curve or pool. Entry "net SOL ≥ 20 within 60 s":
+
+| exit | closed by the rule | held (median) | mean (±) | median | ≥ 2× | kept of the peak on winners |
+|---|---:|---:|---|---:|---:|---:|
+| SOL in curve/pool ≤ 80% of its peak | 97% | 7 s | **−6.3%** (±3%) | −9.3% | 3% | 83% |
+| money leaving \| bundle out | 96% | 15 s | −8.7% (±3%) | −12.1% | 4% | 81% |
+| holders ≤ 90% of their peak | 89% | 19 s | −8.5% (±4%) | −13.9% | 4% | 54% |
+| money leaving: sells ≥ 2× buys over 60 s | 79% | 2 min | −16.9% (±5%) | −50.0% | 8% | 52% |
+| price ≤ 50% of the peak | 82% | 69 s | −14.3% (±5%) | −43.4% | 7% | 50% |
+| ride to the end of the data | 0% | 20 min | −18.8% (±6%) | −62.9% | 11% | 27% |
+
+The exits work on the winners: the SOL-leaving and bundle-out readings get out with 80–83% of the peak. They cut the loss from −19% to −6% a trade. They do not make it positive, because 97% of the rides are closed by the rule, at a median 7 seconds, at about the round-trip cost: the money that fires the entry signal is the bundle, and the bundle leaves within seconds of our fill. The later stages read the same way: the second-wave entries (bundle ≤ 50% or ≤ 30% left, SOL near its peak, new buyers still coming; 867 and 323 fires) are at −5% to −15% whatever the exit, and the organic entry (bundle ≤ 2% of supply, 39 fires) at −4% to −30%.
+
+### 6.3 What this says
+
+Both sides are now metrics, both measured, and the launch tier on this tape is a round-trip cost on most fires with the upside on a quarter of them not covering it. The exit readings are right (they keep four-fifths of a winner's peak); the entry is what loses, because the first-minute book cannot tell the bundle that runs from the bundle that dumps. What the book does not show is who: 68% of the launches on this tape come from creators with two or more launches in 16 hours, 234 creators launched 20 or more, one launched 1,071. The creator index (prior launches and their outcomes per creator wallet, task #17) is the next entry reading, and the natural one: the same bundle from a creator whose last five coins ran is a different coin from the same bundle from a factory.

@@ -14,12 +14,14 @@
 //!   what holding every fire to the hour would have paid;
 //! * lead: when the signal first holds against when the coin first shows on a trending
 //!   list and when it first reads above the label;
-//! * after the signal: on the trade tape, the exact second each signal first holds,
-//!   our fill `delay` later with our size in the curve, and what the position is worth
-//!   at the end of the hour, at its peak, and at the 6 h and 24 h checkpoints.
+//! * the exit, worked backwards from the peak: what the live state (money flow, the
+//!   bundle and the creator selling, holders, new buyers, SOL in the curve or pool)
+//!   read at the winners' peak and as it went, then every entry signal with every
+//!   exit rule on the trade tape, curve and pool, every fire a trade. Exits are
+//!   readings of that state, never a clock.
 //!
 //! No grid. The rules are fixed before looking (a short list, stated), not searched;
-//! no exit is picked, so there is no holdout; the chronological halves of the detector
+//! nothing is picked, so there is no holdout; the chronological halves of the detector
 //! tables show whether a number holds over time.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -30,7 +32,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::census_report::age;
-use crate::replay::{self, hm, pct, recorded_hours, Costs, Signal};
+use crate::replay::{self, hm, pct, recorded_hours, Costs, EntryRule, ExitRule, Signal};
 
 /// Book moments looked at (seconds after creation).
 pub const T: [i64; 6] = [5, 15, 30, 60, 120, 300];
@@ -608,22 +610,6 @@ fn fingerprint(o: &mut String, coins: &[&Coin], w30: &HashSet<&str>, w100: &Hash
 
 // ------------------------------------------------------------------ the signal as the entry
 
-/// The signals replayed on the trade tape, fixed before looking.
-pub fn signals() -> Vec<Signal> {
-    let s = Signal::simple;
-    vec![
-        s(10.0, 0, 0, 60),
-        s(20.0, 0, 0, 15),
-        s(20.0, 0, 0, 60),
-        s(30.0, 0, 0, 60),
-        s(0.0, 30, 0, 60),
-        s(0.0, 50, 0, 120),
-        s(0.0, 0, 40, 60),
-        s(20.0, 30, 0, 60),
-        s(10.0, 20, 0, 30),
-    ]
-}
-
 struct Fire {
     coin: usize,
     signal_ts: i64,
@@ -790,50 +776,211 @@ fn wallet_section(
     out
 }
 
-/// What happens after the signal. Every fire is a trade: our fill `delay` after the
-/// signal's trade with our size in the curve, valued at the end of the first hour (a
-/// coin that graduates is sold into the pool at its final curve price), at its peak on
-/// the way, and at the 6 h and 24 h checkpoints (liquidity-backed market cap over the
-/// market cap we entered at, 0 once no pool backs it, both curve fees taken). No exit
-/// is searched or picked: the riding policy is designed from this table.
-fn entry_replay(
+/// The entries the exit side is worked on: the first-seconds signals, then the state
+/// machine's later stages, fixed before looking.
+fn entry_rules() -> Vec<EntryRule> {
+    vec![
+        EntryRule::Signal(Signal::simple(20.0, 0, 0, 60)),
+        EntryRule::Signal(Signal::simple(30.0, 0, 0, 60)),
+        EntryRule::Signal(Signal::simple(20.0, 30, 0, 60)),
+        EntryRule::SecondWave {
+            max_bundle_left: 0.5,
+            min_sol_vs_peak: 0.9,
+            min_new_buyers_w: 15,
+            min_net_sol: 15.0,
+            within_s: 600,
+        },
+        EntryRule::SecondWave {
+            max_bundle_left: 0.3,
+            min_sol_vs_peak: 0.95,
+            min_new_buyers_w: 25,
+            min_net_sol: 25.0,
+            within_s: 600,
+        },
+        EntryRule::Organic {
+            max_bundle_share: 0.02,
+            min_holders: 30,
+            min_new_buyers_w: 10,
+            within_s: 600,
+        },
+        EntryRule::Organic {
+            max_bundle_share: 0.02,
+            min_holders: 60,
+            min_new_buyers_w: 15,
+            within_s: 1800,
+        },
+    ]
+}
+
+/// The exit rules, fixed before looking: readings of the live state, no clock.
+fn exit_rules() -> Vec<ExitRule> {
+    vec![
+        ExitRule::MoneyLeaving(2.0),
+        ExitRule::BundleOut(0.5),
+        ExitRule::DevOut(0.5),
+        ExitRule::HoldersFalling(0.9),
+        ExitRule::NoNewBuyer(120),
+        ExitRule::SolLeaving(0.8),
+        ExitRule::Either(
+            Box::new(ExitRule::MoneyLeaving(2.0)),
+            Box::new(ExitRule::BundleOut(0.5)),
+        ),
+        ExitRule::Drawdown(0.5),
+        ExitRule::None,
+    ]
+}
+
+fn fires_of(tape: &[replay::Coin], idx: &[usize], r: &EntryRule) -> Vec<Fire> {
+    idx.iter()
+        .filter_map(|&i| {
+            tape[i]
+                .entry_ts(r)
+                .map(|signal_ts| Fire { coin: i, signal_ts })
+        })
+        .collect()
+}
+
+/// Working backwards from the peak: what the live state read at the winners' peak, a
+/// minute after it, and when half the peak was gone, against the losers. Then every
+/// entry signal with every exit rule, every fire a trade, curve and pool, no clock.
+fn exit_section(
     o: &mut String,
     tape: &[replay::Coin],
-    coins: &HashMap<&str, &Coin>,
+    idx: &[usize],
     k: &Costs,
     sol_usd: f64,
     hours: f64,
     extra: &[(Signal, i64)],
 ) {
-    let _ = writeln!(o, "\n## After the signal (trade tape)\n");
-    let idx: Vec<usize> = (0..tape.len())
-        .filter(|&i| coins.contains_key(tape[i].mint.as_str()))
-        .collect();
+    let _ = writeln!(
+        o,
+        "\n## Exit: work backwards from the peak (trade tape, curve and pool)\n"
+    );
     if idx.is_empty() {
         let _ = writeln!(o, "_No trade tape for these coins (pass `--trades`)._");
         return;
     }
-    let sigs: Vec<(Signal, i64)> = signals()
+    let rules_for_fingerprint = entry_rules();
+    for main in [&rules_for_fingerprint[0], &rules_for_fingerprint[3]] {
+        let fires = fires_of(tape, idx, main);
+        let paths: Vec<replay::Trail> = fires
+            .iter()
+            .filter_map(|f| {
+                replay::ride_all(&tape[f.coin], f.signal_ts + k.delay_s, &[ExitRule::None], k)
+            })
+            .map(|(_, p)| p)
+            .collect();
+        let winners: Vec<&replay::Trail> = paths.iter().filter(|p| p.peak_ret >= 1.0).collect();
+        let losers: Vec<&replay::Trail> = paths.iter().filter(|p| p.peak_ret < 0.2).collect();
+        let _ = writeln!(
+        o,
+        "Entry: **{}**, {} fires. Winners here are the rides whose position was worth 2× or more at some point ({}); losers never saw +20% ({}). The live state an engine holding the coin reads, at the winners' peak, a minute after it, and at the first trade at which half the peak was gone; the losers at their half-way point:\n",
+        main.label(),
+        paths.len(),
+        winners.len(),
+        losers.len()
+    );
+        let _ = writeln!(
+        o,
+        "| reading (median) | winners at the peak | winners 60 s after | winners at −50% from the peak | losers at −50% |"
+    );
+        let _ = writeln!(o, "|---|---:|---:|---:|---:|");
+        type Pick = fn(&replay::Snap) -> f64;
+        let readings: [(&str, Pick); 9] = [
+            ("age, s", |s| s.age as f64),
+            ("sells / buys in SOL, last 60 s", |s| s.flow_ratio),
+            ("bundle (first-5 s buyers) still holds", |s| s.bundle_left),
+            ("creator still holds", |s| s.dev_left),
+            ("holders vs their peak", |s| s.holders_vs_peak),
+            ("holders", |s| s.holders as f64),
+            ("new buyers, last 60 s", |s| s.new_buyers_w as f64),
+            ("seconds since the last new buyer", |s| {
+                s.since_new_buyer as f64
+            }),
+            ("SOL in curve/pool vs its peak", |s| s.net_sol_vs_peak),
+        ];
+        let med = |v: Vec<f64>| {
+            let mut v = v;
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:.2} ({})", median(&mut v), v.len())
+            }
+        };
+        for (name, f) in readings {
+            let _ = writeln!(
+                o,
+                "| {name} | {} | {} | {} | {} |",
+                med(winners.iter().map(|p| f(&p.at_peak)).collect()),
+                med(winners
+                    .iter()
+                    .filter_map(|p| p.after_peak.map(|s| f(&s)))
+                    .collect()),
+                med(winners
+                    .iter()
+                    .filter_map(|p| p.at_half.map(|s| f(&s)))
+                    .collect()),
+                med(losers
+                    .iter()
+                    .filter_map(|p| p.at_half.map(|s| f(&s)))
+                    .collect())
+            );
+        }
+        let mut to_half: Vec<f64> = winners
+            .iter()
+            .filter_map(|p| p.at_half.map(|s| (s.age - p.at_peak.age) as f64))
+            .collect();
+        let mut kept: Vec<f64> = winners
+            .iter()
+            .map(|p| (1.0 + p.end_ret) / (1.0 + p.peak_ret))
+            .collect();
+        let _ = writeln!(
+        o,
+        "\n- winners: half the peak is gone a median **{:.0} s** after it ({} of {} got there on tape); a winner never sold keeps a median **{:.0}%** of its peak value at the end of the data",
+        median(&mut to_half),
+        to_half.len(),
+        winners.len(),
+        100.0 * median(&mut kept)
+    );
+        let _ = writeln!(
+        o,
+        "_The reading that moves first after the peak is the exit. Bundle and creator shares are of their own peak holdings (1 = untouched); flow is SOL sold over SOL bought in the last minute (99 = sells with no buys)._"
+    );
+    }
+
+    // ---- entry × exit
+    let rules = exit_rules();
+    let entries: Vec<(EntryRule, i64)> = entry_rules()
         .into_iter()
         .map(|s| (s, 0))
-        .chain(extra.iter().cloned())
+        .chain(
+            extra
+                .iter()
+                .map(|(s, t)| (EntryRule::Signal(s.clone()), *t)),
+        )
         .collect();
+    let _ = writeln!(o, "\n### Entry signal × exit signal\n");
     let _ = writeln!(
         o,
-        "- {} standard coins with their trades on tape ({} trades); our buy lands {} s after the signal's trade with {} SOL in the curve; fees as recorded; {} SOL per transaction; {} signals, fixed in advance; every fire is a trade",
+        "- {} standard coins with their trades on tape ({} trades); our buy lands {} s after the signal's trade with {} SOL in the curve, fees as recorded, {} SOL per transaction; the sell lands {} s after the first trade at which the exit rule holds, on the curve or in the pool as it is then; a rule that never holds closes at the last trade on tape (the pool is followed for a day after graduation, the curve for its first hour); {} entries × {} exits, all fixed in advance; every fire is a trade",
         idx.len(),
         idx.iter().map(|&i| tape[i].trades()).sum::<usize>(),
         k.delay_s,
         k.size_lamports as f64 / 1e9,
         k.tx_lamports as f64 / 1e9,
-        sigs.len()
+        k.delay_s,
+        entries.len(),
+        rules.len()
     );
     let _ = writeln!(
         o,
-        "\n| signal | fires | /day | at (median s) | entry mcap (median) | at 1 h: mean (±), median, ≥ 2×, ≤ 0.1× | peak in the hour: median, ≥ 2×, ≥ 5× | at 6 h (n) | at 24 h (n) |"
+        "\n| entry | exit | trades | /day | closed by the rule | graduated | held (median) | mean (±) | median | ≥ 2× | ≤ 0.1× | kept of the peak (winners, median) | SOL/day at size |"
     );
-    let _ = writeln!(o, "|---|---:|---:|---:|---:|---|---|---|---|");
-    for (s, from_ts) in &sigs {
+    let _ = writeln!(
+        o,
+        "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|"
+    );
+    for (s, from_ts) in &entries {
         let pool: Vec<usize> = idx
             .iter()
             .copied()
@@ -844,88 +991,69 @@ fn entry_replay(
         } else {
             hours
         };
-        let fires: Vec<Fire> = pool
+        let fires = fires_of(tape, &pool, s);
+        let rides: Vec<Vec<replay::Ride>> = fires
             .iter()
-            .filter_map(|&i| {
-                tape[i]
-                    .signal_ts(s)
-                    .map(|signal_ts| Fire { coin: i, signal_ts })
-            })
+            .filter_map(|f| replay::ride_all(&tape[f.coin], f.signal_ts + k.delay_s, &rules, k))
+            .map(|(r, _)| r)
             .collect();
-        let (mut at, mut mcap, mut r1h, mut peak, mut h6, mut h24) =
-            (vec![], vec![], vec![], vec![], vec![], vec![]);
-        for f in &fires {
-            let c = &tape[f.coin];
-            let entry_ts = f.signal_ts + k.delay_s;
-            let Some((last, pk)) = replay::path_from(c, entry_ts, k) else {
-                continue;
-            };
-            r1h.push(last);
-            peak.push(pk);
-            at.push((f.signal_ts - c.created_ts) as f64);
-            let m = c.mcap_sol_at(entry_ts) * sol_usd;
-            mcap.push(m);
-            if let Some(w) = coins.get(c.mint.as_str()).filter(|_| m > 0.0) {
-                let later = |cp: i64| {
-                    w.cp_usd(cp)
-                        .map(|v| v / m * (1.0 - FEE) * (1.0 - FEE) - 1.0)
-                };
-                h6.extend(later(21_600));
-                h24.extend(later(86_400));
-            }
-        }
-        if r1h.len() < MIN_FIRES {
+        if rides.len() < MIN_FIRES {
             continue;
         }
+        let mut entry_mcap: Vec<f64> = fires
+            .iter()
+            .map(|f| tape[f.coin].mcap_sol_at(f.signal_ts + k.delay_s) * sol_usd)
+            .collect();
         let _ = writeln!(
             o,
-            "| {}{} | {} | {:.0} | {:.0} | {} | {} | {} | {} | {} |",
+            "| **{}{}** | _{} fires, entry mcap median {}_ | | | | | | | | | | | |",
             s.label(),
             if *from_ts > 0 { " (2nd half)" } else { "" },
-            r1h.len(),
-            r1h.len() as f64 / hours * 24.0,
-            median(&mut at),
-            money(median(&mut mcap)),
-            dist_cell(&mut r1h, &[("≥ 2×", 1.0)], Some(-0.9), false),
-            dist_cell(&mut peak, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, true),
-            dist_cell(&mut h6, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, false),
-            dist_cell(&mut h24, &[("≥ 2×", 1.0), ("≥ 5×", 4.0)], None, false)
+            rides.len(),
+            money(median(&mut entry_mcap))
         );
+        for (r, rule) in rules.iter().enumerate() {
+            let mut rets: Vec<f64> = rides.iter().map(|v| v[r].ret).collect();
+            let mut held: Vec<f64> = rides
+                .iter()
+                .map(|v| (v[r].exit_ts - v[r].entry_ts) as f64)
+                .collect();
+            let by_rule = rides.iter().filter(|v| v[r].by_rule).count();
+            let graduated = rides.iter().filter(|v| v[r].graduated).count();
+            let mut kept: Vec<f64> = rides
+                .iter()
+                .filter(|v| v[r].peak_ret >= 1.0)
+                .map(|v| (1.0 + v[r].ret) / (1.0 + v[r].peak_ret))
+                .collect();
+            let (m, ci) = mean_ci(&rets);
+            let med = median(&mut rets);
+            let n = rets.len() as f64;
+            let share =
+                |f: &dyn Fn(f64) -> bool| 100.0 * rets.iter().filter(|x| f(**x)).count() as f64 / n;
+            let sol_day = rets.iter().sum::<f64>() * k.size_lamports as f64 / 1e9 / hours * 24.0;
+            let _ = writeln!(
+                o,
+                "| | {} | {} | {:.0} | {:.0}% | {:.0}% | {} | **{}** (±{:.0}%) | {} | {:.0}% | {:.0}% | {} | {} |",
+                rule.label(),
+                rets.len(),
+                n / hours * 24.0,
+                100.0 * by_rule as f64 / n,
+                100.0 * graduated as f64 / n,
+                age((median(&mut held) * 1000.0) as i64),
+                pct(m),
+                100.0 * ci,
+                pct(med),
+                share(&|x| x >= 1.0),
+                share(&|x| x <= -0.9),
+                if kept.is_empty() { "-".into() } else { format!("{:.0}% ({})", 100.0 * median(&mut kept), kept.len()) },
+                if hours >= 6.0 { format!("{sol_day:+.1}") } else { "n/a".into() }
+            );
+        }
     }
     let _ = writeln!(
         o,
-        "_\"at\" is the second after creation when the signal first held; the entry market cap is the curve's after our delay. Returns are on what we paid, after both fees and our own price impact on the curve (the checkpoint columns take the fees but not the impact). A coin that graduates within the hour is sold into the pool at its final curve price, so the hour's figures cap a runner at about its graduation price; the 6 h and 24 h columns are where the runners show, with (n) the fires old enough to have that checkpoint. Halves of the tape are not split here because nothing is picked; the detector tables above carry the intervals._"
+        "_Returns are on what we paid, after fees and our own impact on the curve (the pool sell is constant product against the pool's SOL at that trade, at the pool fee). \"Held\" is an outcome, not an input. \"Kept of the peak\" is the exit value over the best value seen before it, on rides that reached 2×. A ride the rule never closed is marked at the last trade on tape with the position still open._"
     );
-}
-
-/// "mean (±ci), median, a% ≥ 2×, b% ≤ 0.1× (n)" for a list of returns; `median_only`
-/// leaves the mean out (a peak has no useful mean).
-fn dist_cell(
-    v: &mut [f64],
-    marks: &[(&str, f64)],
-    floor: Option<f64>,
-    median_only: bool,
-) -> String {
-    if v.is_empty() {
-        return "-".into();
-    }
-    let n = v.len();
-    let med = median(v);
-    let share =
-        |f: &dyn Fn(f64) -> bool| 100.0 * v.iter().filter(|r| f(**r)).count() as f64 / n as f64;
-    let mut parts = vec![];
-    if !median_only {
-        let (m, ci) = mean_ci(v);
-        parts.push(format!("{} (±{:.0}%)", pct(m), 100.0 * ci));
-    }
-    parts.push(format!("median {}", pct(med)));
-    for (label, at) in marks {
-        parts.push(format!("{label} {:.0}%", share(&|r| r >= *at)));
-    }
-    if let Some(f) = floor {
-        parts.push(format!("≤ {:.1}× {:.0}%", 1.0 + f, share(&|r| r <= f)));
-    }
-    format!("{} ({n})", parts.join(", "))
 }
 
 // ------------------------------------------------------------------ the report
@@ -1235,7 +1363,7 @@ pub fn report(
         .filter(|&i| by_mint.contains_key(tape[i].mint.as_str()))
         .collect();
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
-    entry_replay(&mut o, tape, &by_mint, &k, sol_usd, hours, &extra);
+    exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
     o
 }
 

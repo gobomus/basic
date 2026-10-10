@@ -98,6 +98,10 @@ pub struct Coin {
     pub created_ts: i64,
     ticks: Vec<Tick>,
     pub graduated_ts: Option<i64>,
+    /// the creator's wallet (hash)
+    pub creator: u64,
+    /// the pool's trades after graduation, in chain order
+    pool: Vec<PoolTick>,
     /// priced in another token (amounts are not SOL)
     pub quoted: bool,
     /// moments (s after creation) with a complete book on the tape
@@ -248,6 +252,30 @@ struct TapeRow {
     buy: Option<bool>,
     user: Option<String>,
     tok: Option<u64>,
+    creator: Option<String>,
+    sol: Option<u64>,
+    base: Option<u64>,
+    mcap_sol: Option<f64>,
+    liq: Option<u64>,
+}
+
+/// One pool trade after graduation (the `ev: "amm"` row).
+#[derive(Clone, Copy, Debug)]
+pub struct PoolTick {
+    ts: i64,
+    slot: u64,
+    seq: u64,
+    buy: bool,
+    user: u64,
+    /// lamports the user paid or received
+    sol: u64,
+    /// tokens traded (base units)
+    tok: u64,
+    /// market cap in SOL after the trade
+    mcap_sol: f64,
+    /// the pool's SOL after the trade, lamports
+    liq: u64,
+    fee_bps: u64,
 }
 
 /// The tape keeps wallets as 64-bit hashes; the map from `load_with_wallets` names them.
@@ -310,7 +338,34 @@ pub fn load_with_wallets(
             seq += 1;
             let c = coins.entry(row.mint.clone()).or_default();
             match row.ev.as_str() {
-                "create" => c.created_ts = row.ts,
+                "create" => {
+                    c.created_ts = row.ts;
+                    if let Some(u) = row.creator.as_deref() {
+                        c.creator = wallet_hash(u);
+                        wallets.entry(c.creator).or_insert_with(|| u.to_string());
+                    }
+                }
+                "amm" => {
+                    let (Some(mcap_sol), Some(liq)) = (row.mcap_sol, row.liq) else {
+                        continue;
+                    };
+                    let user = row.user.as_deref().map(wallet_hash).unwrap_or(0);
+                    if let Some(u) = row.user.as_deref() {
+                        wallets.entry(user).or_insert_with(|| u.to_string());
+                    }
+                    c.pool.push(PoolTick {
+                        ts: row.ts,
+                        slot: row.slot,
+                        seq,
+                        buy: row.buy.unwrap_or(false),
+                        user,
+                        sol: row.sol.unwrap_or(0),
+                        tok: row.base.unwrap_or(0),
+                        mcap_sol,
+                        liq,
+                        fee_bps: row.fee_bps.unwrap_or(DEFAULT_POOL_FEE_BPS),
+                    });
+                }
                 "complete" => {
                     c.graduated_ts.get_or_insert(row.ts);
                 }
@@ -377,6 +432,7 @@ pub fn load_with_wallets(
         .map(|(mint, mut c)| {
             c.mint = mint;
             c.ticks.sort_by_key(|t| (t.slot, t.seq));
+            c.pool.sort_by_key(|t| (t.slot, t.seq));
             c
         })
         .collect();
@@ -428,8 +484,6 @@ pub struct Costs {
 struct Position {
     input: u64,
     tokens: u64,
-    /// end of the tape for this coin
-    end: i64,
 }
 
 /// Buy with a fill at block time `entry_ts`; `None` after the window or after graduation.
@@ -446,7 +500,6 @@ fn open(c: &Coin, entry_ts: i64, k: &Costs) -> Option<Position> {
     Some(Position {
         input: curve_input(k.size_lamports, at_entry.fee_bps),
         tokens,
-        end,
     })
 }
 
@@ -459,38 +512,497 @@ impl Position {
             x.fee_bps,
         )
     }
-    /// A sell landing at `fill_ts`: what it returns, and whether the coin had graduated
-    /// by then (then it sells into the pool at the final curve price).
-    fn close(&self, c: &Coin, fill_ts: i64) -> (u64, bool) {
-        let fill_ts = fill_ts.min(self.end);
-        match c.graduated_ts.filter(|g| *g <= fill_ts) {
-            Some(g) => {
-                let pool = pool_after_graduation(with_us(c.at(g).state(), self.input, self.tokens));
-                (sell_quote_for_tokens(&pool, self.tokens, AMM_FEE_BPS), true)
+}
+
+/// Wallets that bought within this many seconds of the create are "the bundle".
+const BUNDLE_S: i64 = 5;
+/// A Pump.fun coin's supply in base units (1e9 tokens of 6 decimals).
+const SUPPLY_BASE_UNITS: f64 = 1e15;
+/// The flow window for money leaving and new buyers.
+const FLOW_S: i64 = 60;
+/// Pool fee when the row does not carry it.
+const DEFAULT_POOL_FEE_BPS: u64 = 25;
+
+/// The live state of a coin as the tape unfolds: what an engine holding it would see.
+#[derive(Clone, Debug, Default)]
+struct State {
+    bal: HashMap<u64, i128>,
+    holders: usize,
+    holders_peak: usize,
+    buyers: std::collections::HashSet<u64>,
+    /// the bundle's tokens: at their peak, and now
+    bundle: std::collections::HashSet<u64>,
+    bundle_peak: i128,
+    bundle_now: i128,
+    dev_peak: i128,
+    dev_now: i128,
+    /// (ts, buy, lamports, first buy of a new wallet) in the last `FLOW_S`
+    window: std::collections::VecDeque<(i64, bool, u64, bool)>,
+    buy_w: u64,
+    sell_w: u64,
+    new_buyers_w: usize,
+    last_new_buyer_ts: i64,
+    /// SOL in the curve, then the pool's SOL after graduation (lamports)
+    net_sol: u64,
+    net_sol_peak: u64,
+    mcap_sol: f64,
+    graduated: bool,
+}
+
+/// The state's readings at one moment, for the fingerprints.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Snap {
+    /// seconds after the create
+    pub age: i64,
+    /// sells over buys in SOL over the last minute (sells with no buys: 99)
+    pub flow_ratio: f64,
+    /// what the bundle still holds of its peak (1 = all, 0 = sold out)
+    pub bundle_left: f64,
+    /// what the creator still holds of their peak; 1 when they never bought
+    pub dev_left: f64,
+    /// holders over their peak
+    pub holders_vs_peak: f64,
+    pub new_buyers_w: usize,
+    /// seconds since the last new buyer
+    pub since_new_buyer: i64,
+    /// SOL in the curve or pool over its peak
+    pub net_sol_vs_peak: f64,
+    pub holders: usize,
+}
+
+impl State {
+    fn apply(&mut self, c: &Coin, ts: i64, buy: bool, user: u64, sol: u64, tok: u64) {
+        let b = self.bal.entry(user).or_insert(0);
+        let before = *b;
+        *b += if buy { tok as i128 } else { -(tok as i128) };
+        let after = *b;
+        self.holders = (self.holders + (after > 0) as usize).saturating_sub((before > 0) as usize);
+        self.holders_peak = self.holders_peak.max(self.holders);
+        let mut fresh = false;
+        if buy {
+            fresh = self.buyers.insert(user);
+            if ts - c.created_ts <= BUNDLE_S {
+                self.bundle.insert(user);
             }
-            None => (self.value(&c.at(fill_ts)), false),
+            if fresh {
+                self.last_new_buyer_ts = ts;
+            }
+        }
+        if self.bundle.contains(&user) {
+            self.bundle_now += after - before;
+            self.bundle_peak = self.bundle_peak.max(self.bundle_now);
+        }
+        if user == c.creator && c.creator != 0 {
+            self.dev_now += after - before;
+            self.dev_peak = self.dev_peak.max(self.dev_now);
+        }
+        self.window.push_back((ts, buy, sol, fresh));
+        if buy {
+            self.buy_w += sol;
+        } else {
+            self.sell_w += sol;
+        }
+        self.new_buyers_w += fresh as usize;
+        while self.window.front().is_some_and(|w| w.0 < ts - FLOW_S) {
+            let (_, b, s, f) = self.window.pop_front().unwrap();
+            if b {
+                self.buy_w -= s;
+            } else {
+                self.sell_w -= s;
+            }
+            self.new_buyers_w -= f as usize;
+        }
+    }
+    fn curve(&mut self, c: &Coin, x: &Tick) {
+        self.apply(c, x.ts, x.buy, x.user, 0, x.tok);
+        // the window's SOL comes from the curve's own reserves on this leg
+        if let Some(w) = self.window.back_mut() {
+            w.2 = x.rsol.abs_diff(self.net_sol);
+            if x.buy {
+                self.buy_w += w.2;
+            } else {
+                self.sell_w += w.2;
+            }
+        }
+        self.net_sol = x.rsol;
+        self.net_sol_peak = self.net_sol_peak.max(self.net_sol);
+        self.mcap_sol = x.mcap_sol();
+    }
+    fn pool(&mut self, c: &Coin, x: &PoolTick) {
+        self.apply(c, x.ts, x.buy, x.user, x.sol, x.tok);
+        self.graduated = true;
+        self.net_sol = x.liq;
+        self.net_sol_peak = self.net_sol_peak.max(self.net_sol);
+        self.mcap_sol = x.mcap_sol;
+    }
+    fn snap(&self, c: &Coin, ts: i64) -> Snap {
+        let share = |now: i128, peak: i128| {
+            if peak <= 0 {
+                1.0
+            } else {
+                (now.max(0) as f64 / peak as f64).min(1.0)
+            }
+        };
+        Snap {
+            age: ts - c.created_ts,
+            flow_ratio: if self.buy_w == 0 {
+                if self.sell_w == 0 {
+                    1.0
+                } else {
+                    99.0
+                }
+            } else {
+                self.sell_w as f64 / self.buy_w as f64
+            },
+            bundle_left: share(self.bundle_now, self.bundle_peak),
+            dev_left: share(self.dev_now, self.dev_peak),
+            holders_vs_peak: if self.holders_peak == 0 {
+                1.0
+            } else {
+                self.holders as f64 / self.holders_peak as f64
+            },
+            new_buyers_w: self.new_buyers_w,
+            since_new_buyer: if self.last_new_buyer_ts == 0 {
+                ts - c.created_ts
+            } else {
+                ts - self.last_new_buyer_ts
+            },
+            net_sol_vs_peak: if self.net_sol_peak == 0 {
+                1.0
+            } else {
+                self.net_sol as f64 / self.net_sol_peak as f64
+            },
+            holders: self.holders,
         }
     }
 }
 
-/// Buy with a fill at `entry_ts` and hold: the position's return at the end of the
-/// hour (or in the pool, if the coin graduated) and at its peak on the way, both on
-/// what we paid (size plus the transaction fees of the buy and one sell).
-pub fn path_from(c: &Coin, entry_ts: i64, k: &Costs) -> Option<(f64, f64)> {
+/// When to buy: a reading of the live state within a window of the create.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntryRule {
+    /// the plain signal: SOL in the curve, holders, buyers, known wallets
+    Signal(Signal),
+    /// the second wave: the bundle has sold at least half, SOL in the curve is still at
+    /// or near its peak, new buyers keep coming, and the curve holds this much SOL
+    SecondWave {
+        max_bundle_left: f64,
+        min_sol_vs_peak: f64,
+        min_new_buyers_w: usize,
+        min_net_sol: f64,
+        within_s: i64,
+    },
+    /// no real bundle (the first-5 s buyers took at most this share of the supply at
+    /// their peak), and breadth: holders and new buyers
+    Organic {
+        max_bundle_share: f64,
+        min_holders: usize,
+        min_new_buyers_w: usize,
+        within_s: i64,
+    },
+}
+
+impl EntryRule {
+    pub fn label(&self) -> String {
+        match self {
+            EntryRule::Signal(s) => s.label(),
+            EntryRule::SecondWave {
+                max_bundle_left,
+                min_sol_vs_peak,
+                min_new_buyers_w,
+                min_net_sol,
+                within_s,
+            } => format!(
+                "second wave: bundle ≤ {:.0}% left & SOL ≥ {:.0}% of its peak & new buyers 60 s ≥ {} & net SOL ≥ {} within {} s",
+                max_bundle_left * 100.0,
+                min_sol_vs_peak * 100.0,
+                min_new_buyers_w,
+                min_net_sol,
+                within_s
+            ),
+            EntryRule::Organic {
+                max_bundle_share,
+                min_holders,
+                min_new_buyers_w,
+                within_s,
+            } => format!(
+                "organic: bundle ≤ {:.0}% of supply & holders ≥ {} & new buyers 60 s ≥ {} within {} s",
+                max_bundle_share * 100.0,
+                min_holders,
+                min_new_buyers_w,
+                within_s
+            ),
+        }
+    }
+    fn within(&self) -> i64 {
+        match self {
+            EntryRule::Signal(s) => s.within_s,
+            EntryRule::SecondWave { within_s, .. } | EntryRule::Organic { within_s, .. } => {
+                *within_s
+            }
+        }
+    }
+    fn holds(&self, st: &State, snap: &Snap) -> bool {
+        match self {
+            EntryRule::Signal(_) => false,
+            EntryRule::SecondWave {
+                max_bundle_left,
+                min_sol_vs_peak,
+                min_new_buyers_w,
+                min_net_sol,
+                ..
+            } => {
+                st.bundle_peak > 0
+                    && snap.bundle_left <= *max_bundle_left
+                    && snap.net_sol_vs_peak >= *min_sol_vs_peak
+                    && snap.new_buyers_w >= *min_new_buyers_w
+                    && st.net_sol as f64 / LAMPORTS >= *min_net_sol
+            }
+            EntryRule::Organic {
+                max_bundle_share,
+                min_holders,
+                min_new_buyers_w,
+                ..
+            } => {
+                st.bundle_peak as f64 <= max_bundle_share * SUPPLY_BASE_UNITS
+                    && st.holders >= *min_holders
+                    && snap.new_buyers_w >= *min_new_buyers_w
+            }
+        }
+    }
+}
+
+impl Coin {
+    /// Block time of the first trade after which the entry rule holds (curve only:
+    /// an entry is a curve buy), within its window of the create.
+    pub fn entry_ts(&self, rule: &EntryRule) -> Option<i64> {
+        if let EntryRule::Signal(s) = rule {
+            return self.signal_ts(s);
+        }
+        let mut st = State::default();
+        for x in &self.ticks {
+            if x.ts - self.created_ts > rule.within() {
+                return None;
+            }
+            st.curve(self, x);
+            if rule.holds(&st, &st.snap(self, x.ts)) {
+                return Some(x.ts);
+            }
+        }
+        None
+    }
+}
+
+/// When to sell: a reading of the live state, not a clock.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExitRule {
+    /// sells exceed buys in SOL over the last minute by this ratio (at least 1 SOL sold)
+    MoneyLeaving(f64),
+    /// the bundle (buyers in the first 5 s) holds at most this share of its peak
+    BundleOut(f64),
+    /// the creator holds at most this share of their peak (only when they bought)
+    DevOut(f64),
+    /// holders at most this share of their peak (peak ≥ 20)
+    HoldersFalling(f64),
+    /// no new buyer for this many seconds
+    NoNewBuyer(i64),
+    /// SOL in the curve or pool at most this share of its peak
+    SolLeaving(f64),
+    /// the position at most this share of its peak value (the price reference)
+    Drawdown(f64),
+    /// either of two
+    Either(Box<ExitRule>, Box<ExitRule>),
+    /// never: ride to the end of the data
+    None,
+}
+
+impl ExitRule {
+    pub fn label(&self) -> String {
+        match self {
+            ExitRule::MoneyLeaving(r) => format!("money leaving: sells ≥ {r}× buys over 60 s"),
+            ExitRule::BundleOut(x) => {
+                format!("bundle out: first-5 s buyers hold ≤ {:.0}%", x * 100.0)
+            }
+            ExitRule::DevOut(x) => format!("dev out: creator holds ≤ {:.0}%", x * 100.0),
+            ExitRule::HoldersFalling(x) => format!("holders ≤ {:.0}% of their peak", x * 100.0),
+            ExitRule::NoNewBuyer(s) => format!("no new buyer for {s} s"),
+            ExitRule::SolLeaving(x) => format!("SOL in curve/pool ≤ {:.0}% of its peak", x * 100.0),
+            ExitRule::Drawdown(x) => format!("price ≤ {:.0}% of the peak", x * 100.0),
+            ExitRule::Either(a, b) => format!("{} | {}", a.label(), b.label()),
+            ExitRule::None => "ride to the end of the data".into(),
+        }
+    }
+    fn holds(&self, st: &State, snap: &Snap, value_vs_peak: f64) -> bool {
+        match self {
+            ExitRule::MoneyLeaving(r) => {
+                st.sell_w >= LAMPORTS as u64 && st.sell_w as f64 >= r * st.buy_w as f64
+            }
+            ExitRule::BundleOut(x) => st.bundle_peak > 0 && snap.bundle_left <= *x,
+            ExitRule::DevOut(x) => st.dev_peak > 0 && snap.dev_left <= *x,
+            ExitRule::HoldersFalling(x) => st.holders_peak >= 20 && snap.holders_vs_peak <= *x,
+            ExitRule::NoNewBuyer(s) => snap.since_new_buyer >= *s,
+            ExitRule::SolLeaving(x) => snap.net_sol_vs_peak <= *x,
+            ExitRule::Drawdown(x) => value_vs_peak <= *x,
+            ExitRule::Either(a, b) => {
+                a.holds(st, snap, value_vs_peak) || b.holds(st, snap, value_vs_peak)
+            }
+            ExitRule::None => false,
+        }
+    }
+}
+
+/// One ride from the signal entry to an exit rule's sell (or the end of the data).
+#[derive(Clone, Copy, Debug)]
+pub struct Ride {
+    pub entry_ts: i64,
+    pub exit_ts: i64,
+    /// return on what we paid (size plus two transaction fees)
+    pub ret: f64,
+    /// the best return seen before the exit
+    pub peak_ret: f64,
+    /// the rule fired (else the data ended with the position open)
+    pub by_rule: bool,
+    pub graduated: bool,
+}
+
+/// What the whole path looked like, for working backwards from the peak.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Trail {
+    pub peak_ret: f64,
+    pub peak_ts: i64,
+    pub at_peak: Snap,
+    /// the first reading a minute or more after the peak
+    pub after_peak: Option<Snap>,
+    /// the first reading at which the position was worth half its peak
+    pub at_half: Option<Snap>,
+    pub end_ret: f64,
+}
+
+/// Our tokens sold into the pool as it is after `x` (constant product, the pool fee).
+fn pool_value(x: &PoolTick, tokens: u64) -> u64 {
+    if x.mcap_sol <= 0.0 || x.liq == 0 {
+        return 0;
+    }
+    // lamports per base unit = mcap_sol / 1e6
+    let r_tok = x.liq as f64 / (x.mcap_sol / 1e6);
+    let out = x.liq as f64 * tokens as f64 / (r_tok + tokens as f64);
+    (out * (1.0 - x.fee_bps as f64 / 10_000.0)) as u64
+}
+
+/// Buy with a fill at `entry_ts`, then watch the live state on every later trade,
+/// curve and pool, and sell `k.delay_s` after the first trade at which each rule
+/// holds; a rule that never holds closes at the last trade on tape. One pass serves
+/// every rule. `None` when the entry cannot fill.
+pub fn ride_all(
+    c: &Coin,
+    entry_ts: i64,
+    rules: &[ExitRule],
+    k: &Costs,
+) -> Option<(Vec<Ride>, Trail)> {
     let pos = open(c, entry_ts, k)?;
     let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
-    let until = c.graduated_ts.map_or(pos.end, |g| g.min(pos.end));
-    let first = c.ticks.partition_point(|x| x.ts <= entry_ts);
-    let mut peak = 0u64;
-    for x in &c.ticks[first..] {
-        if x.ts > until {
-            break;
+    // every trade in time order: (ts, curve index or pool index)
+    let mut events: Vec<(i64, bool, usize)> = Vec::with_capacity(c.ticks.len() + c.pool.len());
+    events.extend(c.ticks.iter().enumerate().map(|(i, x)| (x.ts, false, i)));
+    events.extend(c.pool.iter().enumerate().map(|(i, x)| (x.ts, true, i)));
+    events.sort_by_key(|e| (e.0, e.1));
+    let value_of = |is_pool: bool, i: usize| -> u64 {
+        if is_pool {
+            pool_value(&c.pool[i], pos.tokens)
+        } else {
+            pos.value(&c.ticks[i])
         }
-        peak = peak.max(pos.value(x));
+    };
+    // the value a sell landing at `ts` gets: the last trade at or before it
+    let value_at = |ts: i64| -> (i64, u64, bool) {
+        let n = events.partition_point(|e| e.0 <= ts);
+        if n == 0 {
+            return (entry_ts, pos.value(&c.at(entry_ts)), false);
+        }
+        let (ets, is_pool, i) = events[n - 1];
+        if !is_pool && c.graduated_ts.is_some_and(|g| g <= ts) {
+            // graduated, no pool trade yet: the pool as the curve left it
+            let pool = pool_after_graduation(with_us(c.ticks[i].state(), pos.input, pos.tokens));
+            return (
+                ets,
+                sell_quote_for_tokens(&pool, pos.tokens, AMM_FEE_BPS),
+                true,
+            );
+        }
+        (ets.max(entry_ts), value_of(is_pool, i), is_pool)
+    };
+    let mut st = State::default();
+    let mut path = Trail::default();
+    let mut fired: Vec<Option<i64>> = vec![None; rules.len()];
+    let mut peak = 0u64;
+    let mut all_fired = false;
+    for &(ts, is_pool, i) in &events {
+        if is_pool {
+            st.pool(c, &c.pool[i]);
+        } else {
+            st.curve(c, &c.ticks[i]);
+        }
+        if ts <= entry_ts {
+            continue;
+        }
+        let v = value_of(is_pool, i);
+        let snap = st.snap(c, ts);
+        if v > peak {
+            peak = v;
+            path.peak_ret = v as f64 / cost - 1.0;
+            path.peak_ts = ts;
+            path.at_peak = snap;
+            path.after_peak = None;
+            path.at_half = None;
+        } else {
+            if path.after_peak.is_none() && ts >= path.peak_ts + 60 {
+                path.after_peak = Some(snap);
+            }
+            if path.at_half.is_none() && (v as f64) <= 0.5 * peak as f64 {
+                path.at_half = Some(snap);
+            }
+        }
+        if all_fired {
+            continue;
+        }
+        let vs_peak = v as f64 / peak.max(1) as f64;
+        all_fired = true;
+        for (r, rule) in rules.iter().enumerate() {
+            if fired[r].is_none() {
+                if rule.holds(&st, &snap, vs_peak) {
+                    fired[r] = Some(ts);
+                } else {
+                    all_fired = false;
+                }
+            }
+        }
     }
-    let (last, _) = pos.close(c, pos.end);
-    let ret = |v: u64| v as f64 / cost - 1.0;
-    Some((ret(last), ret(peak.max(last))))
+    let (end_ts, end_value, end_graduated) = value_at(i64::MAX);
+    path.end_ret = end_value as f64 / cost - 1.0;
+    let rides = fired
+        .iter()
+        .map(|f| {
+            let (exit_ts, value, graduated) = match f {
+                Some(ts) => value_at(ts + k.delay_s),
+                Option::None => (end_ts, end_value, end_graduated),
+            };
+            let until = f.map_or(i64::MAX, |t| t + k.delay_s);
+            let peak_before: u64 = events
+                .iter()
+                .filter(|e| e.0 > entry_ts && e.0 <= until)
+                .map(|e| value_of(e.1, e.2))
+                .max()
+                .unwrap_or(0);
+            Ride {
+                entry_ts,
+                exit_ts,
+                ret: value as f64 / cost - 1.0,
+                peak_ret: peak_before.max(value) as f64 / cost - 1.0,
+                by_rule: f.is_some(),
+                graduated,
+            }
+        })
+        .collect();
+    Some((rides, path))
 }
 
 // ------------------------------------------------------------------ helpers
@@ -564,6 +1076,61 @@ mod tests {
         }
     }
 
+    /// Ride with no exit rule: (return at the end of the data, peak return).
+    fn hold(c: &Coin, entry_ts: i64, k: &Costs) -> Option<(f64, f64)> {
+        let (r, p) = ride_all(c, entry_ts, &[ExitRule::None], k)?;
+        assert!(!r[0].by_rule);
+        assert!((r[0].peak_ret - p.peak_ret.max(r[0].ret)).abs() < 1e-12 || p.peak_ret >= r[0].ret);
+        Some((r[0].ret, r[0].peak_ret))
+    }
+
+    #[test]
+    fn exit_rules_read_the_live_state_and_sell_after_the_delay() {
+        // wallet 1 buys at 3 s (the bundle), wallets 2 and 3 at 10 and 20 s; the curve
+        // rises to 60 SOL; then wallet 1 sells everything at 40 s and wallet 2 some at 85 s
+        let mut c = coin(
+            &[(3, 40.0), (10, 50.0), (20, 60.0), (40, 45.0), (85, 44.0)],
+            None,
+        );
+        c.ticks[3].buy = false;
+        c.ticks[3].user = 1;
+        c.ticks[3].tok = 10;
+        c.ticks[4].buy = false;
+        c.ticks[4].user = 2;
+        c.ticks[4].tok = 5;
+        let rules = [
+            ExitRule::BundleOut(0.5),
+            ExitRule::MoneyLeaving(2.0),
+            ExitRule::Drawdown(0.5),
+            ExitRule::NoNewBuyer(15),
+            ExitRule::None,
+        ];
+        let (r, p) = ride_all(&c, T0 + 12, &rules, &k(2)).unwrap();
+        // the bundle sold out at 40 s: sell lands at 42 s on the 45 SOL curve
+        assert!(r[0].by_rule);
+        assert_eq!(r[0].exit_ts, T0 + 40, "last trade at or before 42 s");
+        let (hold_ret, _) = hold(&c, T0 + 12, &k(2)).unwrap();
+        assert!(
+            r[0].ret > hold_ret,
+            "out before the 44 SOL end: {} vs {hold_ret}",
+            r[0].ret
+        );
+        // at 40 s the 30 SOL bought are still in the window: money is not leaving yet;
+        // by 85 s the buys have aged out and 16 SOL has been sold against none bought
+        assert!(r[1].by_rule && r[1].exit_ts == T0 + 85);
+        // the price never fell to half its peak; no new buyer between 20 and 40 s fires at 40 s
+        assert!(!r[2].by_rule);
+        assert!(r[3].by_rule && r[3].exit_ts == T0 + 40);
+        assert!(!r[4].by_rule);
+        // the path: peak at 20 s with the bundle whole, half the bundle gone after it
+        assert_eq!(p.peak_ts, T0 + 20);
+        assert!((p.at_peak.bundle_left - 1.0).abs() < 1e-9);
+        assert_eq!(p.at_peak.holders, 3);
+        assert!(p.after_peak.unwrap().bundle_left < 0.01);
+        assert!(p.at_half.is_none());
+        assert!(p.end_ret < p.peak_ret);
+    }
+
     #[test]
     fn the_buy_fills_on_the_curve_as_it_was_and_the_path_is_valued_from_it() {
         // the curve doubles in SOL (price x4) between 20 and 40 s, then falls back
@@ -579,7 +1146,7 @@ mod tests {
             None,
         );
         // signal at 15 s, our fill 4 s later: bought on the curve as it was at 19 s
-        let (last, peak) = path_from(&c, T0 + 19, &k(4)).unwrap();
+        let (last, peak) = hold(&c, T0 + 19, &k(4)).unwrap();
         let buy_state = c.at(T0 + 19);
         assert_eq!(buy_state.vsol, 36_000_000_000);
         let tokens = buy_tokens_for_quote(&buy_state.state(), 500_000_000, 125);
@@ -596,7 +1163,7 @@ mod tests {
         assert!(peak > 1.5 && peak > last, "{peak}");
         // a round trip on a flat curve costs the two fees and two transaction fees
         let flat = coin(&[(5, 40.0), (16, 40.0)], None);
-        let (last, peak) = path_from(&flat, T0 + 17, &k(2)).unwrap();
+        let (last, peak) = hold(&flat, T0 + 17, &k(2)).unwrap();
         assert!(last < -0.02 && last > -0.04, "{last}");
         assert_eq!(peak, last, "nothing traded after us: the peak is the end");
     }
@@ -604,12 +1171,12 @@ mod tests {
     #[test]
     fn graduation_sells_into_the_pool_and_late_or_post_graduation_entries_are_none() {
         let up = coin(&[(5, 40.0), (100, 90.0), (200, 115.0)], Some(200));
-        let (last, peak) = path_from(&up, T0 + 17, &k(2)).unwrap();
+        let (last, peak) = hold(&up, T0 + 17, &k(2)).unwrap();
         assert!(last > 3.0, "{last}");
         assert!(peak >= last);
         // already graduated at the fill: no trade; after the window: no trade
-        assert!(path_from(&coin(&[(5, 115.0)], Some(10)), T0 + 17, &k(2)).is_none());
-        assert!(path_from(&up, T0 + WINDOW_SECS, &k(0)).is_none());
+        assert!(hold(&coin(&[(5, 115.0)], Some(10)), T0 + 17, &k(2)).is_none());
+        assert!(hold(&up, T0 + WINDOW_SECS, &k(0)).is_none());
     }
 
     #[test]
