@@ -100,6 +100,8 @@ pub struct Coin {
     pub graduated_ts: Option<i64>,
     /// the creator's wallet (hash)
     pub creator: u64,
+    /// the slot of the create transaction (0 when unknown)
+    pub created_slot: u64,
     /// the host of the metadata URI on the create (which launch tool made the coin)
     pub uri_host: String,
     /// the pool's trades after graduation, in chain order
@@ -373,6 +375,7 @@ pub fn load_with_wallets(
             match row.ev.as_str() {
                 "create" => {
                     c.created_ts = row.ts;
+                    c.created_slot = row.slot;
                     c.uri_host = row
                         .uri
                         .as_deref()
@@ -562,8 +565,10 @@ impl Position {
     }
 }
 
-/// Wallets that bought within this many seconds of the create are "the bundle".
+/// Without the create's slot, wallets that bought within this many seconds of the
+/// create are "the bundle"; with it, the buyers in the create's block and the next.
 const BUNDLE_S: i64 = 5;
+const BUNDLE_SLOTS: u64 = 1;
 /// A Pump.fun coin's supply in base units (1e9 tokens of 6 decimals).
 const SUPPLY_BASE_UNITS: f64 = 1e15;
 /// The flow window for money leaving and new buyers.
@@ -587,6 +592,10 @@ struct State {
     bundle_now: i128,
     dev_peak: i128,
     dev_now: i128,
+    /// tokens held by every wallet with a positive balance
+    held_total: i128,
+    /// holders outside the bundle
+    non_bundle_holders: usize,
     /// (ts, buy, lamports, first buy of a new wallet) in the last `FLOW_S`
     window: std::collections::VecDeque<(i64, bool, u64, bool)>,
     buy_w: u64,
@@ -619,25 +628,42 @@ pub struct Snap {
     /// SOL in the curve or pool over its peak
     pub net_sol_vs_peak: f64,
     pub holders: usize,
+    /// the bundle's share of all tokens held
+    pub bundle_share_held: f64,
+    /// holders outside the bundle
+    pub non_bundle_holders: usize,
 }
 
 impl State {
-    fn apply(&mut self, c: &Coin, ts: i64, buy: bool, user: u64, sol: u64, tok: u64) {
+    #[allow(clippy::too_many_arguments)]
+    fn apply(&mut self, c: &Coin, ts: i64, slot: u64, buy: bool, user: u64, sol: u64, tok: u64) {
         let b = self.bal.entry(user).or_insert(0);
         let before = *b;
         *b += if buy { tok as i128 } else { -(tok as i128) };
         let after = *b;
-        self.holders = (self.holders + (after > 0) as usize).saturating_sub((before > 0) as usize);
-        self.holders_peak = self.holders_peak.max(self.holders);
+        self.held_total += after.max(0) - before.max(0);
         let mut fresh = false;
         if buy {
             fresh = self.buyers.insert(user);
-            if ts - c.created_ts <= BUNDLE_S {
+            let in_bundle = if c.created_slot > 0 && slot > 0 {
+                slot <= c.created_slot + BUNDLE_SLOTS
+            } else {
+                ts - c.created_ts <= BUNDLE_S
+            };
+            if in_bundle {
                 self.bundle.insert(user);
             }
             if fresh {
                 self.last_new_buyer_ts = ts;
             }
+        }
+        let was = before > 0;
+        let is = after > 0;
+        self.holders = (self.holders + is as usize).saturating_sub(was as usize);
+        self.holders_peak = self.holders_peak.max(self.holders);
+        if !self.bundle.contains(&user) {
+            self.non_bundle_holders =
+                (self.non_bundle_holders + is as usize).saturating_sub(was as usize);
         }
         if self.bundle.contains(&user) {
             self.bundle_now += after - before;
@@ -665,7 +691,7 @@ impl State {
         }
     }
     fn curve(&mut self, c: &Coin, x: &Tick) {
-        self.apply(c, x.ts, x.buy, x.user, 0, x.tok);
+        self.apply(c, x.ts, x.slot, x.buy, x.user, 0, x.tok);
         // the window's SOL comes from the curve's own reserves on this leg
         if let Some(w) = self.window.back_mut() {
             w.2 = x.rsol.abs_diff(self.net_sol);
@@ -680,7 +706,7 @@ impl State {
         self.mcap_sol = x.mcap_sol();
     }
     fn pool(&mut self, c: &Coin, x: &PoolTick) {
-        self.apply(c, x.ts, x.buy, x.user, x.sol, x.tok);
+        self.apply(c, x.ts, x.slot, x.buy, x.user, x.sol, x.tok);
         self.graduated = true;
         self.net_sol = x.liq;
         self.net_sol_peak = self.net_sol_peak.max(self.net_sol);
@@ -724,6 +750,12 @@ impl State {
                 self.net_sol as f64 / self.net_sol_peak as f64
             },
             holders: self.holders,
+            bundle_share_held: if self.held_total > 0 {
+                (self.bundle_now.max(0) as f64 / self.held_total as f64).min(1.0)
+            } else {
+                0.0
+            },
+            non_bundle_holders: self.non_bundle_holders,
         }
     }
 }
@@ -757,6 +789,14 @@ pub enum EntryRule {
         min_buy_ratio: f64,
         min_new_buyers_w: usize,
         min_sol_vs_peak: f64,
+    },
+    /// money in the curve, and breadth outside the bundle: the bundle holds at most this
+    /// share of all tokens held and at least this many holders are not in it
+    MoneyBreadth {
+        min_net_sol: f64,
+        max_bundle_share: f64,
+        min_non_bundle_holders: usize,
+        within_s: i64,
     },
     /// the first of several to hold
     Any(Vec<EntryRule>),
@@ -800,6 +840,15 @@ impl EntryRule {
                 "resume: buys ≥ {min_buy_ratio}× sells over 60 s & new buyers 60 s ≥ {min_new_buyers_w} & SOL ≥ {:.0}% of its peak",
                 min_sol_vs_peak * 100.0
             ),
+            EntryRule::MoneyBreadth {
+                min_net_sol,
+                max_bundle_share,
+                min_non_bundle_holders,
+                within_s,
+            } => format!(
+                "net SOL ≥ {min_net_sol} & bundle ≤ {:.0}% of tokens held & holders outside it ≥ {min_non_bundle_holders} within {within_s} s",
+                max_bundle_share * 100.0
+            ),
             EntryRule::Any(v) => v
                 .iter()
                 .map(|r| r.label())
@@ -814,6 +863,7 @@ impl EntryRule {
                 *within_s
             }
             EntryRule::Resume { .. } => i64::MAX,
+            EntryRule::MoneyBreadth { within_s, .. } => *within_s,
             EntryRule::Any(v) => v.iter().map(|r| r.within()).max().unwrap_or(0),
         }
     }
@@ -852,6 +902,16 @@ impl EntryRule {
                     && st.buy_w as f64 >= min_buy_ratio * st.sell_w as f64
                     && snap.new_buyers_w >= *min_new_buyers_w
                     && snap.net_sol_vs_peak >= *min_sol_vs_peak
+            }
+            EntryRule::MoneyBreadth {
+                min_net_sol,
+                max_bundle_share,
+                min_non_bundle_holders,
+                ..
+            } => {
+                st.net_sol as f64 / LAMPORTS >= *min_net_sol
+                    && snap.bundle_share_held <= *max_bundle_share
+                    && snap.non_bundle_holders >= *min_non_bundle_holders
             }
             EntryRule::Any(v) => v.iter().any(|r| r.holds(st, snap)),
         }

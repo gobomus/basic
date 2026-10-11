@@ -816,6 +816,18 @@ fn entry_rules() -> Vec<EntryRule> {
             min_new_buyers_w: 15,
             within_s: 1800,
         },
+        EntryRule::MoneyBreadth {
+            min_net_sol: 20.0,
+            max_bundle_share: 0.5,
+            min_non_bundle_holders: 10,
+            within_s: 60,
+        },
+        EntryRule::MoneyBreadth {
+            min_net_sol: 20.0,
+            max_bundle_share: 0.3,
+            min_non_bundle_holders: 20,
+            within_s: 120,
+        },
     ]
 }
 
@@ -900,10 +912,12 @@ fn exit_section(
     );
         let _ = writeln!(o, "|---|---:|---:|---:|---:|");
         type Pick = fn(&replay::Snap) -> f64;
-        let readings: [(&str, Pick); 9] = [
+        let readings: [(&str, Pick); 11] = [
             ("age, s", |s| s.age as f64),
             ("sells / buys in SOL, last 60 s", |s| s.flow_ratio),
-            ("bundle (first-5 s buyers) still holds", |s| s.bundle_left),
+            ("bundle (create-block buyers) still holds", |s| {
+                s.bundle_left
+            }),
             ("creator still holds", |s| s.dev_left),
             ("holders vs their peak", |s| s.holders_vs_peak),
             ("holders", |s| s.holders as f64),
@@ -912,6 +926,10 @@ fn exit_section(
                 s.since_new_buyer as f64
             }),
             ("SOL in curve/pool vs its peak", |s| s.net_sol_vs_peak),
+            ("bundle's share of tokens held", |s| s.bundle_share_held),
+            ("holders outside the bundle", |s| {
+                s.non_bundle_holders as f64
+            }),
         ];
         let med = |v: Vec<f64>| {
             let mut v = v;
@@ -1501,9 +1519,51 @@ fn creator_section(
             sol_d / rs.len() as f64
         );
     }
+    // the money signal with breadth outside the bundle instead of the bare money signal
+    let (second, organic) = match &entry {
+        EntryRule::Any(v) => (v[1].clone(), v[2].clone()),
+        other => (other.clone(), other.clone()),
+    };
+    let breadth = EntryRule::Any(vec![
+        EntryRule::MoneyBreadth {
+            min_net_sol: 20.0,
+            max_bundle_share: 0.5,
+            min_non_bundle_holders: 10,
+            within_s: 60,
+        },
+        second,
+        organic,
+    ]);
+    let (mut n, mut w100, mut w30, mut nl, mut sa, mut sd) =
+        (0usize, 0usize, 0usize, 0usize, 0.0f64, 0.0f64);
+    for c in standard {
+        let Some(&i) = tape_ix.get(c.mint.as_str()) else {
+            continue;
+        };
+        let la = replay::legs(&tape[i], &breadth, &reentry, a, k);
+        if la.is_empty() {
+            continue;
+        }
+        let ld = replay::legs(&tape[i], &breadth, &reentry, d, k);
+        let sol =
+            |l: &[replay::Leg]| l.iter().map(|x| x.ret).sum::<f64>() * k.size_lamports as f64 / 1e9;
+        n += 1;
+        w100 += (c.peak_usd() >= 100e3) as usize;
+        w30 += (c.peak_usd() >= 30e3) as usize;
+        nl += ld.len();
+        sa += sol(&la);
+        sd += sol(&ld);
+    }
+    if n >= MIN_FIRES {
+        let _ = writeln!(
+            o,
+            "| entry = money & breadth outside the bundle (bundle ≤ 50% of tokens held, ≥ 10 holders outside it) instead of the bare money signal | {n} | {w100} | {w30} | {nl} | {sa:+.1} | **{sd:+.1}** | {:+.3} |",
+            sd / n as f64
+        );
+    }
     let _ = writeln!(
         o,
-        "_The record grows with every census run: a creator's history before the first tape is unknown, so \"first launch on tape\" is a mix of true first-timers and creators whose history predates the recording._"
+        "_The record grows with every census run: a creator's history before the first tape is unknown, so \"first launch on tape\" is a mix of true first-timers and creators whose history predates the recording. The bundle is the buyers in the create's block and the next one._"
     );
 }
 
