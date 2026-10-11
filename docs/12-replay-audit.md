@@ -72,7 +72,7 @@ What I will not change: the fees, the delay, the impact model and the no-lookahe
 
 Asked for after: *"The whole point of identifying trending and top runners each day is to find the metrics and data that singles them out at as early stage as possible, and THAT IS our entry. We should be in the coins within seconds of that signal. Now audit all the conventional junk we seem to have been contaminated with."*
 
-The order was wrong. The replays asked "which entry × exit pair makes money" before asking "who are the winners and what did they look like in their first seconds". That is the standard backtest template and it is the wrong order for this market, where a coin's future is decided in its first seconds by who shows up. `copybot winners` now does it in the right order, on the whole tape, every run: winners → fingerprint → earliest signal → what entering at that signal pays. The full report for the three Actions runs so far (33,378 coins, 16.4 h) is in [reports/winners-2026-10-10.md](reports/winners-2026-10-10.md).
+The order was wrong. The replays asked "which entry × exit pair makes money" before asking "who are the winners and what did they look like in their first seconds". That is the standard backtest template and it is the wrong order for this market, where a coin's future is decided in its first seconds by who shows up. `copybot winners` now does it in the right order, on the whole tape, every run: winners → fingerprint → earliest signal → what entering at that signal pays. The full report for the three Actions runs so far (33,378 coins, 16.4 h) is in [reports/winners-2026-10-11.md](reports/winners-2026-10-11.md).
 
 ### 5.1 The conventional practices, named, and what replaces them
 
@@ -196,3 +196,49 @@ The population: 27 standard coins reached $100k on 16.4 h of tape (the largest 1
 That is the engine's result, and the trade-off is now in numbers: the exit that keeps four-fifths of a runner's move holds the losers longest, and 1,548 coins at −0.14 SOL each outweigh 24 coins at +3.2 SOL each. To be positive with exit D the entry has to remove three of every four non-winners while keeping the winners; the first-minute book does not do that (§5), the first-minute wallet overlap does not (§5.3), and the creator index is the next reading to test.
 
 Everything above recomputes in every census run, on more tape each time.
+
+## 8. Who launches them (2026-10-11)
+
+*"If the creator pool is small, do they throw spaghetti at the wall and see what runs, or are they pretty good statistically?"* Measured on 27.4 h of tape (five census runs, 52,040 coins with books, 32,382 standard).
+
+**The pool is not small, and it has a fat tail.** 25,427 creators; 22,299 of them launched once on this tape. 232 creators launched 20 or more and made 33% of all coins; one made over a thousand. By launches on tape:
+
+| creators by launches | creators | coins | ≥ $30k | ≥ $100k | Mayhem-mode |
+|---|---:|---:|---:|---:|---:|
+| 1 | 22,299 | 22,299 | 1.48% | 49 | 3% |
+| 2–4 | 2,041 | 5,111 | 1.06% | 8 | 16% |
+| 5–19 | 855 | 7,498 | 1.64% | 19 | 35% |
+| ≥ 20 | 232 | 17,132 | 1.51% | 36 | 61% |
+
+The serial launchers' hit rate per coin is the same as everyone's (1.5%); what differs is what they launch: 61% of the factories' coins are Mayhem-mode, where the $100k coins are more frequent (0.41% against 0.13%) and die harder afterwards (§5: −80 to −98% at 6 h). So the factories are spaghetti by volume, and the hit rate of a throw does not improve with practice.
+
+**The $100k coins come from one-shot creators.** Of the 43 standard coins that reached $100k, 37 came from a creator with exactly one launch on the tape, and 42 from creators with no prior winner. The serial ones among them (one creator with 49 launches, one with 14, one with 10, one with 5) each have exactly one hit and nothing else: spaghetti with one that stuck. One creator launched two coins and both reached $400k, hours apart. Nobody whose prior coin reached $100k launched another one that did (33 later coins, none above $30k).
+
+**The record as an entry reading** (a prior coin counts only if it is an hour older, so the reading is known at creation):
+
+| gate on the creator | coins | ≥ $30k | lift | ≥ $100k |
+|---|---:|---:|---:|---:|
+| no gate | 32,382 | 1.20% | | 43 |
+| first launch on tape | 24,830 | 1.33% | 1.1× | 39 |
+| factory: ≥ 3 prior launches, none ≥ $30k | 5,474 | 0.46% | 0.4× | 3 |
+| spray: ≥ 3 launches in the last hour | 6,496 | 0.38% | 0.3× | 3 |
+| a prior coin reached $30k | 569 | 2.11% [1.2–3.7] | 1.8× | 0 |
+| not a factory and not spraying | 24,134 | 1.43% | 1.2× | 39 |
+
+A prior winner nearly doubles the $30k rate and brings no $100k coin; a factory or spray record cuts the rate to a third. Inside the money signal (20 SOL in the curve at 5 s) the gates make no difference: 25–29% whatever the record. The launch tool (the metadata host on the create: ipfs.io, j7tracker, uxento, rapidlaunch and the rest) separates nothing either, 0.5–2.4% across the board with overlapping intervals.
+
+**The engine with the gate** (entry, re-entry and the four exits of §7, 27.4 h, 0.5 SOL a leg):
+
+| gate | coins entered | of them ≥ $100k | SOL, exit D |
+|---|---:|---:|---:|
+| no gate | 2,436 | 36 | −294.5 |
+| not a factory and not spraying | 2,091 | 32 | −249.7 |
+| first launch, or a prior coin reached $30k | 2,102 | 32 | −254.1 |
+
+Excluding the factories and sprayers keeps 32 of the 36 winners the engine enters and removes 15% of the loss. That is a real reading and it goes into the engine's entry, and it is nowhere near the three-of-four the launch tier needs. On a 27-hour tape "first launch" is the honest default for most creators; the reading sharpens as the tape lengthens, because a creator who launches again next week carries a record then.
+
+**The wallets, again, on 27 h.** Selective early wallets (≥ 2 winners, ≥ 25% precision, found on the first half) on the second half: 11.4% [9.8–13.2] for ≥ $30k with two of them in the first minute (10× lift), 18.8% [16.2–21.7] together with the money signal (17×, 762 fires), 1.4% for ≥ $100k. Below the money signal alone (28%); the wallets that are early in winners are early in everything.
+
+**The ledger on 27 h** (§7's table recomputed): 43 coins reached $100k; the entry held on 36 (84%); from the entry the tape peak is a median 15×; exit D keeps a median 57% of each move, +92 SOL on the 36 winners; the same rules on all 2,436 coins entered: −294 SOL.
+
+**So what is left to find.** Three layers are now measured at the moment of the create: the book (money and breadth in the first seconds), the creator's record, the early wallets' record. Each separates a little; none separates the bundle that runs from the bundle that dumps. What the winners have in common that the losers lack is after the bundle: new buyers keep coming while the bundle sells (§6.1: the bundle holds 27% at the winners' peak, and the run is the buyers who came after it). The measurable next reading is the second wave itself as a filter rather than an entry: not "enter at 20 SOL in 2 seconds" but "enter at 20 SOL in 2 seconds only if the first minute's buyers are not the bundle", which the live state already carries (new buyers in the last 60 s, bundle share of holders). That and the days of tape now accumulating are the next two sharpeners, and the engine's own result is printed every run so the day it turns is visible.

@@ -88,6 +88,7 @@ impl Book {
 pub struct Coin {
     pub mint: String,
     pub symbol: String,
+    pub creator: String,
     pub created_ts: i64,
     pub sol_usd: f64,
     pub mayhem: bool,
@@ -195,6 +196,7 @@ pub fn load(dir: &Path, day: Option<&str>) -> Vec<Coin> {
         let c = coins.entry(mint.to_string()).or_default();
         if t == 5 {
             c.symbol = r["symbol"].as_str().unwrap_or("").to_string();
+            c.creator = r["creator"].as_str().unwrap_or("").to_string();
             c.created_ts = r["created_ts"].as_i64().unwrap_or(0);
             c.sol_usd = r["sol_usd"].as_f64().unwrap_or(0.0);
             c.mayhem = r["mayhem"] == true;
@@ -723,16 +725,21 @@ fn wallet_section(
             .count()
     };
     let mut out = vec![];
-    let cases: [WalletCase; 3] = [
+    let cases: [WalletCase; 4] = [
         ("selective early wallets", &known, 1, second, split_ts),
         ("selective early wallets", &known, 2, second, split_ts),
+        ("selective early wallets", &known, 1, second, split_ts),
         ("leaders", leaders, 1, idx, 0),
     ];
-    for (label, set, min, pool, from_ts) in cases {
+    for (i, (label, set, min, pool, from_ts)) in cases.into_iter().enumerate() {
         if set.is_empty() {
             continue;
         }
-        let sig = Signal::wallets(set.clone(), min, EARLY_S, label);
+        let mut sig = Signal::wallets(set.clone(), min, EARLY_S, label);
+        if i == 2 {
+            // the money signal and a selective wallet together
+            sig.min_net_sol = 20.0;
+        }
         let fires: Vec<usize> = pool
             .iter()
             .copied()
@@ -1066,26 +1073,9 @@ fn exit_section(
 /// The logged winners against the engine: for every standard coin that reached $100k,
 /// the full move on tape, the entry that fired and when, the move from there, and the
 /// state machine's legs with re-entry under two exit readings.
-fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Costs, sol_usd: f64) {
-    let _ = writeln!(
-        o,
-        "\n## The logged winners against the engine (every standard coin that reached $100k)\n"
-    );
-    let tape_ix: HashMap<&str, usize> = tape
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.mint.as_str(), i))
-        .collect();
-    let mut big: Vec<&Coin> = coins
-        .iter()
-        .copied()
-        .filter(|c| c.peak_usd() >= 100e3 && tape_ix.contains_key(c.mint.as_str()))
-        .collect();
-    big.sort_by(|a, b| b.peak_usd().total_cmp(&a.peak_usd()));
-    if big.is_empty() {
-        let _ = writeln!(o, "_No such coin with its trades on tape yet._");
-        return;
-    }
+/// The state machine as tested: entry (the first of three readings), re-entry, and the
+/// exit readings A–D.
+fn machine() -> (EntryRule, EntryRule, Vec<ExitRule>) {
     let entry = EntryRule::Any(vec![
         EntryRule::Signal(Signal::simple(20.0, 0, 0, 60)),
         EntryRule::SecondWave {
@@ -1107,7 +1097,7 @@ fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Co
         min_new_buyers_w: 10,
         min_sol_vs_peak: 0.9,
     };
-    let exits = [
+    let exits = vec![
         ExitRule::SolLeaving(0.8),
         ExitRule::Either(
             Box::new(ExitRule::MoneyLeaving(2.0)),
@@ -1125,6 +1115,419 @@ fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Co
             Box::new(ExitRule::HoldersFalling(0.9)),
         ),
     ];
+    (entry, reentry, exits)
+}
+
+/// A creator's record on tape as of one of their coins' creation: launches at least
+/// an hour older (their first hour is complete, so their outcome was knowable), how
+/// those did, and how many they launched in the hour before.
+#[derive(Clone, Copy, Debug, Default)]
+struct Record {
+    prior: usize,
+    prior_30k: usize,
+    prior_100k: usize,
+    prior_insider: usize,
+    last_hour: usize,
+    /// launches by this creator on the whole tape (hindsight; for the tables only)
+    total: usize,
+    total_30k: usize,
+}
+
+/// Every coin's creator record, by mint. Pre-funded coins never count as winners.
+fn creator_records(coins: &[Coin]) -> HashMap<&str, Record> {
+    let mut by: HashMap<&str, Vec<&Coin>> = HashMap::new();
+    for c in coins.iter().filter(|c| !c.creator.is_empty()) {
+        by.entry(c.creator.as_str()).or_default().push(c);
+    }
+    let mut out = HashMap::new();
+    for v in by.values_mut() {
+        v.sort_by_key(|c| c.created_ts);
+        let total = v.len();
+        let total_30k = v
+            .iter()
+            .filter(|c| !c.insider && c.peak_usd() >= 30e3)
+            .count();
+        for (i, c) in v.iter().enumerate() {
+            let mut r = Record {
+                total,
+                total_30k,
+                ..Default::default()
+            };
+            for p in &v[..i] {
+                if p.created_ts <= c.created_ts - 3600 {
+                    r.prior += 1;
+                    r.prior_insider += p.insider as usize;
+                    if !p.insider {
+                        r.prior_30k += (p.peak_usd() >= 30e3) as usize;
+                        r.prior_100k += (p.peak_usd() >= 100e3) as usize;
+                    }
+                } else {
+                    r.last_hour += 1;
+                }
+            }
+            out.insert(c.mint.as_str(), r);
+        }
+    }
+    out
+}
+
+/// A gate on the creator's record at creation.
+type Gate = (&'static str, fn(&Record) -> bool);
+
+fn gates() -> Vec<Gate> {
+    vec![
+        ("no gate", |_| true),
+        ("first launch on tape (no prior ≥ 1 h older)", |r| {
+            r.prior == 0
+        }),
+        ("prior launches, none ≥ $30k", |r| {
+            r.prior >= 1 && r.prior_30k == 0
+        }),
+        ("factory: ≥ 3 prior launches, none ≥ $30k", |r| {
+            r.prior >= 3 && r.prior_30k == 0
+        }),
+        ("spray: ≥ 3 launches in the last hour", |r| {
+            r.last_hour >= 3
+        }),
+        ("a prior coin reached $30k", |r| r.prior_30k >= 1),
+        ("a prior coin reached $100k", |r| r.prior_100k >= 1),
+        ("a prior coin was pre-funded", |r| r.prior_insider >= 1),
+        ("not a factory and not spraying", |r| {
+            !(r.prior >= 3 && r.prior_30k == 0) && r.last_hour < 3
+        }),
+        ("first launch, or a prior coin reached $30k", |r| {
+            r.prior == 0 || r.prior_30k >= 1
+        }),
+    ]
+}
+
+/// Who launches the coins: the size of the creator pool, what the serial launchers
+/// produce, the winners' creators' records, the creator's record as an entry reading
+/// (known at creation by construction), and the engine with the entry gated by it.
+fn creator_section(
+    o: &mut String,
+    coins: &[Coin],
+    standard: &[&Coin],
+    tape: &[replay::Coin],
+    k: &Costs,
+) {
+    let _ = writeln!(
+        o,
+        "\n## Who launches them: the creator index (from the tape)\n"
+    );
+    let records = creator_records(coins);
+    let mut by: HashMap<&str, Vec<&Coin>> = HashMap::new();
+    for c in coins.iter().filter(|c| !c.creator.is_empty()) {
+        by.entry(c.creator.as_str()).or_default().push(c);
+    }
+    if by.is_empty() {
+        let _ = writeln!(o, "_No creator on the books yet._");
+        return;
+    }
+    let n_launch: usize = by.values().map(|v| v.len()).sum();
+    let count = |min: usize| by.values().filter(|v| v.len() >= min).count();
+    let cover = |min: usize| {
+        by.values()
+            .filter(|v| v.len() >= min)
+            .map(|v| v.len())
+            .sum::<usize>()
+    };
+    let _ = writeln!(
+        o,
+        "- {} coins with a creator on the books, **{} creators**; with ≥ 2 launches: {} creators covering {} coins ({:.0}%); ≥ 5: {} covering {} ({:.0}%); ≥ 20: {} covering {} ({:.0}%)",
+        n_launch,
+        by.len(),
+        count(2),
+        cover(2),
+        100.0 * cover(2) as f64 / n_launch as f64,
+        count(5),
+        cover(5),
+        100.0 * cover(5) as f64 / n_launch as f64,
+        count(20),
+        cover(20),
+        100.0 * cover(20) as f64 / n_launch as f64
+    );
+    // ---- by launches on tape
+    let _ = writeln!(
+        o,
+        "\n| creators by launches on tape | creators | coins | ≥ $30k (not pre-funded) | ≥ $100k | pre-funded | Mayhem-mode | median net SOL at 5 s | median holders at 15 s |"
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (label, lo, hi) in [
+        ("1", 1, 1),
+        ("2–4", 2, 4),
+        ("5–19", 5, 19),
+        ("≥ 20", 20, usize::MAX),
+    ] {
+        let groups: Vec<&Vec<&Coin>> = by
+            .values()
+            .filter(|v| v.len() >= lo && v.len() <= hi)
+            .collect();
+        let cs: Vec<&Coin> = groups.iter().flat_map(|v| v.iter().copied()).collect();
+        if cs.is_empty() {
+            continue;
+        }
+        let n = cs.len() as f64;
+        let w30 = cs
+            .iter()
+            .filter(|c| !c.insider && c.peak_usd() >= 30e3)
+            .count();
+        let w100 = cs
+            .iter()
+            .filter(|c| !c.insider && c.peak_usd() >= 100e3)
+            .count();
+        let mut net: Vec<f64> = cs
+            .iter()
+            .filter_map(|c| c.books.get(&5).map(|b| b.net_sol))
+            .collect();
+        let mut hold: Vec<f64> = cs
+            .iter()
+            .filter_map(|c| c.books.get(&15).map(|b| b.holders as f64))
+            .collect();
+        let _ = writeln!(
+            o,
+            "| {label} | {} | {} | {} ({:.2}%) | {} | {:.0}% | {:.0}% | {:.1} | {:.0} |",
+            groups.len(),
+            cs.len(),
+            w30,
+            100.0 * w30 as f64 / n,
+            w100,
+            100.0 * cs.iter().filter(|c| c.insider).count() as f64 / n,
+            100.0 * cs.iter().filter(|c| c.mayhem).count() as f64 / n,
+            median(&mut net),
+            median(&mut hold)
+        );
+    }
+    // ---- the winners' creators
+    let mut big: Vec<&Coin> = standard
+        .iter()
+        .copied()
+        .filter(|c| c.peak_usd() >= 100e3)
+        .collect();
+    big.sort_by(|a, b| b.peak_usd().total_cmp(&a.peak_usd()));
+    if !big.is_empty() {
+        let _ = writeln!(
+            o,
+            "\nThe $100k coins' creators: launches on tape, what came before this coin (an hour older or more) and what came after:\n"
+        );
+        let _ = writeln!(
+            o,
+            "| coin | peak | creator | launches on tape, ≥ $30k | before: launches, ≥ $30k | in the hour before | after: launches, ≥ $30k |"
+        );
+        let _ = writeln!(o, "|---|---:|---|---:|---:|---:|---:|");
+        for c in &big {
+            let r = records.get(c.mint.as_str()).copied().unwrap_or_default();
+            let later: Vec<&&Coin> = by
+                .get(c.creator.as_str())
+                .map(|v| v.iter().filter(|x| x.created_ts > c.created_ts).collect())
+                .unwrap_or_default();
+            let _ = writeln!(
+                o,
+                "| {} | {} | `{}` | {}, {} | {}, {} | {} | {}, {} |",
+                if c.symbol.is_empty() {
+                    &c.mint[..6]
+                } else {
+                    &c.symbol
+                },
+                money(c.peak_usd()),
+                if c.creator.len() > 8 {
+                    &c.creator[..8]
+                } else {
+                    &c.creator
+                },
+                r.total,
+                r.total_30k,
+                r.prior,
+                r.prior_30k,
+                r.last_hour,
+                later.len(),
+                later
+                    .iter()
+                    .filter(|x| !x.insider && x.peak_usd() >= 30e3)
+                    .count()
+            );
+        }
+    }
+    // ---- the launch tool: the metadata host on the create
+    let tape_host: HashMap<&str, &str> = tape
+        .iter()
+        .map(|c| (c.mint.as_str(), c.uri_host.as_str()))
+        .collect();
+    if !tape_host.is_empty() {
+        let mut hosts: HashMap<&str, Vec<&Coin>> = HashMap::new();
+        for c in standard {
+            if let Some(h) = tape_host.get(c.mint.as_str()) {
+                hosts.entry(h).or_default().push(c);
+            }
+        }
+        let mut rows: Vec<(&str, &Vec<&Coin>)> = hosts.iter().map(|(h, v)| (*h, v)).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1.len()));
+        let _ = writeln!(
+            o,
+            "\nThe launch tool, read from the metadata host on the create (standard coins on tape):\n"
+        );
+        let _ = writeln!(
+            o,
+            "| metadata host | coins | ≥ $30k (95%) | ≥ $100k | median net SOL at 5 s | creators |"
+        );
+        let _ = writeln!(o, "|---|---:|---|---:|---:|---:|");
+        for (h, v) in rows.iter().take(12) {
+            let w30 = v.iter().filter(|c| c.peak_usd() >= 30e3).count();
+            let (lo, hi) = wilson(w30, v.len());
+            let mut net: Vec<f64> = v
+                .iter()
+                .filter_map(|c| c.books.get(&5).map(|b| b.net_sol))
+                .collect();
+            let creators: HashSet<&str> = v.iter().map(|c| c.creator.as_str()).collect();
+            let _ = writeln!(
+                o,
+                "| {} | {} | {:.2}% [{:.2}–{:.2}] | {} | {:.1} | {} |",
+                if h.is_empty() { "(none)" } else { h },
+                v.len(),
+                100.0 * w30 as f64 / v.len() as f64,
+                100.0 * lo,
+                100.0 * hi,
+                v.iter().filter(|c| c.peak_usd() >= 100e3).count(),
+                median(&mut net),
+                creators.len()
+            );
+        }
+    }
+    // ---- the record as an entry reading
+    let base30 = standard.iter().filter(|c| c.peak_usd() >= 30e3).count() as f64
+        / standard.len().max(1) as f64;
+    let base100 = standard.iter().filter(|c| c.peak_usd() >= 100e3).count() as f64
+        / standard.len().max(1) as f64;
+    let _ = writeln!(
+        o,
+        "\nThe creator's record at creation as an entry reading (standard coins; a prior coin counts only if it is an hour older, so this is known when the coin is created):\n"
+    );
+    let _ = writeln!(
+        o,
+        "| gate on the creator | coins | ≥ $30k (95%) | lift | ≥ $100k | lift | with net SOL ≥ 20 at 5 s: coins | ≥ $30k (95%) | ≥ $100k |"
+    );
+    let _ = writeln!(o, "|---|---:|---|---:|---:|---:|---:|---|---:|");
+    for (label, pass) in gates() {
+        let cs: Vec<&Coin> = standard
+            .iter()
+            .copied()
+            .filter(|c| records.get(c.mint.as_str()).is_some_and(pass))
+            .collect();
+        if cs.len() < MIN_FIRES {
+            continue;
+        }
+        let n = cs.len();
+        let w30 = cs.iter().filter(|c| c.peak_usd() >= 30e3).count();
+        let w100 = cs.iter().filter(|c| c.peak_usd() >= 100e3).count();
+        let fired: Vec<&Coin> = cs
+            .iter()
+            .copied()
+            .filter(|c| c.books.get(&5).is_some_and(|b| b.net_sol >= 20.0))
+            .collect();
+        let f30 = fired.iter().filter(|c| c.peak_usd() >= 30e3).count();
+        let f100 = fired.iter().filter(|c| c.peak_usd() >= 100e3).count();
+        let (lo, hi) = wilson(w30, n);
+        let (flo, fhi) = wilson(f30, fired.len());
+        let _ = writeln!(
+            o,
+            "| {label} | {n} | **{:.2}%** [{:.2}–{:.2}] | {:.1}× | {w100} ({:.2}%) | {:.1}× | {} | {:.1}% [{:.1}–{:.1}] | {f100} |",
+            100.0 * w30 as f64 / n as f64,
+            100.0 * lo,
+            100.0 * hi,
+            (w30 as f64 / n as f64) / base30.max(1e-9),
+            100.0 * w100 as f64 / n as f64,
+            (w100 as f64 / n as f64) / base100.max(1e-9),
+            fired.len(),
+            100.0 * f30 as f64 / fired.len().max(1) as f64,
+            100.0 * flo,
+            100.0 * fhi
+        );
+    }
+    // ---- the engine with the gate
+    let tape_ix: HashMap<&str, usize> = tape
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.mint.as_str(), i))
+        .collect();
+    if tape_ix.is_empty() {
+        return;
+    }
+    let (entry, reentry, exits) = machine();
+    let (a, d) = (&exits[0], &exits[3]);
+    // one ride per coin per exit; the gates only pick coins
+    let rides: Vec<(&Coin, f64, f64, usize)> = standard
+        .iter()
+        .filter_map(|c| {
+            let &i = tape_ix.get(c.mint.as_str())?;
+            let la = replay::legs(&tape[i], &entry, &reentry, a, k);
+            if la.is_empty() {
+                return None;
+            }
+            let ld = replay::legs(&tape[i], &entry, &reentry, d, k);
+            let sol = |l: &[replay::Leg]| {
+                l.iter().map(|x| x.ret).sum::<f64>() * k.size_lamports as f64 / 1e9
+            };
+            Some((*c, sol(&la), sol(&ld), ld.len()))
+        })
+        .collect();
+    let _ = writeln!(
+        o,
+        "\nThe engine (entry, re-entry, exits as in the ledger) with the entry gated by the creator's record, every coin the entry fires on:\n"
+    );
+    let _ = writeln!(
+        o,
+        "| gate on the creator | coins entered | of them ≥ $100k | ≥ $30k | legs (D) | SOL, exit A | SOL, exit D | SOL per coin, D |"
+    );
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---:|---:|");
+    for (label, pass) in gates() {
+        let rs: Vec<&(&Coin, f64, f64, usize)> = rides
+            .iter()
+            .filter(|r| records.get(r.0.mint.as_str()).is_some_and(pass))
+            .collect();
+        if rs.len() < MIN_FIRES {
+            continue;
+        }
+        let sol_a: f64 = rs.iter().map(|r| r.1).sum();
+        let sol_d: f64 = rs.iter().map(|r| r.2).sum();
+        let _ = writeln!(
+            o,
+            "| {label} | {} | {} | {} | {} | {:+.1} | **{:+.1}** | {:+.3} |",
+            rs.len(),
+            rs.iter().filter(|r| r.0.peak_usd() >= 100e3).count(),
+            rs.iter().filter(|r| r.0.peak_usd() >= 30e3).count(),
+            rs.iter().map(|r| r.3).sum::<usize>(),
+            sol_a,
+            sol_d,
+            sol_d / rs.len() as f64
+        );
+    }
+    let _ = writeln!(
+        o,
+        "_The record grows with every census run: a creator's history before the first tape is unknown, so \"first launch on tape\" is a mix of true first-timers and creators whose history predates the recording._"
+    );
+}
+
+fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Costs, sol_usd: f64) {
+    let _ = writeln!(
+        o,
+        "\n## The logged winners against the engine (every standard coin that reached $100k)\n"
+    );
+    let tape_ix: HashMap<&str, usize> = tape
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.mint.as_str(), i))
+        .collect();
+    let mut big: Vec<&Coin> = coins
+        .iter()
+        .copied()
+        .filter(|c| c.peak_usd() >= 100e3 && tape_ix.contains_key(c.mint.as_str()))
+        .collect();
+    big.sort_by(|a, b| b.peak_usd().total_cmp(&a.peak_usd()));
+    if big.is_empty() {
+        let _ = writeln!(o, "_No such coin with its trades on tape yet._");
+        return;
+    }
+    let (entry, reentry, exits) = machine();
     let _ = writeln!(
         o,
         "- entry: the first of **{}** to hold; re-entry after an exit: **{}**; exits A: **{}**, B: **{}**, C: **{}**, D (distribution, all three readings together): **{}**; {} SOL a leg, fills {} s after the deciding trade; the path is the trade tape (curve, then the pool while it was followed), the checkpoint peak is Jupiter's liquidity-backed reading up to 24 h",
@@ -1605,6 +2008,7 @@ pub fn report(
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
     exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
     ledger_section(&mut o, tape, &standard, &k, sol_usd);
+    creator_section(&mut o, coins, &standard, tape, &k);
     o
 }
 

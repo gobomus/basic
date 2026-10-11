@@ -100,6 +100,8 @@ pub struct Coin {
     pub graduated_ts: Option<i64>,
     /// the creator's wallet (hash)
     pub creator: u64,
+    /// the host of the metadata URI on the create (which launch tool made the coin)
+    pub uri_host: String,
     /// the pool's trades after graduation, in chain order
     pool: Vec<PoolTick>,
     /// priced in another token (amounts are not SOL)
@@ -283,6 +285,7 @@ struct TapeRow {
     user: Option<String>,
     tok: Option<u64>,
     creator: Option<String>,
+    uri: Option<String>,
     sol: Option<u64>,
     base: Option<u64>,
     mcap_sol: Option<f64>,
@@ -370,6 +373,13 @@ pub fn load_with_wallets(
             match row.ev.as_str() {
                 "create" => {
                     c.created_ts = row.ts;
+                    c.uri_host = row
+                        .uri
+                        .as_deref()
+                        .and_then(|u| u.split("://").nth(1))
+                        .and_then(|u| u.split('/').next())
+                        .unwrap_or("")
+                        .to_string();
                     if let Some(u) = row.creator.as_deref() {
                         c.creator = wallet_hash(u);
                         wallets.entry(c.creator).or_insert_with(|| u.to_string());
