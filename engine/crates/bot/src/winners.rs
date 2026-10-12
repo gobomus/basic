@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::census_report::age;
-use crate::replay::{self, hm, pct, recorded_hours, Costs, EntryRule, ExitRule, Signal};
+use crate::replay::{
+    self, hm, pct, recorded_hours, Costs, EntryRule, ExitRule, ForkKind, Outcome, Signal,
+};
 
 /// Book moments looked at (seconds after creation).
 pub const T: [i64; 6] = [5, 15, 30, 60, 120, 300];
@@ -1759,6 +1761,255 @@ fn ledger_section(o: &mut String, tape: &[replay::Coin], coins: &[&Coin], k: &Co
     }
 }
 
+/// A reading at a fork, from the live state and the balance table.
+type Reading = (&'static str, fn(&replay::Fork) -> f64);
+/// A reading with its separation.
+type Ranked = (f64, &'static str, fn(&replay::Fork) -> f64);
+/// A test on a fork, labelled.
+type ForkTest = (String, Box<dyn Fn(&replay::Fork) -> bool>);
+/// A split: the side the continuers lean to, the reading, the died side's median.
+type Split = (bool, fn(&replay::Fork) -> f64, f64);
+
+fn fork_readings() -> Vec<Reading> {
+    vec![
+        ("age, s", |f| f.snap.age as f64),
+        ("market cap, SOL", |f| f.snap.mcap_sol),
+        ("SOL in curve/pool", |f| f.snap.net_sol),
+        ("graduated (1 = yes)", |f| f.snap.graduated as u8 as f64),
+        ("holders", |f| f.snap.holders as f64),
+        ("holders outside the bundle", |f| {
+            f.snap.non_bundle_holders as f64
+        }),
+        ("holders gained in the last 60 s", |f| {
+            f.snap.holders_delta_w as f64
+        }),
+        ("holders vs their peak", |f| f.snap.holders_vs_peak),
+        ("new buyers, last 60 s", |f| f.snap.new_buyers_w as f64),
+        ("seconds since the last new buyer", |f| {
+            f.snap.since_new_buyer as f64
+        }),
+        ("sells / buys in SOL, last 60 s", |f| f.snap.flow_ratio),
+        ("buys / sells by count, last 60 s", |f| {
+            f.snap.buy_count_ratio
+        }),
+        ("mean buy size, SOL, last 60 s", |f| f.snap.mean_buy_sol_w),
+        ("buys of ≥ 1 SOL, last 60 s", |f| f.snap.big_buys_w as f64),
+        ("share of buy SOL in buys of ≥ 1 SOL, last 60 s", |f| {
+            f.snap.big_buy_share_w
+        }),
+        ("largest buy, SOL, last 60 s", |f| f.snap.max_buy_sol_w),
+        ("SOL change over the last 60 s", |f| f.snap.sol_delta_w),
+        ("SOL in curve/pool vs its peak", |f| f.snap.net_sol_vs_peak),
+        ("creator still holds (of their peak)", |f| f.snap.dev_left),
+        ("creator's share of supply", |f| f.snap.dev_share_supply),
+        ("creator sold in the last 60 s, SOL", |f| {
+            f.snap.dev_sold_w_sol
+        }),
+        ("bundle still holds (of its peak)", |f| f.snap.bundle_left),
+        ("bundle's share of supply", |f| f.snap.bundle_share_supply),
+        ("bundle's share of tokens held", |f| {
+            f.snap.bundle_share_held
+        }),
+        ("top holder's share of tokens held", |f| f.heavy.top1_share),
+        ("top 10 holders' share of tokens held", |f| {
+            f.heavy.top10_share
+        }),
+        ("holders with ≥ 1% of supply", |f| {
+            f.heavy.holders_1pct as f64
+        }),
+    ]
+}
+
+/// The share of (continuer, dier) pairs in which the continuer reads higher (ties
+/// half): 0.5 separates nothing, 1 or 0 separates perfectly.
+fn separation(c: &[f64], d: &[f64]) -> f64 {
+    if c.is_empty() || d.is_empty() {
+        return 0.5;
+    }
+    let mut d = d.to_vec();
+    d.sort_by(f64::total_cmp);
+    let mut wins = 0.0;
+    for x in c {
+        let below = d.partition_point(|y| *y < *x);
+        let upto = d.partition_point(|y| *y <= *x);
+        wins += below as f64 + 0.5 * (upto - below) as f64;
+    }
+    wins / (c.len() * d.len()) as f64
+}
+
+/// What separates a runner that keeps going from one that dies: at the first 2× from
+/// our entry, at the first pullback after it, and at the first $30k reading, every
+/// reading of the live state against what happened next.
+fn fork_section(o: &mut String, tape: &[replay::Coin], idx: &[usize], k: &Costs, sol_usd: f64) {
+    let _ = writeln!(
+        o,
+        "\n## The fork: what separates a runner that keeps going from one that dies\n"
+    );
+    if idx.is_empty() {
+        let _ = writeln!(o, "_Needs the trade tape._");
+        return;
+    }
+    let (entry, _, _) = machine();
+    let mut all: Vec<replay::Fork> = vec![];
+    for &i in idx {
+        if let Some(t) = tape[i].entry_ts(&entry) {
+            all.extend(replay::forks(&tape[i], t + k.delay_s, k, sol_usd));
+        }
+    }
+    let _ = writeln!(
+        o,
+        "Entry: the first of the three entry readings to hold ({} coins entered). At each moment below the live state is read; \"kept going\" and \"died\" are what the position did next, whichever came first; the data ending before either is left out. The separation is the share of (kept going, died) pairs in which the one that kept going reads higher: 0.50 separates nothing, 1.00 or 0.00 separates perfectly. Readings are ranked by how far from 0.50 they are.\n",
+        idx.iter().filter(|&&i| tape[i].entry_ts(&entry).is_some()).count()
+    );
+    for (kind, title, up, down) in [
+        (
+            ForkKind::Double,
+            "At the first 2× from our entry",
+            "doubled again (4×)",
+            "fell to half",
+        ),
+        (
+            ForkKind::Pullback,
+            "At the first pullback to 80% of the peak, after 2×",
+            "made a new high (≥ 110% of the peak)",
+            "fell to half the peak",
+        ),
+        (
+            ForkKind::Mcap30k,
+            "At the first $30k reading",
+            "reached $100k",
+            "fell to $15k",
+        ),
+    ] {
+        let at: Vec<&replay::Fork> = all.iter().filter(|f| f.kind == kind).collect();
+        let cont: Vec<&replay::Fork> = at
+            .iter()
+            .copied()
+            .filter(|f| f.outcome == Outcome::Continued)
+            .collect();
+        let died: Vec<&replay::Fork> = at
+            .iter()
+            .copied()
+            .filter(|f| f.outcome == Outcome::Died)
+            .collect();
+        let unknown = at.len() - cont.len() - died.len();
+        let mut fwd_c: Vec<f64> = cont.iter().map(|f| f.fwd_peak).collect();
+        let mut fwd_d: Vec<f64> = died.iter().map(|f| f.fwd_peak).collect();
+        let _ = writeln!(
+            o,
+            "### {title}\n\n{} moments: **{} kept going** ({up}; median peak from here {:.1}×), **{} died** ({down}; median peak from here {:.2}×), {} unknown (data ended). Kept going before dying: **{:.0}%**.\n",
+            at.len(),
+            cont.len(),
+            median(&mut fwd_c),
+            died.len(),
+            median(&mut fwd_d),
+            unknown,
+            100.0 * cont.len() as f64 / (cont.len() + died.len()).max(1) as f64
+        );
+        if cont.len() < MIN_FIRES || died.len() < MIN_FIRES {
+            let _ = writeln!(o, "_Too few on one side to read._");
+            continue;
+        }
+        let _ = writeln!(
+            o,
+            "| reading | kept going: p25 / **median** / p75 | died: p25 / **median** / p75 | separation |"
+        );
+        let _ = writeln!(o, "|---|---:|---:|---:|");
+        let mut rows: Vec<(f64, String)> = vec![];
+        for (name, f) in fork_readings() {
+            let mut cv: Vec<f64> = cont.iter().map(|x| f(x)).collect();
+            let mut dv: Vec<f64> = died.iter().map(|x| f(x)).collect();
+            let sep = separation(&cv, &dv);
+            let q = |v: &mut Vec<f64>| {
+                format!(
+                    "{:.2} / **{:.2}** / {:.2}",
+                    quantile(v, 0.25),
+                    quantile(v, 0.5),
+                    quantile(v, 0.75)
+                )
+            };
+            let row = format!(
+                "| {name} | {} | {} | **{sep:.2}** |",
+                q(&mut cv),
+                q(&mut dv)
+            );
+            rows.push(((sep - 0.5).abs(), row));
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, row) in &rows {
+            let _ = writeln!(o, "{row}");
+        }
+        // the three readings that separate most, each split at the diers' median, on
+        // the side the continuers lean to; then all three together
+        let mut ranked: Vec<Ranked> = fork_readings()
+            .into_iter()
+            .map(|(name, f)| {
+                let cv: Vec<f64> = cont.iter().map(|x| f(x)).collect();
+                let dv: Vec<f64> = died.iter().map(|x| f(x)).collect();
+                (separation(&cv, &dv), name, f)
+            })
+            .collect();
+        ranked.sort_by(|a, b| (b.0 - 0.5).abs().total_cmp(&(a.0 - 0.5).abs()));
+        let top: Vec<&Ranked> = ranked.iter().take(3).collect();
+        let base = cont.len() as f64 / (cont.len() + died.len()) as f64;
+        let _ = writeln!(
+            o,
+            "\nThe three readings that separate most, each split at the died side's median (no threshold search: the median is the split), and all three together:\n"
+        );
+        let _ = writeln!(
+            o,
+            "| rule at this moment | moments | kept going | precision (95%) | lift | recall |"
+        );
+        let _ = writeln!(o, "|---|---:|---:|---|---:|---:|");
+        let mut tests: Vec<ForkTest> = vec![];
+        for (sep, name, f) in &top {
+            let mut dv: Vec<f64> = died.iter().map(|x| f(x)).collect();
+            let m = median(&mut dv);
+            let higher = *sep > 0.5;
+            let f = *f;
+            tests.push((
+                format!("{name} {} {m:.2}", if higher { "≥" } else { "≤" }),
+                Box::new(move |x: &replay::Fork| if higher { f(x) >= m } else { f(x) <= m }),
+            ));
+        }
+        let all_three: Vec<ForkTest> = {
+            let names: Vec<String> = tests.iter().map(|t| t.0.clone()).collect();
+            let fs: Vec<Split> = top
+                .iter()
+                .map(|(sep, _, f)| {
+                    let mut dv: Vec<f64> = died.iter().map(|x| f(x)).collect();
+                    (*sep > 0.5, *f, median(&mut dv))
+                })
+                .collect();
+            vec![(
+                format!("all three: {}", names.join(" & ")),
+                Box::new(move |x: &replay::Fork| {
+                    fs.iter()
+                        .all(|(higher, f, m)| if *higher { f(x) >= *m } else { f(x) <= *m })
+                }),
+            )]
+        };
+        for (label, pass) in tests.iter().chain(all_three.iter()) {
+            let n = cont.iter().chain(died.iter()).filter(|x| pass(x)).count();
+            let kept = cont.iter().filter(|x| pass(x)).count();
+            let (lo, hi) = wilson(kept, n);
+            let _ = writeln!(
+                o,
+                "| {label} | {n} | {kept} | {:.0}% [{:.0}–{:.0}] | {:.1}× | {:.0}% |",
+                100.0 * kept as f64 / n.max(1) as f64,
+                100.0 * lo,
+                100.0 * hi,
+                (kept as f64 / n.max(1) as f64) / base.max(1e-9),
+                100.0 * kept as f64 / cont.len().max(1) as f64
+            );
+        }
+    }
+    let _ = writeln!(
+        o,
+        "_Shares of a peak are 1 when untouched. The top-holder readings come from the full balance table at that moment. A separation near 0.50 means the reading looks the same on both sides at that moment, whatever it does later._"
+    );
+}
+
 // ------------------------------------------------------------------ the report
 
 pub struct Args {
@@ -2067,6 +2318,7 @@ pub fn report(
         .collect();
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
     exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
+    fork_section(&mut o, tape, &std_idx, &k, sol_usd);
     ledger_section(&mut o, tape, &standard, &k, sol_usd);
     creator_section(&mut o, coins, &standard, tape, &k);
     o

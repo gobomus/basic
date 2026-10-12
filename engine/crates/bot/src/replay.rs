@@ -596,17 +596,42 @@ struct State {
     held_total: i128,
     /// holders outside the bundle
     non_bundle_holders: usize,
-    /// (ts, buy, lamports, first buy of a new wallet) in the last `FLOW_S`
-    window: std::collections::VecDeque<(i64, bool, u64, bool)>,
+    /// the trades of the last `FLOW_S`
+    window: std::collections::VecDeque<W>,
     buy_w: u64,
     sell_w: u64,
+    buys_w: usize,
+    sells_w: usize,
     new_buyers_w: usize,
+    dev_sold_w: u64,
     last_new_buyer_ts: i64,
+    /// (ts, holders, SOL in curve or pool) at each trade, back to `FLOW_S` ago
+    hist: std::collections::VecDeque<(i64, usize, u64)>,
     /// SOL in the curve, then the pool's SOL after graduation (lamports)
     net_sol: u64,
     net_sol_peak: u64,
     mcap_sol: f64,
     graduated: bool,
+}
+
+/// One trade in the flow window.
+#[derive(Clone, Copy, Debug)]
+struct W {
+    ts: i64,
+    buy: bool,
+    sol: u64,
+    fresh: bool,
+    dev: bool,
+}
+
+/// Readings that need the whole balance table; taken at a few moments only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Heavy {
+    /// the ten largest holders' share of all tokens held
+    pub top10_share: f64,
+    pub top1_share: f64,
+    /// holders with at least 1% of the supply
+    pub holders_1pct: usize,
 }
 
 /// The state's readings at one moment, for the fingerprints.
@@ -632,6 +657,30 @@ pub struct Snap {
     pub bundle_share_held: f64,
     /// holders outside the bundle
     pub non_bundle_holders: usize,
+    /// holders now minus holders a minute ago
+    pub holders_delta_w: i64,
+    /// SOL in the curve or pool now over a minute ago, minus one
+    pub sol_delta_w: f64,
+    /// buys over sells by count in the last minute (no sells: 99)
+    pub buy_count_ratio: f64,
+    /// mean buy size in SOL in the last minute
+    pub mean_buy_sol_w: f64,
+    /// SOL the creator sold in the last minute
+    pub dev_sold_w_sol: f64,
+    pub graduated: bool,
+    /// SOL in the curve or pool
+    pub net_sol: f64,
+    pub mcap_sol: f64,
+    /// the creator's share of the supply
+    pub dev_share_supply: f64,
+    /// the bundle's share of the supply
+    pub bundle_share_supply: f64,
+    /// buys of 1 SOL or more in the last minute
+    pub big_buys_w: usize,
+    /// the share of the last minute's buy SOL that came in buys of 1 SOL or more
+    pub big_buy_share_w: f64,
+    /// the largest buy in the last minute, SOL
+    pub max_buy_sol_w: f64,
 }
 
 impl State {
@@ -673,37 +722,82 @@ impl State {
             self.dev_now += after - before;
             self.dev_peak = self.dev_peak.max(self.dev_now);
         }
-        self.window.push_back((ts, buy, sol, fresh));
+        let dev = user == c.creator && c.creator != 0;
+        self.window.push_back(W {
+            ts,
+            buy,
+            sol,
+            fresh,
+            dev,
+        });
         if buy {
             self.buy_w += sol;
+            self.buys_w += 1;
         } else {
             self.sell_w += sol;
+            self.sells_w += 1;
+            if dev {
+                self.dev_sold_w += sol;
+            }
         }
         self.new_buyers_w += fresh as usize;
-        while self.window.front().is_some_and(|w| w.0 < ts - FLOW_S) {
-            let (_, b, s, f) = self.window.pop_front().unwrap();
-            if b {
-                self.buy_w -= s;
+        while self.window.front().is_some_and(|w| w.ts < ts - FLOW_S) {
+            let w = self.window.pop_front().unwrap();
+            if w.buy {
+                self.buy_w -= w.sol;
+                self.buys_w -= 1;
             } else {
-                self.sell_w -= s;
+                self.sell_w -= w.sol;
+                self.sells_w -= 1;
+                if w.dev {
+                    self.dev_sold_w -= w.sol;
+                }
             }
-            self.new_buyers_w -= f as usize;
+            self.new_buyers_w -= w.fresh as usize;
+        }
+    }
+    /// Remember holders and SOL at this trade, keeping the last reading from a minute ago.
+    fn remember(&mut self, ts: i64) {
+        self.hist.push_back((ts, self.holders, self.net_sol));
+        while self.hist.len() >= 2 && self.hist[1].0 <= ts - FLOW_S {
+            self.hist.pop_front();
+        }
+    }
+    /// The ten largest holders' share and the holders with ≥ 1% of the supply.
+    pub fn heavy(&self) -> Heavy {
+        let mut v: Vec<i128> = self.bal.values().copied().filter(|b| *b > 0).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let total: i128 = v.iter().sum();
+        if total <= 0 {
+            return Heavy::default();
+        }
+        Heavy {
+            top10_share: v.iter().take(10).sum::<i128>() as f64 / total as f64,
+            top1_share: v[0] as f64 / total as f64,
+            holders_1pct: v
+                .iter()
+                .filter(|b| **b as f64 >= 0.01 * SUPPLY_BASE_UNITS)
+                .count(),
         }
     }
     fn curve(&mut self, c: &Coin, x: &Tick) {
         self.apply(c, x.ts, x.slot, x.buy, x.user, 0, x.tok);
         // the window's SOL comes from the curve's own reserves on this leg
         if let Some(w) = self.window.back_mut() {
-            w.2 = x.rsol.abs_diff(self.net_sol);
+            w.sol = x.rsol.abs_diff(self.net_sol);
             if x.buy {
-                self.buy_w += w.2;
+                self.buy_w += w.sol;
             } else {
-                self.sell_w += w.2;
+                self.sell_w += w.sol;
+                if w.dev {
+                    self.dev_sold_w += w.sol;
+                }
             }
         }
         self.net_sol = x.rsol;
         self.net_sol_peak = self.net_sol_peak.max(self.net_sol);
         self.mcap_sol = x.mcap_sol();
+        self.remember(x.ts);
     }
     fn pool(&mut self, c: &Coin, x: &PoolTick) {
         self.apply(c, x.ts, x.slot, x.buy, x.user, x.sol, x.tok);
@@ -711,6 +805,7 @@ impl State {
         self.net_sol = x.liq;
         self.net_sol_peak = self.net_sol_peak.max(self.net_sol);
         self.mcap_sol = x.mcap_sol;
+        self.remember(x.ts);
     }
     fn snap(&self, c: &Coin, ts: i64) -> Snap {
         let share = |now: i128, peak: i128| {
@@ -756,6 +851,58 @@ impl State {
                 0.0
             },
             non_bundle_holders: self.non_bundle_holders,
+            holders_delta_w: self
+                .hist
+                .front()
+                .map_or(0, |h| self.holders as i64 - h.1 as i64),
+            sol_delta_w: self
+                .hist
+                .front()
+                .filter(|h| h.2 > 0)
+                .map_or(0.0, |h| self.net_sol as f64 / h.2 as f64 - 1.0),
+            buy_count_ratio: if self.sells_w == 0 {
+                if self.buys_w == 0 {
+                    1.0
+                } else {
+                    99.0
+                }
+            } else {
+                self.buys_w as f64 / self.sells_w as f64
+            },
+            mean_buy_sol_w: if self.buys_w == 0 {
+                0.0
+            } else {
+                self.buy_w as f64 / LAMPORTS / self.buys_w as f64
+            },
+            dev_sold_w_sol: self.dev_sold_w as f64 / LAMPORTS,
+            graduated: self.graduated,
+            net_sol: self.net_sol as f64 / LAMPORTS,
+            mcap_sol: self.mcap_sol,
+            dev_share_supply: self.dev_now.max(0) as f64 / SUPPLY_BASE_UNITS,
+            bundle_share_supply: self.bundle_now.max(0) as f64 / SUPPLY_BASE_UNITS,
+            big_buys_w: self
+                .window
+                .iter()
+                .filter(|w| w.buy && w.sol >= LAMPORTS as u64)
+                .count(),
+            big_buy_share_w: if self.buy_w == 0 {
+                0.0
+            } else {
+                self.window
+                    .iter()
+                    .filter(|w| w.buy && w.sol >= LAMPORTS as u64)
+                    .map(|w| w.sol)
+                    .sum::<u64>() as f64
+                    / self.buy_w as f64
+            },
+            max_buy_sol_w: self
+                .window
+                .iter()
+                .filter(|w| w.buy)
+                .map(|w| w.sol)
+                .max()
+                .unwrap_or(0) as f64
+                / LAMPORTS,
         }
     }
 }
@@ -1203,6 +1350,109 @@ pub fn legs(
         close(&pos, entry_ts, sell_ts, next_sell.is_some(), &mut out);
     }
     out
+}
+
+/// A moment on a run at which the question is "does it keep going or die".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForkKind {
+    /// the position is first worth 2× what we paid
+    Double,
+    /// after 2×, the position first falls to 80% of its peak
+    Pullback,
+    /// the coin first reads $30k
+    Mcap30k,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// doubled again (Double), made a new high (Pullback), reached $100k (Mcap30k)
+    Continued,
+    /// fell to half first
+    Died,
+    /// the data ended before either
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Fork {
+    pub kind: ForkKind,
+    pub snap: Snap,
+    pub heavy: Heavy,
+    pub outcome: Outcome,
+    /// the best later value over the value at the fork
+    pub fwd_peak: f64,
+}
+
+/// Buy with a fill at `entry_ts`, hold, and read the state at each fork moment; the
+/// outcome is what the position did afterwards.
+pub fn forks(c: &Coin, entry_ts: i64, k: &Costs, sol_usd: f64) -> Vec<Fork> {
+    let Some(pos) = open(c, entry_ts, k) else {
+        return vec![];
+    };
+    let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
+    let events = events_of(c);
+    let mut st = State::default();
+    let mut series: Vec<(i64, f64)> = vec![]; // (ts, value over cost)
+    let mut found: Vec<(ForkKind, usize, Snap, Heavy, f64)> = vec![]; // index into series, peak at the time
+    let (mut doubled, mut pulled, mut at30k) = (false, false, false);
+    let mut peak = 0.0f64;
+    for &(ts, is_pool, i) in &events {
+        if is_pool {
+            st.pool(c, &c.pool[i]);
+        } else {
+            st.curve(c, &c.ticks[i]);
+        }
+        if ts <= entry_ts {
+            continue;
+        }
+        let v = event_value(c, &pos, is_pool, i) as f64 / cost;
+        series.push((ts, v));
+        peak = peak.max(v);
+        let idx = series.len() - 1;
+        if !doubled && v >= 2.0 {
+            doubled = true;
+            found.push((ForkKind::Double, idx, st.snap(c, ts), st.heavy(), peak));
+        }
+        if doubled && !pulled && v <= 0.8 * peak {
+            pulled = true;
+            found.push((ForkKind::Pullback, idx, st.snap(c, ts), st.heavy(), peak));
+        }
+        if !at30k && st.mcap_sol * sol_usd >= 30_000.0 {
+            at30k = true;
+            found.push((ForkKind::Mcap30k, idx, st.snap(c, ts), st.heavy(), peak));
+        }
+    }
+    found
+        .into_iter()
+        .map(|(kind, idx, snap, heavy, peak_then)| {
+            let now = series[idx].1;
+            let (up, down) = match kind {
+                ForkKind::Double => (2.0 * now, 0.5 * now),
+                ForkKind::Pullback => (1.1 * peak_then, 0.5 * peak_then),
+                ForkKind::Mcap30k => (now * 100.0 / 30.0, 0.5 * now),
+            };
+            let mut outcome = Outcome::Unknown;
+            let mut fwd = now;
+            for &(_, v) in &series[idx + 1..] {
+                fwd = fwd.max(v);
+                if v >= up {
+                    outcome = Outcome::Continued;
+                    break;
+                }
+                if v <= down {
+                    outcome = Outcome::Died;
+                    break;
+                }
+            }
+            Fork {
+                kind,
+                snap,
+                heavy,
+                outcome,
+                fwd_peak: fwd / now.max(1e-12),
+            }
+        })
+        .collect()
 }
 
 /// Buy with a fill at `entry_ts`, then watch the live state on every later trade,
