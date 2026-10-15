@@ -72,7 +72,7 @@ What I will not change: the fees, the delay, the impact model and the no-lookahe
 
 Asked for after: *"The whole point of identifying trending and top runners each day is to find the metrics and data that singles them out at as early stage as possible, and THAT IS our entry. We should be in the coins within seconds of that signal. Now audit all the conventional junk we seem to have been contaminated with."*
 
-The order was wrong. The replays asked "which entry × exit pair makes money" before asking "who are the winners and what did they look like in their first seconds". That is the standard backtest template and it is the wrong order for this market, where a coin's future is decided in its first seconds by who shows up. `copybot winners` now does it in the right order, on the whole tape, every run: winners → fingerprint → earliest signal → what entering at that signal pays. The full report for the three Actions runs so far (33,378 coins, 16.4 h) is in [reports/winners-2026-10-12.md](reports/winners-2026-10-12.md).
+The order was wrong. The replays asked "which entry × exit pair makes money" before asking "who are the winners and what did they look like in their first seconds". That is the standard backtest template and it is the wrong order for this market, where a coin's future is decided in its first seconds by who shows up. `copybot winners` now does it in the right order, on the whole tape, every run: winners → fingerprint → earliest signal → what entering at that signal pays. The full report for the three Actions runs so far (33,378 coins, 16.4 h) is in [reports/winners-2026-10-15.md](reports/winners-2026-10-15.md).
 
 ### 5.1 The conventional practices, named, and what replaces them
 
@@ -295,7 +295,16 @@ The leaders are real: +9.5% a trade on their own fills, 53-second holds. Four se
 
 ### 10.3 What speed would buy
 
-(see the table that follows; filled in from the same run)
+The same trades with our transaction landing 0, 1, 2 and 4 seconds after the deciding trade (0 = the same block as the signal's trade, the best any infrastructure can do; the free feed runs 1–3 s behind the chain, so 0 s is not reachable on it):
+
+| landing | +3% before −10% | pays per fill | +10% before −20% | pays per fill | SOL-leaving exit, mean | copying the leaders, our mean | their mean |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 s | 45% | −4.2% | 51% | −4.8% | −6.6% | **−4.0%** (±5%) | +9.5% |
+| 1 s | 45% | −4.2% | 50% | −4.8% | −6.3% | −5.6% | +9.5% |
+| 2 s | 44% | −4.2% | 50% | −4.7% | −6.4% | −6.1% | +9.5% |
+| 4 s | 44% | −4.1% | 50% | −4.5% | −6.8% | −6.6% | +9.5% |
+
+Speed is not the lever. The money signal pays the same at 0 s as at 4 s: the fill lands on the bundle's spike whatever the latency, because the signal *is* the spike. Copying the leaders improves from −6.6% to −4.0% at the same block and stays negative: thirteen points short of their own +9.5%, which is fees and our impact (four to six points) and the rest the structure of following. Their buy moves the curve before ours lands and their sell moves it before ours does; a copier is always one trade behind on both sides, and on a bonding curve with 50-second holds that one trade is the edge. Paid infrastructure would buy nothing here.
 
 ### 10.4 The spike, on four days
 
@@ -303,4 +312,4 @@ The ledger of §7 on 149 coins: the entry held on 136 (91%); the median move fro
 
 ### 10.5 What this says about the two layers
 
-The spike layer exists and is measured: the entry catches nine of ten $100k coins within seconds, the exit keeps a third to four-fifths of the move depending on the exit, and the coins that go on can be told from the ones that die at $30k by who is buying, modestly. The grind layer does not exist at the launch tier at a 4-second landing: the path after the fill has no small-gain edge in any direction, and the only wallets with a real per-trade edge lose it in the delay. The question that decides the grind is therefore speed, and §10.3 measures it on the same trades.
+The spike layer exists and is measured: the entry catches nine of ten $100k coins within seconds, the exit keeps a third to four-fifths of the move depending on the exit, and the coins that go on can be told from the ones that die at $30k by who is buying, modestly. The grind layer does not exist at the launch tier, at any landing: the path after the fill has no small-gain edge in any direction at 0 s or at 4 s, and the only wallets with a real per-trade edge cannot be followed, because following is being one trade behind on a curve. The grind, if it exists, is not on the bonding curve in a coin's first minutes. Where it can still be looked for with the data already recorded: the pool after graduation, where the tape carries every trade for a day and the losses of §5 (85% of pools at −95% an hour after graduation) are a pattern a short side could use if there were one (there is not, on Pump.fun) and a patient bid could use when it turns; and the liquidity-backed trending coins of the 5-minute captures, hours old, where a pullback-and-resume reading is the kind of thing a grind is made of. Both are measurable from the tape on hand and neither has been measured as a grind yet. The spike layer is built; the grind layer is the next thing to look for, and it is not on the launch tier.
