@@ -262,3 +262,45 @@ Excluding the factories and sprayers keeps 32 of the 36 winners the engine enter
 **At $30k the pattern is who is buying, and it runs against the crowd.** The coins that go on to $100k have fewer holders at $30k (median 116 against 168), fewer new buyers in the last minute (43 against 68), fewer holders gained (26 against 46), and their money comes in bigger pieces: 71% of the last minute's buy SOL in buys of a SOL or more against 59%, a mean buy of 0.80 SOL against 0.56, the top holder at 12% of what is held against 7%, the top ten at 49% against 37%, and the bundle still holding 30% of its peak against 12%. The retail swarm at $30k is the dying pattern; the concentrated, big-ticket coin with its bundle still in is the one that goes on. Together (big-buy share ≥ 59%, top holder ≥ 7%, holders ≤ 161): 21% [15–30] reach $100k against 13%, lift 1.7×, catching 48% of them. Real, modest, and in the engine: at $30k a position's size can follow it.
 
 **What this says about the engine.** The entry (§5) is a money signal that fires on everything with a bundle; the exit (§6) keeps four-fifths of a runner once it is one; the fork says the live tape cannot tell, at 2× or at a pullback, which runner it is. The information that decides a runner is the identity and intent of the big buyers, and the tape sees their size but not who they are. That is the same conclusion as §8 from the other side: the next data is the wallets themselves (funding source and age for the bundle, and now also for the big buyers at $30k), which is a free lookup per wallet, and the one collector not yet built.
+
+## 10. The grind and the spike (2026-10-15)
+
+*"What we need to build is an engine, a slow grind that consistently gains even if it's just 0.5%, 1.5%, building the stack day by day; then a layer that singles out the 10×, 100×, 1000× for the asymmetry."* Measured on four days of tape (17 census runs, 93.6 h, 168,766 coins with books, 103,460 standard; 149 standard coins reached $100k, 1,327 reached $30k; the base rates of §5 hold to the decimal: 1.28% and 0.14%).
+
+### 10.1 Is there a grind after the entry?
+
+After the money signal's fill (9,995 fills, 2,564 a day), the path's first-passage odds: how often the position is first worth a small gain before it is a given loss down, after fees and our own impact.
+
+| gain first | before −10% | before −20% | before −30% | before −50% |
+|---|---:|---:|---:|---:|
+| +3% | 44% (pays −4.2% a fill) | 60% (−5.9%) | 67% (−7.0%) | 72% (−9.9%) |
+| +5% | 40% (−3.8%) | 56% (−5.5%) | 64% (−6.7%) | 70% (−9.9%) |
+| +10% | 34% (−3.1%) | 50% (−4.7%) | 58% (−6.1%) | 63% (−10.0%) |
+| +20% | 26% (−2.1%) | 40% (−3.6%) | 48% (−5.3%) | 54% (−10.2%) |
+| +50% | 16% (−0.3%) | 25% (−1.8%) | 31% (−4.0%) | 37% (−10.9%) |
+| +100% | 10% (+0.7%) | 15% (−1.3%) | 19% (−4.3%) | 23% (−12.8%) |
+
+Every cell but one is negative and the one is noise (+0.7% a fill at 2× before −10%). The coins that reach +3% do it in a median of 2 seconds and the rest are already past −10%: the entry's fill is at the top of the bundle's spike for most fires. There is no small, consistent gain to collect after this entry at this landing. The only cells that approach zero are the asymmetric ones (large gain, tight loss), which is the spike, not the grind.
+
+### 10.2 Is copying the leaders a grind?
+
+The leaders file (four wallets, the ones the audit of §2 of [10](10-engine-v2-plan.md) kept), copied on the whole tape: our buy 4 s after theirs, our sell 4 s after their next sell on the coin.
+
+| | trades | closed by their sell | held (median) | win | our mean (±) | their mean before fees |
+|---|---:|---:|---:|---:|---|---:|
+| leaders file | 641 | 97% | 53 s | 25% | **−6.6%** (±5%) | **+9.5%** |
+| selective early wallets of the tape (first half → second half) | 150,552 | 95% | 38 s | 31% | −7.1% (±0.4%) | −1.4% |
+
+The leaders are real: +9.5% a trade on their own fills, 53-second holds. Four seconds behind them we make −6.6%; the delay and the round trip take sixteen points. One by one: the best of them (392 trades) copies to −1.6%, the other three to −12%, −15% and −20%. The tape's own selective wallets are not leaders at all: −1.4% on their own fills.
+
+### 10.3 What speed would buy
+
+(see the table that follows; filled in from the same run)
+
+### 10.4 The spike, on four days
+
+The ledger of §7 on 149 coins: the entry held on 136 (91%); the median move from our entry to the tape peak is 17.4×; the distribution exit keeps a median 35% of each move and makes +313 SOL on the 136 at 0.5 SOL a leg. The same rules on all 9,995 coins entered: −1,391 SOL. The fork of §9 on 2,393 first doublings, 2,343 first pullbacks and 1,358 first $30k readings reads as before: nothing separates at 2× or at a pullback; at $30k the concentrated, big-ticket coin goes on and the swarm dies. The creator gates of §8 keep 120 of 135 winners while removing a fifth of the loss (−1,117 against −1,391); the breadth-outside-the-bundle entry keeps 97 and removes a fifth; the selective wallets with the money signal: 17.9% [16.6–19.3] for ≥ $30k on 3,221 fires out of sample, 13× lift, below the money signal alone.
+
+### 10.5 What this says about the two layers
+
+The spike layer exists and is measured: the entry catches nine of ten $100k coins within seconds, the exit keeps a third to four-fifths of the move depending on the exit, and the coins that go on can be told from the ones that die at $30k by who is buying, modestly. The grind layer does not exist at the launch tier at a 4-second landing: the path after the fill has no small-gain edge in any direction, and the only wallets with a real per-trade edge lose it in the delay. The question that decides the grind is therefore speed, and §10.3 measures it on the same trades.

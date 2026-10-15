@@ -2211,6 +2211,120 @@ fn copy_section(
     }
 }
 
+/// What speed buys: the same entry and the same copy at a faster landing. The launch
+/// tier's and the copy's returns against the seconds between the deciding trade and
+/// our fill.
+fn speed_section(
+    o: &mut String,
+    tape: &[replay::Coin],
+    idx: &[usize],
+    leaders: &HashSet<u64>,
+    k: &Costs,
+) {
+    let _ = writeln!(
+        o,
+        "\n## What speed buys: the same trades at a faster landing\n"
+    );
+    if idx.is_empty() {
+        let _ = writeln!(o, "_Needs the trade tape._");
+        return;
+    }
+    let entry = EntryRule::Signal(Signal::simple(20.0, 0, 0, 60));
+    let _ = writeln!(
+        o,
+        "The money signal (20 SOL in the curve within 60 s) and the leaders file, with our transaction landing 0, 1, 2 or {} s after the deciding trade (0 = the same block as the signal's trade, the best any infrastructure can do):\n",
+        k.delay_s
+    );
+    let _ = writeln!(
+        o,
+        "| landing | signal fills | +3% before −10% | pays per fill | +10% before −20% | pays per fill | SOL-leaving exit, mean | copying the leaders: trades | mean (±) | their mean |"
+    );
+    let _ = writeln!(o, "|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|");
+    let mut delays = vec![0, 1, 2];
+    if !delays.contains(&k.delay_s) {
+        delays.push(k.delay_s);
+    }
+    let fills: Vec<(usize, i64)> = idx
+        .iter()
+        .filter_map(|&i| tape[i].entry_ts(&entry).map(|t| (i, t)))
+        .collect();
+    for d in delays {
+        let kd = Costs { delay_s: d, ..*k };
+        let cell = |x: f64, y: f64| -> (f64, f64) {
+            let (mut up, mut n, mut pays) = (0usize, 0usize, 0.0f64);
+            for &(i, t) in &fills {
+                let p = replay::path_after(&tape[i], t + d, &kd);
+                if p.is_empty() {
+                    continue;
+                }
+                n += 1;
+                let mut done = false;
+                for &(_, v) in &p {
+                    if v >= 1.0 + x {
+                        up += 1;
+                        pays += x;
+                        done = true;
+                        break;
+                    }
+                    if v <= 1.0 - y {
+                        pays -= y;
+                        done = true;
+                        break;
+                    }
+                }
+                if !done {
+                    pays += p.last().map_or(0.0, |l| l.1 - 1.0);
+                }
+            }
+            (up as f64 / n.max(1) as f64, pays / n.max(1) as f64)
+        };
+        let (p3, e3) = cell(0.03, 0.10);
+        let (p10, e10) = cell(0.10, 0.20);
+        let exit = ExitRule::SolLeaving(0.8);
+        let reentry = EntryRule::Resume {
+            min_buy_ratio: 2.0,
+            min_new_buyers_w: 10,
+            min_sol_vs_peak: 0.9,
+        };
+        let mut rets: Vec<f64> = vec![];
+        for &(i, _) in &fills {
+            if let Some(first) = replay::legs(&tape[i], &entry, &reentry, &exit, &kd).first() {
+                rets.push(first.ret);
+            }
+        }
+        let (m, _) = mean_ci(&rets);
+        let mut copy: Vec<(f64, f64)> = vec![];
+        if !leaders.is_empty() {
+            for &i in idx {
+                for (_, leg, theirs) in replay::copy_trades(&tape[i], leaders, &kd) {
+                    copy.push((leg.ret, theirs));
+                }
+            }
+        }
+        let ours: Vec<f64> = copy.iter().map(|c| c.0).collect();
+        let theirs: Vec<f64> = copy.iter().map(|c| c.1).collect();
+        let (cm, cci) = mean_ci(&ours);
+        let _ = writeln!(
+            o,
+            "| {d} s | {} | {:.0}% | **{}** | {:.0}% | **{}** | {} | {} | **{}** (±{:.0}%) | {} |",
+            rets.len(),
+            100.0 * p3,
+            pct(e3),
+            100.0 * p10,
+            pct(e10),
+            pct(m),
+            copy.len(),
+            pct(cm),
+            100.0 * cci,
+            pct(mean_ci(&theirs).0)
+        );
+    }
+    let _ = writeln!(
+        o,
+        "_The landing is the seconds from the deciding trade to our fill; the stream itself runs 1–3 s behind the chain on the free feed, so 0 s is not reachable there. If a column turns positive only at 0 or 1 s, that is what paid infrastructure would be buying; if it stays negative at 0 s, speed is not the lever._"
+    );
+}
+
 // ------------------------------------------------------------------ the report
 
 pub struct Args {
@@ -2527,6 +2641,7 @@ pub fn report(
     copy_section(
         &mut o, tape, &std_idx, names, leaders, &selective, split_ts, &k, hours,
     );
+    speed_section(&mut o, tape, &std_idx, leaders, &k);
     exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
     fork_section(&mut o, tape, &std_idx, &k, sol_usd);
     ledger_section(&mut o, tape, &standard, &k, sol_usd);
