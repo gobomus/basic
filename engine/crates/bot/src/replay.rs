@@ -1383,6 +1383,91 @@ pub struct Fork {
     pub fwd_peak: f64,
 }
 
+/// The position's path after a fill at `entry_ts`: (seconds after the fill, value over
+/// what we paid) at every later trade, curve and pool; empty when the entry cannot fill.
+pub fn path_after(c: &Coin, entry_ts: i64, k: &Costs) -> Vec<(i64, f64)> {
+    let Some(pos) = open_at(c, entry_ts, k) else {
+        return vec![];
+    };
+    let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
+    events_of(c)
+        .into_iter()
+        .filter(|e| e.0 > entry_ts)
+        .map(|(ts, is_pool, i)| {
+            (
+                ts - entry_ts,
+                event_value(c, &pos, is_pool, i) as f64 / cost,
+            )
+        })
+        .collect()
+}
+
+/// Copy a set of wallets on this coin: when one of them buys, our buy lands `delay`
+/// later; when that wallet next sells, our sell lands `delay` later; one position per
+/// wallet at a time; a position still open at the end is marked at the last trade.
+/// Returns (wallet, our leg, the wallet's own return on the same trade before fees).
+pub fn copy_trades(
+    c: &Coin,
+    wallets: &std::collections::HashSet<u64>,
+    k: &Costs,
+) -> Vec<(u64, Leg, f64)> {
+    let events = events_of(c);
+    let cost = (k.size_lamports + 2 * k.tx_lamports) as f64;
+    let mut open_by: HashMap<u64, (Position, i64, f64)> = HashMap::new(); // position, our fill, their buy mcap
+    let mut out = vec![];
+    for &(ts, is_pool, i) in &events {
+        let (user, buy, mcap) = if is_pool {
+            let x = &c.pool[i];
+            (x.user, x.buy, x.mcap_sol)
+        } else {
+            let x = &c.ticks[i];
+            (x.user, x.buy, x.mcap_sol())
+        };
+        if !wallets.contains(&user) {
+            continue;
+        }
+        if buy {
+            if open_by.contains_key(&user) {
+                continue;
+            }
+            let fill = ts + k.delay_s;
+            if let Some(pos) = open_at(c, fill, k) {
+                open_by.insert(user, (pos, fill, mcap));
+            }
+        } else if let Some((pos, fill, their_in)) = open_by.remove(&user) {
+            let (exit_ts, value, _) = value_with(c, &events, &pos, fill, ts + k.delay_s);
+            out.push((
+                user,
+                Leg {
+                    entry_ts: fill,
+                    exit_ts,
+                    entry_mcap_sol: c.mcap_sol_at(fill),
+                    exit_mcap_sol: c.mcap_sol_at(exit_ts),
+                    ret: value as f64 / cost - 1.0,
+                    by_rule: true,
+                },
+                mcap / their_in.max(1e-9) - 1.0,
+            ));
+        }
+    }
+    for (user, (pos, fill, their_in)) in open_by {
+        let (exit_ts, value, _) = value_with(c, &events, &pos, fill, i64::MAX);
+        out.push((
+            user,
+            Leg {
+                entry_ts: fill,
+                exit_ts,
+                entry_mcap_sol: c.mcap_sol_at(fill),
+                exit_mcap_sol: c.mcap_sol_at(exit_ts),
+                ret: value as f64 / cost - 1.0,
+                by_rule: false,
+            },
+            c.mcap_sol_at(exit_ts) / their_in.max(1e-9) - 1.0,
+        ));
+    }
+    out
+}
+
 /// Buy with a fill at `entry_ts`, hold, and read the state at each fork moment; the
 /// outcome is what the position did afterwards.
 pub fn forks(c: &Coin, entry_ts: i64, k: &Costs, sol_usd: f64) -> Vec<Fork> {

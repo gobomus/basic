@@ -2010,6 +2010,207 @@ fn fork_section(o: &mut String, tape: &[replay::Coin], idx: &[usize], k: &Costs,
     );
 }
 
+/// The grind: after the entry's fill, how often the position first reaches a small gain
+/// before a given loss, how long that takes, and what that pays. No exit is picked:
+/// the table is the path's first-passage probabilities, which any exit must live in.
+fn grind_section(o: &mut String, tape: &[replay::Coin], idx: &[usize], k: &Costs, hours: f64) {
+    let _ = writeln!(
+        o,
+        "\n## The grind: what the path does right after the entry\n"
+    );
+    if idx.is_empty() {
+        let _ = writeln!(o, "_Needs the trade tape._");
+        return;
+    }
+    let (entry, _, _) = machine();
+    let paths: Vec<Vec<(i64, f64)>> = idx
+        .iter()
+        .filter_map(|&i| {
+            tape[i]
+                .entry_ts(&entry)
+                .map(|t| replay::path_after(&tape[i], t + k.delay_s, k))
+        })
+        .filter(|p| !p.is_empty())
+        .collect();
+    let _ = writeln!(
+        o,
+        "Entry: the first of the three entry readings to hold, {} fills, {:.0} a day. For each gain X and loss Y: the share of fills whose position is first worth X above what we paid before it is Y below (after fees and our own impact), the share that hit Y first, the share that did neither before the data ended, the median seconds to the first of the two, and what the pair pays per fill when the neither cases are closed at their last trade:\n",
+        paths.len(),
+        paths.len() as f64 / hours * 24.0
+    );
+    let _ = writeln!(o, "| gain X | loss Y | X first | Y first | neither | median s to X | pays per fill | SOL/day at {} a fill |", k.size_lamports as f64 / 1e9);
+    let _ = writeln!(o, "|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for x in [0.03, 0.05, 0.10, 0.20, 0.50, 1.00] {
+        for y in [0.10, 0.20, 0.30, 0.50] {
+            let (mut up, mut down, mut neither, mut pays, mut secs) =
+                (0usize, 0usize, 0usize, 0.0f64, vec![]);
+            for p in &paths {
+                let mut done = false;
+                for &(t, v) in p {
+                    if v >= 1.0 + x {
+                        up += 1;
+                        pays += x;
+                        secs.push(t as f64);
+                        done = true;
+                        break;
+                    }
+                    if v <= 1.0 - y {
+                        down += 1;
+                        pays -= y;
+                        done = true;
+                        break;
+                    }
+                }
+                if !done {
+                    neither += 1;
+                    pays += p.last().map_or(0.0, |l| l.1 - 1.0);
+                }
+            }
+            let n = paths.len() as f64;
+            let per = pays / n;
+            let _ = writeln!(
+                o,
+                "| +{:.0}% | −{:.0}% | {:.0}% | {:.0}% | {:.0}% | {:.0} | **{}** | {:+.1} |",
+                100.0 * x,
+                100.0 * y,
+                100.0 * up as f64 / n,
+                100.0 * down as f64 / n,
+                100.0 * neither as f64 / n,
+                median(&mut secs),
+                pct(per),
+                per * n * k.size_lamports as f64 / 1e9 / hours * 24.0
+            );
+        }
+    }
+    let _ = writeln!(
+        o,
+        "_A gain is reached when a sell landing at that trade would return it; the sell itself lands `delay` later, so a live engine gets a little less than X. A positive cell is a grind only if it survives that and the days to come._"
+    );
+}
+
+/// Copying wallets: the leaders file and the selective early wallets found on the
+/// first half of the tape. Our buy lands `delay` after theirs, our sell `delay` after
+/// their next sell on that coin.
+#[allow(clippy::too_many_arguments)]
+fn copy_section(
+    o: &mut String,
+    tape: &[replay::Coin],
+    idx: &[usize],
+    names: &HashMap<u64, String>,
+    leaders: &HashSet<u64>,
+    selective: &HashSet<u64>,
+    split_ts: i64,
+    k: &Costs,
+    hours: f64,
+) {
+    let _ = writeln!(
+        o,
+        "\n## Copying wallets: the leaders file and the tape's own selective wallets\n"
+    );
+    if idx.is_empty() || (leaders.is_empty() && selective.is_empty()) {
+        let _ = writeln!(o, "_Needs the trade tape and a leaders file._");
+        return;
+    }
+    let _ = writeln!(
+        o,
+        "Our buy lands {} s after the wallet's buy, our sell {} s after that wallet's next sell on the coin; one position per wallet per coin; a position still open at the end of the data is marked at the last trade. \"Their return\" is the wallet's own price change on the same trade before fees: the gap to ours is what the delay and our costs take.\n",
+        k.delay_s, k.delay_s
+    );
+    let _ = writeln!(o, "| wallets | coins | trades | closed by their sell | held (median) | win | mean (±) | median | their mean | SOL at {} a trade | SOL/day |", k.size_lamports as f64 / 1e9);
+    let _ = writeln!(o, "|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|");
+    let groups: [(&str, &HashSet<u64>, i64); 2] = [
+        ("leaders file", leaders, 0),
+        (
+            "selective early wallets (found on the first half, copied on the second)",
+            selective,
+            split_ts,
+        ),
+    ];
+    let mut per_wallet: Vec<(u64, usize, f64)> = vec![];
+    for (label, set, from_ts) in groups {
+        if set.is_empty() {
+            continue;
+        }
+        let mut legs: Vec<(u64, replay::Leg, f64)> = vec![];
+        let mut coins = 0usize;
+        for &i in idx {
+            if tape[i].created_ts < from_ts {
+                continue;
+            }
+            let l = replay::copy_trades(&tape[i], set, k);
+            if !l.is_empty() {
+                coins += 1;
+                legs.extend(l);
+            }
+        }
+        if legs.len() < MIN_FIRES {
+            let _ = writeln!(
+                o,
+                "| {label} | {coins} | {} | | | | _too few_ | | | | |",
+                legs.len()
+            );
+            continue;
+        }
+        let mut rets: Vec<f64> = legs.iter().map(|l| l.1.ret).collect();
+        let mut held: Vec<f64> = legs
+            .iter()
+            .map(|l| (l.1.exit_ts - l.1.entry_ts) as f64)
+            .collect();
+        let theirs: Vec<f64> = legs.iter().map(|l| l.2).collect();
+        let (m, ci) = mean_ci(&rets);
+        let med = median(&mut rets);
+        let sol: f64 = rets.iter().sum::<f64>() * k.size_lamports as f64 / 1e9;
+        let hrs = if from_ts > 0 {
+            recorded_hours(
+                idx.iter()
+                    .map(|&i| tape[i].created_ts)
+                    .filter(|t| *t >= from_ts)
+                    .collect(),
+            )
+        } else {
+            hours
+        };
+        let _ = writeln!(
+            o,
+            "| {label} | {coins} | {} | {:.0}% | {} | {:.0}% | **{}** (±{:.0}%) | {} | {} | {:+.1} | {:+.1} |",
+            legs.len(),
+            100.0 * legs.iter().filter(|l| l.1.by_rule).count() as f64 / legs.len() as f64,
+            age((median(&mut held) * 1000.0) as i64),
+            100.0 * rets.iter().filter(|r| **r > 0.0).count() as f64 / rets.len() as f64,
+            pct(m),
+            100.0 * ci,
+            pct(med),
+            pct(mean_ci(&theirs).0),
+            sol,
+            sol / hrs * 24.0
+        );
+        if label == "leaders file" {
+            let mut by: HashMap<u64, Vec<f64>> = HashMap::new();
+            for l in &legs {
+                by.entry(l.0).or_default().push(l.1.ret);
+            }
+            per_wallet.extend(
+                by.into_iter()
+                    .map(|(w, v)| (w, v.len(), v.iter().sum::<f64>() / v.len() as f64)),
+            );
+        }
+    }
+    if !per_wallet.is_empty() {
+        per_wallet.sort_by_key(|w| std::cmp::Reverse(w.1));
+        let _ = writeln!(o, "\nThe leaders one by one (our return copying them):\n");
+        let _ = writeln!(o, "| wallet | trades | our mean |");
+        let _ = writeln!(o, "|---|---:|---:|");
+        for (w, n, m) in per_wallet {
+            let _ = writeln!(
+                o,
+                "| `{}` | {n} | {} |",
+                names.get(&w).map(String::as_str).unwrap_or("?"),
+                pct(m)
+            );
+        }
+    }
+}
+
 // ------------------------------------------------------------------ the report
 
 pub struct Args {
@@ -2317,6 +2518,15 @@ pub fn report(
         .filter(|&i| by_mint.contains_key(tape[i].mint.as_str()))
         .collect();
     let extra = wallet_section(&mut o, tape, &std_idx, &w30_set, &w100_set, names, leaders);
+    grind_section(&mut o, tape, &std_idx, &k, hours);
+    let (selective, split_ts) = extra
+        .iter()
+        .find(|(s, _)| s.min_known == 1 && s.min_net_sol == 0.0)
+        .map(|(s, t)| (s.known.clone(), *t))
+        .unwrap_or_default();
+    copy_section(
+        &mut o, tape, &std_idx, names, leaders, &selective, split_ts, &k, hours,
+    );
     exit_section(&mut o, tape, &std_idx, &k, sol_usd, hours, &extra);
     fork_section(&mut o, tape, &std_idx, &k, sol_usd);
     ledger_section(&mut o, tape, &standard, &k, sol_usd);
